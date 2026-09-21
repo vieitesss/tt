@@ -7,7 +7,8 @@
 //! Projects resolve through the central registry: `--path` > `$TT_PATH` >
 //! cwd, nearest registered ancestor wins. `--vault` (and `$TT_VAULT`) remain
 //! as a hidden escape hatch that opens a folder directly and skips the
-//! registry.
+//! registry. `--projects` opens the TUI project picker without registering
+//! cwd and is only valid without a subcommand.
 
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -223,6 +224,10 @@ pub(crate) fn run(cli: &Cli) -> ExitCode {
 }
 
 fn execute(cli: &Cli) -> Result<()> {
+    if cli.projects && cli.command.is_some() {
+        bail!("--projects is only valid without a subcommand");
+    }
+
     let mut config = Config::load().context("loading config")?;
     if config.deprecated_vault.is_some() {
         eprintln!(
@@ -270,7 +275,8 @@ fn execute(cli: &Cli) -> Result<()> {
 
 /// Start the TUI: the `--vault`/`$TT_VAULT` hatch runs the vault directly,
 /// otherwise the start directory resolves against the registry and the TUI
-/// shows launch modals as needed.
+/// shows launch modals as needed. `--projects` skips those questions and
+/// opens the project picker.
 fn run_tui(cli: &Cli, config: Config) -> Result<()> {
     if let Some(path) = cli.vault.as_deref() {
         let vault =
@@ -285,7 +291,11 @@ fn run_tui(cli: &Cli, config: Config) -> Result<()> {
     let start =
         resolve::start_dir(cli.path.as_deref()).context("determining the starting directory")?;
     let resolution = resolve::resolve(&config, &start);
-    crate::tui::run_project(config, resolution)
+    if cli.projects {
+        crate::tui::run_projects_picker(config, resolution)
+    } else {
+        crate::tui::run_project(config, resolution)
+    }
 }
 
 /// Open the vault for this invocation.

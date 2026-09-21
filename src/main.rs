@@ -28,6 +28,10 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Open the project picker without registering the current directory.
+    #[arg(long, global = true)]
+    projects: bool,
+
     #[command(subcommand)]
     command: Option<cli::Command>,
 }

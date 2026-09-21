@@ -8,7 +8,8 @@
 //!
 //! Two entry points: [`run_vault`] for the `--vault` escape hatch, and
 //! [`run_project`] for a resolved start directory, which first shows the
-//! launch modal for unregistered or nested directories.
+//! launch modal for unregistered or nested directories. [`run_projects_picker`]
+//! is `--projects`: skip those questions and pick a project.
 
 mod app;
 mod launch;
@@ -52,9 +53,29 @@ pub(crate) fn run_vault(vault: Vault, config: Config) -> Result<()> {
 /// Returns an error when the data directory cannot be determined, the
 /// terminal cannot be initialized, or drawing fails.
 pub(crate) fn run_project(config: Config, resolution: Resolution) -> Result<()> {
+    run_project_from(config, resolution, false)
+}
+
+/// Run the TUI starting at the project picker (`tt --projects`).
+///
+/// # Errors
+///
+/// Returns an error when the data directory cannot be determined, the
+/// terminal cannot be initialized, or drawing fails.
+pub(crate) fn run_projects_picker(config: Config, resolution: Resolution) -> Result<()> {
+    run_project_from(config, resolution, true)
+}
+
+fn run_project_from(config: Config, resolution: Resolution, projects: bool) -> Result<()> {
     let store_root = registry::data_dir().context("cannot determine the data directory")?;
     let mut terminal = ratatui::try_init().context("initializing the terminal")?;
-    let loop_result = run_project_inner(&mut terminal, config, resolution, store_root.clone());
+    let loop_result = run_project_inner(
+        &mut terminal,
+        config,
+        resolution,
+        store_root.clone(),
+        projects,
+    );
     let restore_result = ratatui::try_restore().context("restoring the terminal");
     loop_result.and(restore_result)
 }
@@ -64,8 +85,13 @@ fn run_project_inner(
     config: Config,
     resolution: Resolution,
     store_root: PathBuf,
+    projects: bool,
 ) -> Result<()> {
-    let mut launch = Launch::new(config, resolution, store_root.clone());
+    let mut launch = if projects {
+        Launch::new_projects(config, resolution, store_root.clone())
+    } else {
+        Launch::new(config, resolution, store_root.clone())
+    };
     while !launch.ready() && !launch.should_quit() {
         terminal.draw(|frame| ui::render_launch(frame, &launch))?;
         if event::poll(TICK)? {

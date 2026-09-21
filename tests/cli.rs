@@ -546,6 +546,25 @@ fn project_add_list_and_remove_round_trip() {
 }
 
 #[test]
+fn projects_flag_is_rejected_with_a_subcommand() {
+    let sandbox = Sandbox::new();
+    let output = sandbox
+        .command()
+        .args(["--json", "--projects", "list"])
+        .output()
+        .expect("run tt");
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("error JSON");
+    assert!(
+        value["error"]
+            .as_str()
+            .expect("error string")
+            .contains("--projects"),
+        "unexpected error: {value}"
+    );
+}
+
+#[test]
 fn unregistered_add_silently_registers_and_writes_to_the_store() {
     let sandbox = Sandbox::new();
     let value = run_json(

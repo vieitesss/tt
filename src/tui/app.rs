@@ -1484,7 +1484,7 @@ fn issue_count_text(count: usize) -> String {
 ///
 /// Returns `None` only when the path starts with `~` and `$HOME` is unset;
 /// paths without a tilde pass through unchanged. `~user` is not expanded.
-fn expand_tilde(raw: &str) -> Option<PathBuf> {
+pub(crate) fn expand_tilde(raw: &str) -> Option<PathBuf> {
     expand_tilde_with_home(raw, env::var_os("HOME").map(PathBuf::from).as_deref())
 }
 

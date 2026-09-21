@@ -13,7 +13,7 @@ lives in `CONTEXT.md` and `docs/adr/`.
 ## Invocation
 
 ```
-tt [--path PATH] [--json] <command>
+tt [--path PATH] [--json] [--projects] <command>
 ```
 
 Project resolution, first match wins:
@@ -29,6 +29,9 @@ registered project wins. Consequences:
 - An unregistered directory: `tt add` registers it silently when
   non-interactive (`--json`, piped, or not a TTY) and prompts otherwise; read
   commands fail with `not a registered project; run tt add or tt project add`.
+  Bare `tt` can bind to a different registered project instead (`Projects` in
+  the launch modal, or `tt --projects`); `--projects` is only valid without a
+  subcommand.
 - A directory nested inside a project must be registered explicitly
   (`tt project add`) to become its own project.
 

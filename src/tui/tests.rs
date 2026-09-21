@@ -3535,6 +3535,27 @@ fn register_launch() -> (tempfile::TempDir, Launch) {
     (dir, launch)
 }
 
+/// Unregistered cwd plus one already-registered project.
+fn unregistered_launch_with_other() -> (tempfile::TempDir, Launch) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let other = dir.path().join("other");
+    let fresh = dir.path().join("fresh");
+    fs::create_dir_all(&other).expect("other");
+    fs::create_dir_all(&fresh).expect("fresh");
+    let config_path = dir.path().join("config.toml");
+    let mut config = Config::load_from(Some(config_path)).expect("load");
+    config
+        .projects
+        .push(project(other.to_str().expect("utf-8"), "other"));
+    config.save().expect("save");
+    let launch = Launch::new(
+        config,
+        Resolution::Unregistered { path: fresh },
+        dir.path().join("data"),
+    );
+    (dir, launch)
+}
+
 /// A nested-directory launch question backed by a real config in a temp dir.
 fn nested_launch() -> (tempfile::TempDir, Launch, PathBuf) {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3967,16 +3988,22 @@ fn unregistered_launch_buttons_default_to_yes_and_cancel() {
     let (_dir, mut launch) = register_launch();
     assert_eq!(launch.button_index(), 0, "Yes is the default");
     let text = render_launch_lines(&launch, 90, 12).join("\n");
-    assert!(text.contains("[ Yes ]"), "{text}");
-    assert!(text.contains("[ Cancel ]"), "{text}");
+    assert!(text.contains("[y]"), "{text}");
+    assert!(text.contains("Yes"), "{text}");
+    assert!(text.contains("[p]"), "{text}");
+    assert!(text.contains("Projects"), "{text}");
+    assert!(text.contains("[n]"), "{text}");
+    assert!(text.contains("Cancel"), "{text}");
 
     launch.handle_key(key(KeyCode::Enter));
     assert!(launch.ready(), "Enter on the default Yes registers");
 
-    // Right moves to Cancel; Enter then quits without registering.
+    // Right twice moves to Cancel; Enter then quits without registering.
     let (_dir, mut launch) = register_launch();
     launch.handle_key(key(KeyCode::Right));
-    assert_eq!(launch.button_index(), 1);
+    assert_eq!(launch.button_index(), 1, "right lands on Projects");
+    launch.handle_key(key(KeyCode::Right));
+    assert_eq!(launch.button_index(), 2, "right again lands on Cancel");
     launch.handle_key(key(KeyCode::Enter));
     assert!(launch.should_quit());
     assert!(!launch.ready());
@@ -3984,9 +4011,11 @@ fn unregistered_launch_buttons_default_to_yes_and_cancel() {
     // Left from Yes wraps to Cancel; `h` moves back.
     let (_dir, mut launch) = register_launch();
     launch.handle_key(key(KeyCode::Left));
-    assert_eq!(launch.button_index(), 1, "left wraps");
+    assert_eq!(launch.button_index(), 2, "left wraps to Cancel");
     launch.handle_key(key(KeyCode::Char('h')));
-    assert_eq!(launch.button_index(), 0, "h moves left");
+    assert_eq!(launch.button_index(), 1, "h moves left onto Projects");
+    launch.handle_key(key(KeyCode::Char('h')));
+    assert_eq!(launch.button_index(), 0, "h moves left onto Yes");
 }
 
 #[test]
@@ -4001,15 +4030,22 @@ fn unregistered_launch_esc_cancels() {
 fn launch_buttons_render_with_the_default_highlighted() {
     let (_dir, launch) = register_launch();
     let cells = render_launch_cells(&launch, 90, 12);
-    let yes = style_at_text(&cells, "[ Yes ]");
+    let yes = style_at_text(&cells, "[y]");
     assert!(
         yes.add_modifier.contains(Modifier::REVERSED),
-        "Yes is highlighted: {yes:?}"
+        "Yes key is highlighted: {yes:?}"
     );
-    let cancel = style_at_text(&cells, "[ Cancel ]");
+    let yes_label = style_at_text(&cells, "Yes");
+    assert!(
+        !yes_label.add_modifier.contains(Modifier::REVERSED),
+        "Yes caption is not reversed: {yes_label:?}"
+    );
+    let projects = style_at_text(&cells, "[p]");
+    assert!(!projects.add_modifier.contains(Modifier::REVERSED));
+    let cancel = style_at_text(&cells, "[n]");
     assert!(
         !cancel.add_modifier.contains(Modifier::REVERSED),
-        "Cancel is not highlighted: {cancel:?}"
+        "Cancel key is not highlighted: {cancel:?}"
     );
 
     let (_dir, launch, _config_path) = nested_launch();
@@ -4168,6 +4204,140 @@ fn launch_is_ready_without_a_modal_for_exact_and_never_ask_hits() {
         dir.path().join("data"),
     );
     assert!(nested.ready());
+}
+
+#[test]
+fn unregistered_launch_cancel_is_right_aligned() {
+    let (_dir, launch) = register_launch();
+    let text = render_launch_lines(&launch, 90, 12);
+    let row = text
+        .iter()
+        .find(|line| line.contains("[y]") && line.contains("[n]"))
+        .expect("button row");
+    let p = row.find("[p]").expect("p");
+    let n = row.find("[n]").expect("n");
+    assert!(n > p + 10, "Cancel should sit on the right: {row:?}");
+}
+
+#[test]
+fn unregistered_p_opens_the_project_picker_and_esc_returns() {
+    let (_dir, mut launch) = unregistered_launch_with_other();
+    launch.handle_key(key(KeyCode::Char('p')));
+    let pick = launch.project_pick().expect("picker");
+    assert_eq!(pick.2.len(), 1);
+    assert_eq!(pick.2[0].slug, "other");
+    let text = render_launch_lines(&launch, 90, 16).join("\n");
+    assert!(text.contains("other"), "{text}");
+    assert!(text.contains("project:"), "{text}");
+
+    launch.handle_key(key(KeyCode::Esc));
+    assert!(launch.project_pick().is_none());
+    assert!(!launch.should_quit());
+    assert!(!launch.ready());
+    let text = render_launch_lines(&launch, 90, 12).join("\n");
+    assert!(text.contains("not a registered project"), "{text}");
+}
+
+#[test]
+fn unregistered_p_binds_without_registering_cwd() {
+    let (dir, mut launch) = unregistered_launch_with_other();
+    launch.handle_key(key(KeyCode::Char('p')));
+    launch.handle_key(key(KeyCode::Enter));
+    assert!(launch.ready());
+    let (config, project) = launch.into_parts();
+    assert_eq!(project.slug, "other");
+    assert_eq!(config.projects.len(), 1);
+    assert_eq!(config.projects[0].slug, "other");
+    let fresh = dir.path().join("fresh");
+    assert!(
+        !config.projects.iter().any(|project| project.path == fresh),
+        "cwd stayed unregistered"
+    );
+}
+
+#[test]
+fn unregistered_p_with_empty_registry_opens_the_path_prompt() {
+    let (_dir, mut launch) = register_launch();
+    launch.handle_key(key(KeyCode::Char('p')));
+    assert_eq!(launch.path_input(), Some(""));
+    let text = render_launch_lines(&launch, 90, 12).join("\n");
+    assert!(text.contains("Register a project directory"), "{text}");
+
+    launch.handle_key(key(KeyCode::Esc));
+    assert!(launch.path_input().is_none());
+    assert!(!launch.should_quit());
+    assert!(!launch.ready());
+
+    let (dir, mut launch) = register_launch();
+    let other = dir.path().join("elsewhere");
+    launch.handle_key(key(KeyCode::Char('p')));
+    for character in other.to_str().expect("utf-8").chars() {
+        launch.handle_key(key(KeyCode::Char(character)));
+    }
+    launch.handle_key(key(KeyCode::Enter));
+    assert!(launch.ready(), "registered the typed path");
+    let (config, project) = launch.into_parts();
+    assert_eq!(config.projects.len(), 1);
+    assert_eq!(project.path, other);
+}
+
+#[test]
+fn projects_flag_opens_the_picker_on_the_current_project() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let one = project("/one", "one");
+    let two = project("/two", "two");
+    let mut config = Config::default();
+    config.projects = vec![one.clone(), two.clone()];
+    let launch = Launch::new_projects(
+        config,
+        Resolution::Registered {
+            project: two.clone(),
+            nested: None,
+        },
+        dir.path().join("data"),
+    );
+    let (_query, highlight, projects) = launch.project_pick().expect("picker");
+    assert_eq!(highlight, 1);
+    assert_eq!(projects[1].slug, "two");
+    let cells = render_launch_cells(&launch, 90, 16);
+    let two_style = style_at_text(&cells, "two");
+    assert!(
+        two_style.add_modifier.contains(Modifier::REVERSED),
+        "current project is highlighted: {two_style:?}"
+    );
+}
+
+#[test]
+fn projects_flag_esc_quits() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut config = Config::default();
+    config.projects.push(project("/one", "one"));
+    let mut launch = Launch::new_projects(
+        config,
+        Resolution::Unregistered {
+            path: dir.path().join("fresh"),
+        },
+        dir.path().join("data"),
+    );
+    assert!(launch.project_pick().is_some());
+    launch.handle_key(key(KeyCode::Esc));
+    assert!(launch.should_quit());
+    assert!(!launch.ready());
+}
+
+#[test]
+fn projects_flag_empty_registry_path_prompt_esc_quits() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut launch = Launch::new_projects(
+        Config::default(),
+        Resolution::Unregistered {
+            path: dir.path().join("fresh"),
+        },
+        dir.path().join("data"),
+    );
+    assert_eq!(launch.path_input(), Some(""));
+    launch.handle_key(key(KeyCode::Esc));
+    assert!(launch.should_quit());
 }
 
 #[test]

@@ -534,8 +534,17 @@ fn render_confirm_delete(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 /// The pre-App launch modal: a centered box with the question, any error, and
 /// the highlighted button row. The buttons live in their own bottom sub-area,
-/// so they stay visible even when a long question is clipped.
+/// so they stay visible even when a long question is clipped. The project
+/// picker and empty-registry path prompt replace the question when open.
 pub(crate) fn render_launch(frame: &mut Frame<'_>, launch: &Launch) {
+    if let Some((query, highlight, projects)) = launch.project_pick() {
+        render_launch_picker(frame, launch, query, highlight, &projects);
+        return;
+    }
+    if let Some(input) = launch.path_input() {
+        render_launch_path(frame, input, launch.overlay_error());
+        return;
+    }
     let lines = launch.lines();
     if lines.is_empty() {
         return;
@@ -580,13 +589,154 @@ pub(crate) fn render_launch(frame: &mut Frame<'_>, launch: &Launch) {
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), chunks[0]);
 
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            button_row(buttons, launch.button_index()),
-        ]),
-        chunks[1],
-    );
+    let row = if launch.key_box_buttons() {
+        key_box_row(chunks[1].width as usize, launch.button_index())
+    } else {
+        button_row(buttons, launch.button_index())
+    };
+    frame.render_widget(Paragraph::new(vec![Line::from(""), row]), chunks[1]);
+}
+
+/// Unregistered launch buttons: `[y] Yes  [p] Projects` on the left, `[n] Cancel`
+/// on the right. Only the `[y]`/`[p]`/`[n]` box is reversed when highlighted.
+fn key_box_row(width: usize, highlighted: usize) -> Line<'static> {
+    fn key_span(key: char, highlighted: bool) -> Span<'static> {
+        let style = if highlighted {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        Span::styled(format!("[{key}]"), style)
+    }
+
+    let left: Vec<Span<'static>> = vec![
+        key_span('y', highlighted == 0),
+        Span::raw(" Yes"),
+        Span::raw("  "),
+        key_span('p', highlighted == 1),
+        Span::raw(" Projects"),
+    ];
+    let right: Vec<Span<'static>> = vec![key_span('n', highlighted == 2), Span::raw(" Cancel")];
+    let left_width = left
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum::<usize>();
+    let right_width = right
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum::<usize>();
+    let gap = width
+        .saturating_sub(left_width)
+        .saturating_sub(right_width)
+        .max(1);
+
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(right);
+    Line::from(spans)
+}
+
+/// `--projects` / launch Projects overlay: query line plus matching slugs.
+fn render_launch_picker(
+    frame: &mut Frame<'_>,
+    launch: &Launch,
+    query: &str,
+    highlight: usize,
+    projects: &[tt::Project],
+) {
+    let area = frame.area();
+    let width = area.width.min(72);
+    if width < 8 || area.height < 5 {
+        return;
+    }
+    let inner_width = width.saturating_sub(2) as usize;
+    let visible = projects.len().clamp(1, 12);
+    let extra = usize::from(launch.overlay_error().is_some());
+    let height = (visible + 3 + extra + 2).min(area.height as usize) as u16;
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title("projects")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let prompt = super::picker::PickerKind::Project.prompt();
+    let mut lines: Vec<Line<'static>> = vec![Line::from(format!("{prompt}{query}"))];
+    if let Some(error) = launch.overlay_error() {
+        lines.push(Line::from(format!("error: {error}")));
+    }
+    if projects.is_empty() {
+        lines.push(Line::from("(no matching projects)"));
+    } else {
+        let start = highlight
+            .saturating_sub(visible.saturating_sub(1))
+            .min(projects.len().saturating_sub(visible));
+        for (index, project) in projects.iter().enumerate().skip(start).take(visible) {
+            let label = format!(
+                "{}  {}",
+                project.slug,
+                path_display::shorten(&project.path, launch.path_display())
+            );
+            let style = if index == highlight {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(
+                truncate_title(&label, inner_width),
+                style,
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    let column = inner
+        .x
+        .saturating_add(prompt.len() as u16)
+        .saturating_add(query.len() as u16);
+    frame.set_cursor_position((column.min(inner.right().saturating_sub(1)), inner.y));
+}
+
+/// Empty-registry register-path prompt at launch.
+fn render_launch_path(frame: &mut Frame<'_>, input: &str, error: Option<&str>) {
+    let area = frame.area();
+    let width = area.width.min(70);
+    let extra = u16::from(error.is_some());
+    let height = (5 + extra).min(area.height);
+    if width < 4 || height < 3 {
+        return;
+    }
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let popup = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title("new project")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines = vec![
+        Line::from("Register a project directory:"),
+        Line::from(format!("> {input}")),
+    ];
+    if let Some(error) = error {
+        lines.push(Line::from(format!("error: {error}")));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    let column = inner
+        .x
+        .saturating_add(2)
+        .saturating_add(input.chars().count() as u16);
+    frame.set_cursor_position((
+        column.min(inner.right().saturating_sub(1)),
+        inner.y.saturating_add(1),
+    ));
 }
 
 /// One row of `[ label ]` buttons with the highlighted one reversed.
