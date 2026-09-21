@@ -13,7 +13,7 @@ lives in `CONTEXT.md` and `docs/adr/`.
 ## Invocation
 
 ```
-tt [--path PATH] [--json] [--projects] <command>
+tt [--path PATH] [--json] [-p|--projects] <command>
 ```
 
 Project resolution, first match wins:

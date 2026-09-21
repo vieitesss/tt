@@ -29,7 +29,7 @@ struct Cli {
     json: bool,
 
     /// Open the project picker without registering the current directory.
-    #[arg(long, global = true)]
+    #[arg(short = 'p', long, global = true)]
     projects: bool,
 
     #[command(subcommand)]
