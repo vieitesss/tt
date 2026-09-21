@@ -32,3 +32,7 @@ build-release:
 # Run the TUI, optionally against a vault: just run /tmp/vault
 run vault="":
     cargo run -- {{ if vault == "" { "" } else { "--vault " + quote(vault) } }}
+
+install: build-release
+    rm ~/.local/bin/tt | true
+    ln -sf "$(pwd)/target/release/tt" ~/.local/bin/tt
