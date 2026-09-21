@@ -695,7 +695,7 @@ fn edit_without_title_opens_editor_and_prints_the_task() {
         sandbox
             .command()
             .args(["--json", "edit", &id])
-            .env("EDITOR", "/bin/true"),
+            .env("EDITOR", "/usr/bin/true"),
     );
     assert_eq!(value["id"], id);
     assert_eq!(value["title"], "Editable");
