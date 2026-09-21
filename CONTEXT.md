@@ -61,8 +61,10 @@ The rule that turns a working directory into a Project: start from `--path`,
 then `$TT_PATH`, then the current directory; walk ancestors nearest-first; the
 first registered project wins. An unregistered directory can become a project
 (`tt project add`, an interactive prompt, or a silent register from a
-non-interactive `tt add`); a directory nested inside a project resolves to that
-project unless the user asks for a separate one.
+non-interactive `tt add`); the session can instead bind to a different
+already-registered project and leave the directory unregistered. A directory
+nested inside a project resolves to that project unless the user asks for a
+separate one.
 _Avoid_: lookup, matcher
 
 **Sub-task**:
