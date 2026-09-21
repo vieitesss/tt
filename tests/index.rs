@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
 use chrono::NaiveDate;
-use tt::{NewTask, Task, TaskFilter, TaskId, TaskState, Vault, VaultIssueKind};
+use tt::{NewTask, Priority, Task, TaskFilter, TaskId, TaskState, Vault, VaultIssueKind};
 
 fn open_vault() -> (tempfile::TempDir, Vault) {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -305,6 +305,34 @@ fn tag_filter_matches_nested_tags_only_downward() {
 }
 
 #[test]
+fn priority_filter_matches_only_the_exact_priority() {
+    let (_dir, mut vault) = open_vault();
+    let high = vault
+        .add(NewTask {
+            priority: Some(Priority::High),
+            ..NewTask::new("High")
+        })
+        .expect("add high");
+    vault
+        .add(NewTask {
+            priority: Some(Priority::Low),
+            ..NewTask::new("Low")
+        })
+        .expect("add low");
+    vault.add(NewTask::new("None")).expect("add none");
+
+    let matched = ids_matching(
+        &vault,
+        &TaskFilter {
+            priority: Some(Priority::High),
+            ..TaskFilter::default()
+        },
+    );
+
+    assert_eq!(matched, BTreeSet::from([high.id]));
+}
+
+#[test]
 fn links_and_backlinks_ignore_fenced_code_blocks() {
     let (_dir, mut vault) = open_vault();
     let target = add_task(&mut vault, "Target", None, TaskState::Open, &[], "");
@@ -477,6 +505,7 @@ fn filter_combines_state_tag_and_due_today() {
         &TaskFilter {
             tag: Some("work".to_owned()),
             state: Some(TaskState::Open),
+            priority: None,
             due_today: true,
         },
         today,

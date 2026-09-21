@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::Path;
 
-use crate::model::{Task, TaskId, TaskState};
+use crate::model::{Priority, Task, TaskId, TaskState};
 use crate::vault::{VaultIssue, VaultIssueKind};
 
 /// A task together with its subtree, as returned by [`crate::Vault::tree`].
@@ -32,6 +32,8 @@ pub struct TaskFilter {
     pub tag: Option<String>,
     /// Exact lifecycle state to match.
     pub state: Option<TaskState>,
+    /// Exact priority to match. Tasks without priority do not match.
+    pub priority: Option<Priority>,
     /// Keep only tasks due on or before the `today` passed to
     /// [`crate::Vault::filter`] (overdue included).
     pub due_today: bool,

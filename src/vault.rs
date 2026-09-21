@@ -373,10 +373,13 @@ impl Vault {
             .values()
             .filter(|task| {
                 let state_ok = filter.state.is_none_or(|state| task.state == state);
+                let priority_ok = filter
+                    .priority
+                    .is_none_or(|priority| task.priority == Some(priority));
                 let tag_ok = tag_query
                     .is_none_or(|query| task.tags.iter().any(|tag| tag_matches(tag, query)));
                 let due_ok = !filter.due_today || task.due.is_some_and(|due| due <= today);
-                state_ok && tag_ok && due_ok
+                state_ok && priority_ok && tag_ok && due_ok
             })
             .collect()
     }
@@ -452,6 +455,34 @@ impl Vault {
     pub fn set_state(&mut self, id: &TaskId, state: TaskState) -> Result<Task, VaultError> {
         let mut task = self.cloned(id)?;
         task.state = state;
+        self.persist(task)
+    }
+
+    /// Set or clear the priority of an existing task and persist it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::NotFound`] for an unknown id or
+    /// [`VaultError::Io`] when the file cannot be written.
+    pub fn set_priority(
+        &mut self,
+        id: &TaskId,
+        priority: Option<Priority>,
+    ) -> Result<Task, VaultError> {
+        let mut task = self.cloned(id)?;
+        task.priority = priority;
+        self.persist(task)
+    }
+
+    /// Replace an existing task's tags, normalizing them before persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::NotFound`] for an unknown id or
+    /// [`VaultError::Io`] when the file cannot be written.
+    pub fn set_tags(&mut self, id: &TaskId, tags: Vec<String>) -> Result<Task, VaultError> {
+        let mut task = self.cloned(id)?;
+        task.tags = normalize_tags(tags);
         self.persist(task)
     }
 
@@ -890,6 +921,44 @@ mod tests {
         assert_eq!(after_task.body, "body [[link]]\n");
         assert_eq!(after_task.tags, vec!["work".to_owned()]);
         assert_eq!(read_task_file(&vault, &other.id), other_before);
+    }
+
+    #[test]
+    fn set_priority_persists_and_round_trips() {
+        let (_dir, mut vault) = open_vault();
+        let task = vault.add(NewTask::new("Prioritize me")).expect("add");
+
+        let updated = vault
+            .set_priority(&task.id, Some(Priority::High))
+            .expect("set priority");
+        assert_eq!(updated.priority, Some(Priority::High));
+
+        let stored = Task::from_document(&read_task_file(&vault, &task.id)).expect("parse");
+        assert_eq!(stored.priority, Some(Priority::High));
+
+        vault.set_priority(&task.id, None).expect("clear priority");
+        let reopened = Vault::open(vault.root()).expect("reopen vault");
+        assert_eq!(reopened.get(&task.id).expect("task").priority, None);
+    }
+
+    #[test]
+    fn set_tags_normalizes_persists_and_round_trips() {
+        let (_dir, mut vault) = open_vault();
+        let task = vault.add(NewTask::new("Tag me")).expect("add");
+
+        let updated = vault
+            .set_tags(
+                &task.id,
+                vec![" #work ".to_owned(), "work".to_owned(), "#home".to_owned()],
+            )
+            .expect("set tags");
+        assert_eq!(updated.tags, vec!["work".to_owned(), "home".to_owned()]);
+
+        let reopened = Vault::open(vault.root()).expect("reopen vault");
+        assert_eq!(
+            reopened.get(&task.id).expect("task").tags,
+            vec!["work".to_owned(), "home".to_owned()]
+        );
     }
 
     #[test]

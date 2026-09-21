@@ -524,6 +524,7 @@ fn list(vault: &Vault, args: &ListArgs, json: bool) -> Result<()> {
     let filter = TaskFilter {
         tag: args.tag.clone(),
         state: args.state.map(TaskState::from),
+        priority: None,
         due_today: args.due_today,
     };
     let today = Local::now().date_naive();
