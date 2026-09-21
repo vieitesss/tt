@@ -326,7 +326,9 @@ fn scan_line(body: &str, start: usize, end: usize, links: &mut Vec<WikiLink>) {
             index = close + 2 - start;
             continue;
         }
-        index += 1;
+        // Advance one whole char, never one byte: `&line[index..]` above
+        // must stay on a UTF-8 boundary.
+        index += rest.chars().next().map_or(1, char::len_utf8);
     }
 }
 
@@ -397,6 +399,38 @@ pub(crate) fn tag_matches(task_tag: &str, query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_wikilinks_does_not_panic_on_multibyte_utf8() {
+        // Regression: the scanner advanced one byte at a time, so any
+        // multi-byte char on a scanned line made `&line[index..]` land
+        // inside the char and panic (e.g. a body mentioning "muñecos").
+        let body = "se ve en un diagrama a firestartr en el medio, desde los laterales hay \
+                    alguien ( muñecos? humanos simplificados? ) enviando órdenes ( \
+                    gráficamente se tiene que ver que les envían ordenes) y el habla con \
+                    github / gitlab para gráficamente ( de alguna manera) se ve como crea \
+                    componentes, grupos... y al mismo tiempo habla con un icono de la cloud - \
+                    (que se vea que es multi-cloud) [[id00000001]]\n\
+                    ñ only\n";
+        let links = parse_wikilinks(body);
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target.as_str(), "id00000001");
+    }
+
+    #[test]
+    fn parse_wikilinks_keeps_spans_correct_around_multibyte_chars() {
+        let body = "niño [[id00000001|título ñ]] fin";
+        let links = parse_wikilinks(body);
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].alias.as_deref(), Some("título ñ"));
+        assert_eq!(
+            &body[links[0].alias_span.clone().expect("alias span")],
+            "título ñ",
+            "byte spans stay exact with multi-byte chars before and inside the link"
+        );
+    }
 
     #[test]
     fn extract_links_dedupes_in_order() {
