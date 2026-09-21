@@ -194,13 +194,15 @@ $ echo $?
 
 ## TUI
 
-Bare `tt` opens the list for the resolved project: one indented row per task
-in pre-order, with tree guides, a fold marker on parents, a state glyph, and
-quiet right-aligned metadata only when present (relative due, priority, and the
-`done/total` rollup). The header shows the project path (never the invisible
-store) and the issue badge. The footer is three rows: the first two show key
-hints for the current mode (or the live input prompt on the first), and the
-last the project slug and task count. Short-lived confirmations and errors
+Bare `tt` opens the list for the resolved project: by default, one indented
+row per task in pre-order, with tree guides, a fold marker on parents, a state
+glyph, and quiet right-aligned metadata only when present (relative due,
+priority, and the `done/total` rollup). A session-only filter replaces that
+view with matching tasks as depth-zero rows. The header shows the project path
+(never the invisible store) and the issue badge. The footer is three rows: the
+first two show key hints for the current mode (or the live input prompt on the
+first), and the last the project slug and task count plus the active filter, if
+any. Short-lived confirmations and errors
 appear as a toast popup above the footer that dismisses itself after about
 three seconds and never takes focus.
 The list is the smaller pane; the larger right-hand preview follows the
@@ -224,6 +226,9 @@ Link and backlink navigation stays on `o`.
 | `a`/`A` | Add a child under / a sibling of the selection |
 | `N` | Quick capture to the configured `capture_target`, else the project root |
 | `x` | Cycle the selection (or every marked task) open ↔ done; cancelled tasks are left unchanged |
+| `!` | Set or clear priority on the selection (or every marked task) |
+| `t` | Toggle an existing tag, or add a typed tag, on the selection (or every marked task) |
+| `f` | Filter by one state, priority, or tag; matching tasks form a flat session-only list, and `clear filter` restores the tree |
 | `Tab` | Toggle the current row in the multi-selection; `Esc` clears the selection first |
 | `m` | Move the selection (or every marked task) under another task or `⌂ root` |
 | `d` | Delete the selection (or every marked task) and its descendants after confirming |
@@ -239,7 +244,7 @@ Link and backlink navigation stays on `o`.
 
 `Tab` builds a multi-selection; marked rows show a `▪` marker in the reserved
 left gutter over a yellow background, and the footer switches to selection
-hints. While anything is marked, `m`, `d`, and `x` act on every marked task;
+hints. While anything is marked, `m`, `d`, `x`, `!`, and `t` act on every marked task;
 with nothing marked they act on the selection alone.
 `m` opens a `move under…` picker offering `⌂ root` plus every task outside the
 moving set and its descendants; committing unfolds the new parent and selects

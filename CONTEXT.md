@@ -103,9 +103,16 @@ implies `#work`). Tags are pure labels: they have no state, no description, and
 are not Tasks.
 _Avoid_: category, label
 
+**Filter**:
+A session-only lens over the List that keeps Tasks matching one state, priority,
+or Tag. Matches appear as independent depth-zero rows regardless of their
+parent relationships; clearing the Filter restores the default tree.
+_Avoid_: sort, search
+
 **List**:
-The only main view: the current project's task tree as an indented list in
-pre-order, parents above children. A Task whose parent is missing or part of a
+The only main view: by default, the current project's task tree as an indented
+list in pre-order, parents above children; a Filter temporarily flattens its
+matching Tasks. A Task whose parent is missing or part of a
 cycle renders as a root (see **Dangling**). Each row is a state glyph (`○` open, `●`
 done, `—` cancelled), the title, and quiet right-aligned metadata only when
 present (relative due, priority, `done/total` rollup); parents also carry a
