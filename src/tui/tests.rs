@@ -456,6 +456,116 @@ fn adding_a_child_under_a_collapsed_parent_expands_it() {
 }
 
 #[test]
+fn priority_picker_sets_high_and_none_clears_it() {
+    let (_dir, mut app) = setup();
+    let task = add_task(&mut app, "Prioritize me", None);
+    app.refresh();
+
+    app.handle_key(key(KeyCode::Char('!')));
+    assert!(matches!(app.picker_kind(), Some(PickerKind::Priority)));
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.vault.get(&task).expect("task").priority,
+        Some(Priority::High)
+    );
+
+    app.handle_key(key(KeyCode::Char('!')));
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Down));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.vault.get(&task).expect("task").priority, None);
+}
+
+#[test]
+fn tag_picker_toggles_an_existing_tag_and_adds_a_new_query() {
+    let (_dir, mut app) = setup();
+    let task = app
+        .vault
+        .add(NewTask {
+            tags: vec!["home".to_owned()],
+            ..NewTask::new("Tag me")
+        })
+        .expect("add")
+        .id;
+    app.vault
+        .add(NewTask {
+            tags: vec!["work".to_owned()],
+            ..NewTask::new("Tag source")
+        })
+        .expect("add");
+    app.refresh();
+
+    app.handle_key(key(KeyCode::Char('t')));
+    assert!(matches!(app.picker_kind(), Some(PickerKind::Tags)));
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.vault.get(&task).expect("task").tags.is_empty());
+    assert_eq!(
+        app.toast.as_ref().map(|toast| toast.text.as_str()),
+        Some("tag #home removed")
+    );
+
+    app.handle_key(key(KeyCode::Char('t')));
+    for character in "#new".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.vault.get(&task).expect("task").tags,
+        vec!["new".to_owned()]
+    );
+    assert_eq!(
+        app.toast.as_ref().map(|toast| toast.text.as_str()),
+        Some("tag #new added")
+    );
+}
+
+#[test]
+fn tag_key_uses_a_prompt_when_the_vault_has_no_tags() {
+    let (_dir, mut app) = setup();
+    let task = add_task(&mut app, "First tag", None);
+    app.refresh();
+
+    app.handle_key(key(KeyCode::Char('t')));
+    assert_eq!(app.mode, InputMode::Tag);
+    assert_eq!(app.prompt_prefix().as_deref(), Some("tag: "));
+    for character in " #work ".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(app.mode, InputMode::Navigate);
+    assert_eq!(
+        app.vault.get(&task).expect("task").tags,
+        vec!["work".to_owned()]
+    );
+}
+
+#[test]
+fn priority_picker_applies_to_every_marked_task() {
+    let (_dir, mut app) = setup();
+    let first = add_task(&mut app, "First", None);
+    let second = add_task(&mut app, "Second", None);
+    app.refresh();
+
+    app.handle_key(key(KeyCode::Tab));
+    app.handle_key(key(KeyCode::Char('j')));
+    app.handle_key(key(KeyCode::Tab));
+    app.handle_key(key(KeyCode::Char('!')));
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(
+        app.vault.get(&first).expect("first").priority,
+        Some(Priority::High)
+    );
+    assert_eq!(
+        app.vault.get(&second).expect("second").priority,
+        Some(Priority::High)
+    );
+    assert!(app.marked.is_empty(), "a bulk action clears the marks");
+}
+
+#[test]
 fn x_still_toggles_a_collapsed_parent() {
     let (_dir, mut app) = setup();
     let (parent, _child, _grandchild, _sibling) = fold_fixture(&mut app);
@@ -1910,6 +2020,7 @@ fn priority_and_rollup_render_without_link_marks() {
         })
         .expect("add");
     app.refresh();
+    app.selected = Some(parent.clone());
 
     let areas = layout(Rect::new(0, 0, 120, 20));
     let lines = render_lines(&mut app, 120, 20);
@@ -1919,8 +2030,201 @@ fn priority_and_rollup_render_without_link_marks() {
     assert!(!list.contains('⇄'), "list rows carry no link mark: {list}");
 
     let cells = render_cells(&mut app, 120, 20);
-    let priority = style_at_text(&cells, "!");
-    assert_eq!(priority.fg, Some(Color::Red), "{priority:?}");
+    let list_priority = style_at_text_in(&cells, "!", areas.list);
+    assert_eq!(list_priority.bg, Some(Color::Red), "{list_priority:?}");
+    assert_eq!(
+        list_priority.fg,
+        Some(Color::Rgb(255, 255, 255)),
+        "{list_priority:?}"
+    );
+    assert!(
+        !list_priority.add_modifier.contains(Modifier::REVERSED),
+        "the selected row must not invert the priority contrast: {list_priority:?}"
+    );
+    let preview_priority = style_at_text_in(&cells, "! high", areas.preview);
+    assert_eq!(
+        preview_priority.bg,
+        Some(Color::Red),
+        "{preview_priority:?}"
+    );
+    assert_eq!(
+        preview_priority.fg,
+        Some(Color::Rgb(255, 255, 255)),
+        "{preview_priority:?}"
+    );
+}
+
+#[test]
+fn state_filter_flattens_matching_parent_and_child() {
+    let (_dir, mut app) = setup();
+    let parent = add_task(&mut app, "Parent", None);
+    let child = add_task(&mut app, "Child", Some(&parent));
+    let done = add_task(&mut app, "Done", Some(&parent));
+    app.vault.set_state(&done, TaskState::Done).expect("done");
+    app.refresh();
+
+    app.handle_key(key(KeyCode::Char('f')));
+    assert!(matches!(app.picker_kind(), Some(PickerKind::Filter)));
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(app.list.len(), 2);
+    for id in [&parent, &child] {
+        let row = &app.list.rows()[app.list.index_of(id).expect("matching row")];
+        assert_eq!(row.depth, 0, "filtered rows are all roots");
+        assert!(!row.has_children, "filtered rows have no tree markers");
+        assert!(row.guides().is_empty());
+    }
+    assert!(app.list.index_of(&done).is_none());
+    assert!(app.context_text().contains("[filter open]"));
+}
+
+#[test]
+fn clearing_filter_restores_tree_without_writing_files() {
+    let (_dir, mut app) = setup();
+    let parent = add_task(&mut app, "Parent", None);
+    let child = add_task(&mut app, "Child", Some(&parent));
+    app.refresh();
+    app.selected = Some(child.clone());
+    let parent_path = app.vault.root().join(format!("{parent}.md"));
+    let child_path = app.vault.root().join(format!("{child}.md"));
+    let before = (
+        fs::read(&parent_path).expect("read parent"),
+        fs::read(&child_path).expect("read child"),
+    );
+
+    app.handle_key(key(KeyCode::Char('f')));
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.selected_id(), Some(child.clone()));
+    assert_eq!(app.list.rows()[app.list.index_of(&child).unwrap()].depth, 0);
+
+    app.handle_key(key(KeyCode::Char('f')));
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.active_filter.is_none());
+    assert_eq!(app.selected_id(), Some(child.clone()));
+    let child_row = &app.list.rows()[app.list.index_of(&child).expect("child row")];
+    assert_eq!(child_row.depth, 1, "the tree is restored");
+    assert!(app.list.rows()[app.list.index_of(&parent).unwrap()].has_children);
+    assert_eq!(
+        before,
+        (
+            fs::read(parent_path).expect("read parent"),
+            fs::read(child_path).expect("read child"),
+        ),
+        "filtering is entirely in memory"
+    );
+}
+
+#[test]
+fn tag_filter_flattens_matching_rows() {
+    let (_dir, mut app) = setup();
+    let parent = add_task(&mut app, "Parent", None);
+    let child = add_task(&mut app, "Child", Some(&parent));
+    let other = add_task(&mut app, "Other", None);
+    app.vault
+        .set_tags(&parent, vec!["work".to_owned()])
+        .expect("tag parent");
+    app.vault
+        .set_tags(&child, vec!["work".to_owned()])
+        .expect("tag child");
+    app.refresh();
+
+    app.handle_key(key(KeyCode::Char('f')));
+    for character in "#work".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(app.list.len(), 2);
+    assert!(app.list.index_of(&other).is_none());
+    assert!(app.list.rows().iter().all(|row| row.depth == 0));
+    assert!(app.context_text().contains("[filter #work]"));
+}
+
+#[test]
+fn priority_filter_flattens_matching_rows() {
+    let (_dir, mut app) = setup();
+    let parent = add_task(&mut app, "Parent", None);
+    let child = add_task(&mut app, "Child", Some(&parent));
+    let other = add_task(&mut app, "Other", None);
+    app.vault
+        .set_priority(&parent, Some(Priority::High))
+        .expect("prioritize parent");
+    app.vault
+        .set_priority(&child, Some(Priority::High))
+        .expect("prioritize child");
+    app.refresh();
+
+    app.handle_key(key(KeyCode::Char('f')));
+    for character in "high".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(app.list.len(), 2);
+    assert!(app.list.index_of(&other).is_none());
+    assert!(app.list.rows().iter().all(|row| row.depth == 0));
+    assert!(app.context_text().contains("[filter high]"));
+}
+
+#[test]
+fn filtered_search_only_matches_visible_rows_and_folds_are_no_ops() {
+    let (_dir, mut app) = setup();
+    let parent = add_task(&mut app, "Needle parent", None);
+    let child = add_task(&mut app, "Needle child", Some(&parent));
+    let hidden = add_task(&mut app, "Needle done", None);
+    app.vault
+        .set_state(&hidden, TaskState::Done)
+        .expect("mark done");
+    app.refresh();
+
+    app.handle_key(key(KeyCode::Char('f')));
+    app.handle_key(key(KeyCode::Enter));
+    app.selected = Some(parent.clone());
+    app.handle_key(key(KeyCode::Char('h')));
+    app.handle_key(key(KeyCode::Char('l')));
+    assert_eq!(app.selected_id(), Some(parent));
+    assert_eq!(app.list.len(), 2, "fold keys do not change a flat filter");
+    assert!(app.list.index_of(&child).is_some());
+
+    app.handle_key(key(KeyCode::Char('/')));
+    for character in "needle".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    let matches = app.search_matches();
+    assert_eq!(matches.len(), 2);
+    assert!(
+        !matches.contains(&hidden),
+        "hidden filtered rows do not match"
+    );
+}
+
+#[test]
+fn a_new_nonmatching_task_stays_hidden_by_the_filter() {
+    let (_dir, mut app) = setup();
+    let visible = add_task(&mut app, "Already done", None);
+    app.vault
+        .set_state(&visible, TaskState::Done)
+        .expect("mark done");
+    app.refresh();
+
+    app.handle_key(key(KeyCode::Char('f')));
+    for character in "done".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Char('A')));
+    for character in "New open task".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+
+    let created = app
+        .vault
+        .tasks()
+        .find(|task| task.title == "New open task")
+        .expect("created task");
+    assert!(app.list.index_of(&created.id).is_none());
+    assert_eq!(app.selected_id(), Some(visible));
 }
 
 #[test]
@@ -2103,6 +2407,7 @@ fn hints_describe_the_list_keymap() {
         "h/l fold",
         "tab sel",
         "/ find",
+        "f filter",
         "o links",
         "? issues",
         "q quit",
@@ -2113,7 +2418,8 @@ fn hints_describe_the_list_keymap() {
         );
     }
     for expected in [
-        "a/A add", "N cap", "x state", "m mv", "d del", "L link", "r rename", "e edit", "p/P proj",
+        "a/A add", "N cap", "x state", "! pri", "t tags", "m mv", "d del", "L link", "r rename",
+        "e edit", "p/P proj",
     ] {
         assert!(
             actions.contains(expected),
@@ -2124,8 +2430,8 @@ fn hints_describe_the_list_keymap() {
     // one of them.
     let all_hints = format!("{nav} {actions}");
     for key in [
-        "j/k", "gg/G", "h/l", "tab", "/", "o", "?", "q", "a/A", "N", "x", "m", "d", "L", "r", "e",
-        "p/P",
+        "j/k", "gg/G", "h/l", "tab", "/", "f", "o", "?", "q", "a/A", "N", "x", "!", "t", "m", "d",
+        "L", "r", "e", "p/P",
     ] {
         assert!(
             all_hints.contains(key),
@@ -4278,7 +4584,10 @@ fn unregistered_p_with_empty_registry_opens_the_path_prompt() {
     assert!(launch.ready(), "registered the typed path");
     let (config, project) = launch.into_parts();
     assert_eq!(config.projects.len(), 1);
-    assert_eq!(project.path, other);
+    assert_eq!(
+        project.path,
+        fs::canonicalize(other).expect("canonical registered path")
+    );
 }
 
 #[test]

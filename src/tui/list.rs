@@ -8,7 +8,8 @@
 
 use std::collections::HashSet;
 
-use tt::{TaskId, TreeNode, Vault};
+use chrono::NaiveDate;
+use tt::{TaskFilter, TaskId, TreeNode, Vault};
 
 /// One row of the flattened task list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +62,32 @@ impl TaskList {
         for (index, node) in tree.iter().enumerate() {
             push_node(node, 0, &[], index + 1 == root_count, collapsed, &mut rows);
         }
+        Self { rows }
+    }
+
+    /// Build a flat projection of every matching task. Tree relationships,
+    /// folds, guides, and parent markers are deliberately ignored.
+    pub(crate) fn build_filtered(vault: &Vault, filter: &TaskFilter, today: NaiveDate) -> Self {
+        let mut tasks = vault.filter(filter, today);
+        tasks.sort_by(|a, b| {
+            a.title
+                .to_lowercase()
+                .cmp(&b.title.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let count = tasks.len();
+        let rows = tasks
+            .into_iter()
+            .enumerate()
+            .map(|(index, task)| ListRow {
+                id: task.id.clone(),
+                depth: 0,
+                ancestors_continue: Vec::new(),
+                is_last: index + 1 == count,
+                has_children: false,
+                folded: false,
+            })
+            .collect();
         Self { rows }
     }
 

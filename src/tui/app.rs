@@ -17,12 +17,12 @@ use std::time::Duration;
 use chrono::{Local, NaiveDate};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tt::{
-    registry, Config, DeleteOutcome, NewTask, Project, TaskId, TreeNode, Vault, VaultIssue,
-    VaultWatcher,
+    registry, Config, DeleteOutcome, NewTask, Priority, Project, TaskId, TreeNode, Vault,
+    VaultIssue, VaultWatcher,
 };
 
 use super::list::TaskList;
-use super::picker::{self, Picker, PickerKind};
+use super::picker::{self, FilterChoice, FilterCriterion, Picker, PickerKind};
 
 /// How often the event loop wakes to check for external changes.
 pub(crate) const TICK: Duration = Duration::from_millis(250);
@@ -31,11 +31,11 @@ pub(crate) const TICK: Duration = Duration::from_millis(250);
 pub(crate) const TOAST_TICKS: u32 = 12;
 
 const LIST_NAV_HINTS: &str =
-    "j/k move · gg/G ends · h/l fold · tab sel · / find · o links · ? issues · q quit";
+    "j/k move·gg/G ends·h/l fold·tab sel·/ find·f filter·o links·? issues·q quit";
 const LIST_ACTION_HINTS: &str =
-    "a/A add · N cap · x state · m mv · d del · L link · r rename · e edit · p/P proj";
+    "a/A add·N cap·x state·! pri·t tags·m mv·d del·L link·r rename·e edit·p/P proj";
 const SELECTION_NAV_HINTS: &str = "tab un/select · j/k move · esc clear";
-const SELECTION_ACTION_HINTS: &str = "m move · d delete · x cycle state";
+const SELECTION_ACTION_HINTS: &str = "m move · d delete · x cycle state · ! priority · t tags";
 const CONFIRM_DELETE_HINTS: &str = "←/→ select · enter confirm · y confirm · esc cancel";
 const ISSUES_HINTS: &str = "? or esc close · q quit";
 const REGISTER_HINTS: &str = "enter register · esc cancel";
@@ -71,6 +71,8 @@ pub(crate) enum InputMode {
     },
     /// Typing a title for `N` quick capture.
     Capture,
+    /// Typing the first tag when the vault has no defined tags yet.
+    Tag,
     /// Typing a directory path for `P` to register a new project.
     RegisterPath,
     /// Confirming a destructive delete (`d`); `ids` is a snapshot of the
@@ -83,7 +85,7 @@ pub(crate) enum InputMode {
         /// Highlighted button: 0 = Delete, 1 = Cancel.
         button: usize,
     },
-    /// A `/`, `p`, or `o` picker is open.
+    /// A shared type-to-filter picker is open.
     Pick(Picker),
 }
 
@@ -117,6 +119,9 @@ pub(crate) struct App {
     pub(crate) should_quit: bool,
     /// The flattened task tree, rebuilt on every refresh.
     pub(crate) list: TaskList,
+    /// Active session-only list filter. A filtered list is flat and ignores
+    /// all tree relationships.
+    pub(crate) active_filter: Option<FilterCriterion>,
     /// Ids whose children are hidden in the list. In-memory only; folds are
     /// never persisted.
     pub(crate) collapsed: HashSet<TaskId>,
@@ -172,6 +177,7 @@ impl App {
             issues_cursor: 0,
             should_quit: false,
             list: TaskList::default(),
+            active_filter: None,
             collapsed: HashSet::new(),
             marked: BTreeSet::new(),
             list_scroll: 0,
@@ -231,7 +237,10 @@ impl App {
         // re-introduce a selection that a fold currently hides; unfold its
         // ancestors instead of losing the user's place.
         if let Some(id) = self.selected.clone() {
-            if self.vault.get(&id).is_some() && self.list.index_of(&id).is_none() {
+            if self.active_filter.is_none()
+                && self.vault.get(&id).is_some()
+                && self.list.index_of(&id).is_none()
+            {
                 self.unfold_ancestors(&id);
                 self.rebuild_list();
             }
@@ -293,6 +302,7 @@ impl App {
             InputMode::Add { .. }
             | InputMode::Capture
             | InputMode::Rename { .. }
+            | InputMode::Tag
             | InputMode::RegisterPath => {
                 self.handle_input(key);
             }
@@ -353,6 +363,7 @@ impl App {
                 self.parent_label(self.config.capture_target.as_ref())
             )),
             InputMode::Rename { .. } => Some("rename to: ".to_owned()),
+            InputMode::Tag => Some("tag: ".to_owned()),
             InputMode::Pick(picker) => Some(picker.kind.prompt().to_owned()),
         }
     }
@@ -413,6 +424,9 @@ impl App {
             format!("{count} tasks")
         };
         let mut text = format!("{scope} · {tasks}");
+        if let Some(filter) = &self.active_filter {
+            text.push_str(&format!("  [filter {}]", filter.label()));
+        }
         if self.external_change_pending {
             text.push_str("  [external change pending]");
         }
@@ -430,6 +444,7 @@ impl App {
             InputMode::Add { .. }
             | InputMode::Capture
             | InputMode::Rename { .. }
+            | InputMode::Tag
             | InputMode::RegisterPath
             | InputMode::ConfirmDelete { .. } => true,
             InputMode::Pick(picker) => picker.kind.holds_buffer(),
@@ -468,6 +483,9 @@ impl App {
                 self.status = None;
             }
             KeyCode::Char('x') => self.toggle_done(),
+            KeyCode::Char('!') => self.start_priority_pick(),
+            KeyCode::Char('t') => self.start_tag_edit(),
+            KeyCode::Char('f') => self.start_filter_pick(),
             KeyCode::Char('m') => self.start_move_pick(),
             KeyCode::Char('d') => self.start_delete(),
             KeyCode::Char('L') => self.start_create_link(),
@@ -518,7 +536,12 @@ impl App {
 
     /// Rebuild the flattened list from the vault and the current folds.
     fn rebuild_list(&mut self) {
-        self.list = TaskList::build(&self.vault, &self.collapsed);
+        self.list = match &self.active_filter {
+            Some(filter) => {
+                TaskList::build_filtered(&self.vault, &filter.task_filter(), self.today)
+            }
+            None => TaskList::build(&self.vault, &self.collapsed),
+        };
     }
 
     /// `Tab`: toggle the cursor row in the multi-selection set. Folds never
@@ -559,13 +582,18 @@ impl App {
     fn select_id(&mut self, id: TaskId) {
         self.unfold_ancestors(&id);
         self.rebuild_list();
-        self.selected = Some(id);
+        if self.list.index_of(&id).is_some() {
+            self.selected = Some(id);
+        }
         self.ensure_selection_visible();
     }
 
     /// `h`/Left: collapse the selected parent, or jump to its parent when it
     /// has no visible children to collapse (navigator behavior).
     fn fold_selection(&mut self) {
+        if self.active_filter.is_some() {
+            return;
+        }
         let Some(id) = self.selected.clone() else {
             return;
         };
@@ -583,6 +611,9 @@ impl App {
 
     /// `l`/Right: expand the selected collapsed parent; a no-op otherwise.
     fn unfold_selection(&mut self) {
+        if self.active_filter.is_some() {
+            return;
+        }
         let Some(id) = self.selected.clone() else {
             return;
         };
@@ -767,8 +798,8 @@ impl App {
     }
 
     /// Leave the open picker without committing. Search restores the
-    /// selection from before it opened, then applies any reload held back by
-    /// the buffer.
+    /// selection from before it opened; any picker with a protected buffer
+    /// then applies its pending reload.
     fn cancel_pick(&mut self) {
         let Some(kind) = self.picker_kind().cloned() else {
             return;
@@ -776,10 +807,11 @@ impl App {
         self.mode = InputMode::Navigate;
         self.input.clear();
         self.status = None;
-        if let PickerKind::Search { previous } = kind {
-            if let Some(id) = previous {
-                self.selected = Some(id);
-            }
+        let held_reload = kind.holds_buffer();
+        if let PickerKind::Search { previous: Some(id) } = kind {
+            self.selected = Some(id);
+        }
+        if held_reload {
             self.settle_pending_reload();
         }
     }
@@ -791,6 +823,9 @@ impl App {
             Some(PickerKind::Project) => self.project_matches().len(),
             Some(PickerKind::Link { .. }) => self.link_matches().len(),
             Some(PickerKind::Move { .. }) => self.move_matches().len(),
+            Some(PickerKind::Priority) => self.priority_matches().len(),
+            Some(PickerKind::Tags) => self.tag_matches().len(),
+            Some(PickerKind::Filter) => self.filter_matches().len(),
             Some(PickerKind::CreateLink { .. }) => self.create_link_matches().len(),
             None => 0,
         }
@@ -851,8 +886,7 @@ impl App {
         self.reset_pick_highlight();
     }
 
-    /// Commit the open picker: search selects, project switches, link jumps,
-    /// move reparents.
+    /// Commit the open picker using its kind-specific action.
     fn commit_pick(&mut self) {
         let Some(kind) = self.picker_kind().cloned() else {
             return;
@@ -862,6 +896,9 @@ impl App {
             PickerKind::Project => self.commit_project_pick(),
             PickerKind::Link { .. } => self.commit_link_pick(),
             PickerKind::Move { .. } => self.commit_move_pick(),
+            PickerKind::Priority => self.commit_priority_pick(),
+            PickerKind::Tags => self.commit_tag_pick(),
+            PickerKind::Filter => self.commit_filter_pick(),
             PickerKind::CreateLink { .. } => self.commit_create_link(),
         }
     }
@@ -899,7 +936,23 @@ impl App {
     /// tree pre-order. Folds never hide a search match; selecting one unfolds
     /// its ancestors.
     pub(crate) fn search_matches(&self) -> Vec<TaskId> {
-        picker::search_matches(&self.input, &self.vault)
+        if self.active_filter.is_none() {
+            return picker::search_matches(&self.input, &self.vault);
+        }
+        let query = self.input.trim().to_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        self.list
+            .rows()
+            .iter()
+            .filter_map(|row| {
+                self.vault
+                    .get(&row.id)
+                    .filter(|task| task.title.to_lowercase().contains(&query))
+                    .map(|task| task.id.clone())
+            })
+            .collect()
     }
 
     /// Select the highlighted match and leave search. An empty match list
@@ -1065,6 +1118,189 @@ impl App {
                 "cycled {count} {}",
                 if count == 1 { "task" } else { "tasks" }
             ));
+            self.marked.clear();
+        }
+    }
+
+    /// Open the session-only filter picker (`f`).
+    fn start_filter_pick(&mut self) {
+        self.mode = InputMode::Pick(Picker::new(PickerKind::Filter));
+        self.input.clear();
+        self.status = None;
+    }
+
+    /// Filter choices matching the live query.
+    pub(crate) fn filter_matches(&self) -> Vec<FilterChoice> {
+        if !matches!(self.picker_kind(), Some(PickerKind::Filter)) {
+            return Vec::new();
+        }
+        picker::filter_matches(&self.input, &self.vault, self.active_filter.is_some())
+    }
+
+    /// Apply or clear the highlighted filter while retaining the selected id
+    /// when it remains visible.
+    fn commit_filter_pick(&mut self) {
+        let Some(highlight) = self.picker_highlight() else {
+            return;
+        };
+        let matches = self.filter_matches();
+        let Some(choice) = matches.get(highlight.min(matches.len().saturating_sub(1))) else {
+            return;
+        };
+        self.active_filter = match choice {
+            FilterChoice::Clear => None,
+            FilterChoice::Apply(filter) => Some(filter.clone()),
+        };
+        self.mode = InputMode::Navigate;
+        self.input.clear();
+        self.status = None;
+        self.refresh();
+    }
+
+    /// Start tag editing (`t`) for the active selection set. Existing tags
+    /// use the shared picker; the first tag uses a plain prompt.
+    fn start_tag_edit(&mut self) {
+        if self.action_ids().is_empty() {
+            return;
+        }
+        self.mode = if picker::all_tags(&self.vault).is_empty() {
+            InputMode::Tag
+        } else {
+            InputMode::Pick(Picker::new(PickerKind::Tags))
+        };
+        self.input.clear();
+        self.status = None;
+    }
+
+    /// Existing tags matching the live picker query.
+    pub(crate) fn tag_matches(&self) -> Vec<String> {
+        if !matches!(self.picker_kind(), Some(PickerKind::Tags)) {
+            return Vec::new();
+        }
+        picker::tag_matches(&self.input, &self.vault)
+    }
+
+    /// Commit the tag picker: toggle the highlighted existing tag, or add a
+    /// normalized non-empty query when no existing tag matches it.
+    fn commit_tag_pick(&mut self) {
+        let Some(highlight) = self.picker_highlight() else {
+            return;
+        };
+        self.settle_pending_reload();
+        let matches = self.tag_matches();
+        let (tag, toggle) = if matches.is_empty() {
+            let tag = picker::normalize_tag(&self.input);
+            if tag.is_empty() {
+                return;
+            }
+            (tag, false)
+        } else {
+            (matches[highlight.min(matches.len() - 1)].clone(), true)
+        };
+        self.apply_tag(&tag, toggle);
+    }
+
+    /// Add `tag` to every action task, or toggle it independently when
+    /// `toggle` is true.
+    fn apply_tag(&mut self, tag: &str, toggle: bool) {
+        let ids = self.action_ids();
+        let had_marks = !self.marked.is_empty();
+        let mut added = false;
+        let mut removed = false;
+        for id in &ids {
+            let Some(task) = self.vault.get(id) else {
+                continue;
+            };
+            let mut tags = task.tags.clone();
+            if toggle && tags.iter().any(|existing| existing == tag) {
+                tags.retain(|existing| existing != tag);
+                removed = true;
+            } else if !tags.iter().any(|existing| existing == tag) {
+                tags.push(tag.to_owned());
+                added = true;
+            }
+            if let Err(error) = self.vault.set_tags(id, tags) {
+                self.mode = InputMode::Navigate;
+                self.input.clear();
+                self.refresh();
+                self.set_toast(format!("error: {error}"));
+                return;
+            }
+        }
+        self.mode = InputMode::Navigate;
+        self.input.clear();
+        self.status = None;
+        self.refresh();
+        let action = match (added, removed) {
+            (true, true) => "toggled",
+            (false, true) => "removed",
+            _ => "added",
+        };
+        self.set_toast(format!("tag #{tag} {action}"));
+        if had_marks {
+            self.marked.clear();
+        }
+    }
+
+    /// Commit the first-tag prompt. Blank input closes without writing.
+    fn commit_tag_prompt(&mut self) {
+        self.settle_pending_reload();
+        let tag = picker::normalize_tag(&self.input);
+        if tag.is_empty() {
+            self.finish_input();
+            return;
+        }
+        self.apply_tag(&tag, false);
+    }
+
+    /// Start the priority picker (`!`) for the active selection set.
+    fn start_priority_pick(&mut self) {
+        if self.action_ids().is_empty() {
+            return;
+        }
+        self.mode = InputMode::Pick(Picker::new(PickerKind::Priority));
+        self.input.clear();
+        self.status = None;
+    }
+
+    /// Priority values matching the live query.
+    pub(crate) fn priority_matches(&self) -> Vec<Option<Priority>> {
+        if !matches!(self.picker_kind(), Some(PickerKind::Priority)) {
+            return Vec::new();
+        }
+        picker::priority_matches(&self.input)
+    }
+
+    /// Commit the priority picker for the cursor or every marked task.
+    fn commit_priority_pick(&mut self) {
+        let Some(highlight) = self.picker_highlight() else {
+            return;
+        };
+        let matches = self.priority_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let priority = matches[highlight.min(matches.len() - 1)];
+        let ids = self.action_ids();
+        let had_marks = !self.marked.is_empty();
+        for id in &ids {
+            if let Err(error) = self.vault.set_priority(id, priority) {
+                self.mode = InputMode::Navigate;
+                self.input.clear();
+                self.refresh();
+                self.set_toast(format!("error: {error}"));
+                return;
+            }
+        }
+        self.mode = InputMode::Navigate;
+        self.input.clear();
+        self.status = None;
+        self.refresh();
+        self.set_toast(format!(
+            "priority {}",
+            priority.map_or("none", Priority::as_str)
+        ));
+        if had_marks {
             self.marked.clear();
         }
     }
@@ -1332,11 +1568,16 @@ impl App {
             self.commit_rename(id, title);
             return;
         }
+        if matches!(self.mode, InputMode::Tag) {
+            self.commit_tag_prompt();
+            return;
+        }
         let parent = match &self.mode {
             InputMode::Add { parent } => parent.clone(),
             InputMode::Capture => self.config.capture_target.clone(),
             InputMode::Navigate
             | InputMode::Rename { .. }
+            | InputMode::Tag
             | InputMode::Pick(_)
             | InputMode::RegisterPath
             | InputMode::ConfirmDelete { .. } => return,

@@ -79,6 +79,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &App) {
     render_project_popup(frame, areas.list, app);
     render_link_popup(frame, areas.list, app);
     render_move_popup(frame, areas.list, app);
+    render_priority_popup(frame, areas.list, app);
+    render_tag_popup(frame, areas.list, app);
+    render_filter_popup(frame, areas.list, app);
     render_create_link_popup(frame, areas.list, app);
     render_preview(frame, areas.preview, app);
     render_register_popup(frame, areas.middle, app);
@@ -188,6 +191,26 @@ fn state_glyph(state: Option<TaskState>) -> (&'static str, Style) {
     }
 }
 
+/// Priority marker: colored background, true-color white foreground.
+///
+/// ANSI `Color::White` follows the terminal palette and can read as black
+/// under reverse-video selection; RGB white does not. `sub_modifier` clears
+/// reverse inherited from the selected row.
+fn priority_glyph(priority: Priority) -> (&'static str, Style) {
+    let (text, bg) = match priority {
+        Priority::High => ("!", Color::Red),
+        Priority::Med => ("~", Color::Yellow),
+        Priority::Low => ("↓", Color::DarkGray),
+    };
+    (
+        text,
+        Style::default()
+            .fg(Color::Rgb(255, 255, 255))
+            .bg(bg)
+            .remove_modifier(Modifier::all()),
+    )
+}
+
 /// One task row: selection gutter, guides, state glyph, title, and
 /// right-aligned metadata.
 ///
@@ -244,10 +267,16 @@ fn row_line(app: &App, row: &ListRow, selected: bool, marked: bool, width: u16) 
     ];
     if meta_width > 0 {
         spans.push(Span::styled(" ".repeat(pad), selection));
-        spans.extend(
-            meta.into_iter()
-                .map(|span| Span::styled(span.content, span.style.patch(selection))),
-        );
+        spans.extend(meta.into_iter().map(|span| {
+            // Badges set their own background; do not inherit the row's
+            // reverse-video selection or their fg/bg will invert.
+            let style = if span.style.bg.is_some() {
+                span.style
+            } else {
+                span.style.patch(selection)
+            };
+            Span::styled(span.content, style)
+        }));
     } else if selected || marked {
         // Fill the rest of the row so the highlight spans it.
         spans.push(Span::styled(" ".repeat(pad), selection));
@@ -281,11 +310,7 @@ fn row_meta(app: &App, id: &TaskId) -> Vec<Span<'static>> {
     }
 
     if let Some(priority) = task.priority {
-        let (text, style) = match priority {
-            Priority::High => ("!", Style::default().fg(Color::Red)),
-            Priority::Med => ("~", Style::default().fg(Color::Yellow)),
-            Priority::Low => ("↓", Style::default().fg(Color::DarkGray)),
-        };
+        let (text, style) = priority_glyph(priority);
         push_meta(&mut spans, Span::styled(text, style));
     }
 
@@ -415,6 +440,50 @@ fn render_move_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
         })
         .collect();
     render_picker_popup(frame, area, "move under…", &entries, picker.highlight);
+}
+
+/// Priority picker for `!`: high, med, low, and none.
+fn render_priority_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(picker) = app.picker() else {
+        return;
+    };
+    if !picker.is_priority() {
+        return;
+    }
+    let entries: Vec<String> = app
+        .priority_matches()
+        .into_iter()
+        .map(|priority| priority.map_or_else(|| "none".to_owned(), |value| value.to_string()))
+        .collect();
+    render_picker_popup(frame, area, "priority", &entries, picker.highlight);
+}
+
+/// Tag picker for `t`: unique tags already present in the vault.
+fn render_tag_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(picker) = app.picker() else {
+        return;
+    };
+    if !picker.is_tags() {
+        return;
+    }
+    let entries = app.tag_matches();
+    render_picker_popup(frame, area, "tags", &entries, picker.highlight);
+}
+
+/// Session-only filter picker for `f`.
+fn render_filter_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(picker) = app.picker() else {
+        return;
+    };
+    if !picker.is_filter() {
+        return;
+    }
+    let entries: Vec<String> = app
+        .filter_matches()
+        .into_iter()
+        .map(|choice| choice.label())
+        .collect();
+    render_picker_popup(frame, area, "filter", &entries, picker.highlight);
 }
 
 /// Link-creation picker for `L`: every task except the source.
@@ -867,11 +936,7 @@ fn preview_metadata(app: &App, task: &Task) -> Vec<Span<'static>> {
     }
 
     if let Some(priority) = task.priority {
-        let (marker, style) = match priority {
-            Priority::High => ("!", Style::default().fg(Color::Red)),
-            Priority::Med => ("~", Style::default().fg(Color::Yellow)),
-            Priority::Low => ("↓", dim),
-        };
+        let (marker, style) = priority_glyph(priority);
         push_meta(
             &mut spans,
             Span::styled(format!("{marker} {}", priority.as_str()), style),
@@ -901,6 +966,7 @@ fn render_hint(frame: &mut Frame<'_>, area: Rect, app: &App) {
         InputMode::Add { .. }
         | InputMode::Capture
         | InputMode::Rename { .. }
+        | InputMode::Tag
         | InputMode::Pick(_)
         | InputMode::RegisterPath
         | InputMode::ConfirmDelete { .. } => Style::default().fg(Color::Cyan),

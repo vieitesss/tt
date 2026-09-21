@@ -1,7 +1,6 @@
-//! One picker state machine for the `/` search, `p` project switch, and `o`
-//! link jump.
+//! One picker state machine for every type-to-filter TUI choice.
 //!
-//! All three interactions are the same: type to filter, arrows (or
+//! All interactions are the same: type to filter, arrows (or
 //! `ctrl-n`/`ctrl-p`) to move a highlight, Enter to commit, Esc to cancel. The
 //! per-kind differences — the item source, what Enter does, and what Esc
 //! restores — live on [`PickerKind`] and in the commit/cancel handlers in
@@ -9,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use tt::{Project, TaskId, TreeNode, Vault};
+use tt::{Priority, Project, TaskFilter, TaskId, TaskState, TreeNode, Vault};
 
 /// What a picker is choosing between, and how its keys differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +33,12 @@ pub(crate) enum PickerKind {
         /// are excluded from the candidate list.
         moving: Vec<TaskId>,
     },
+    /// `!`: set or clear priority on the active task set.
+    Priority,
+    /// `t`: toggle an existing tag or add a new typed tag.
+    Tags,
+    /// `f`: choose one session-only list filter.
+    Filter,
     /// `L`: append a `[[id.md|Title]]` link to the cursor task's body.
     /// `source` is the task being linked from and is excluded from the
     /// candidates.
@@ -45,9 +50,9 @@ pub(crate) enum PickerKind {
 
 impl PickerKind {
     /// Whether an unsaved buffer in this picker must block watcher reloads.
-    /// Only search holds typed text worth protecting.
+    /// Search and tags hold typed text worth protecting.
     pub(crate) fn holds_buffer(&self) -> bool {
-        matches!(self, Self::Search { .. })
+        matches!(self, Self::Search { .. } | Self::Tags)
     }
 
     /// Whether the prompt keeps a status message (for example `no matches`)
@@ -69,6 +74,9 @@ impl PickerKind {
             Self::Project => "project: ",
             Self::Link { .. } => "link: ",
             Self::Move { .. } => "move under: ",
+            Self::Priority => "priority: ",
+            Self::Tags => "tag: ",
+            Self::Filter => "filter: ",
             Self::CreateLink { .. } => "link to: ",
         }
     }
@@ -80,6 +88,9 @@ impl PickerKind {
             Self::Project => "↑↓ select · enter switch · esc cancel",
             Self::Link { .. } => "↑↓ select · enter jump · esc cancel",
             Self::Move { .. } => "↑↓ select · enter move · esc cancel",
+            Self::Priority => "↑↓ select · enter set · esc cancel",
+            Self::Tags => "↑↓ select · enter toggle/add · esc cancel",
+            Self::Filter => "↑↓ select · enter apply · esc cancel",
             Self::CreateLink { .. } => "↑↓ select · enter link · esc cancel",
         }
     }
@@ -120,10 +131,152 @@ impl Picker {
         matches!(self.kind, PickerKind::Move { .. })
     }
 
+    /// Whether this is the `!` priority picker.
+    pub(crate) fn is_priority(&self) -> bool {
+        matches!(self.kind, PickerKind::Priority)
+    }
+
+    /// Whether this is the `t` tag picker.
+    pub(crate) fn is_tags(&self) -> bool {
+        matches!(self.kind, PickerKind::Tags)
+    }
+
+    /// Whether this is the `f` filter picker.
+    pub(crate) fn is_filter(&self) -> bool {
+        matches!(self.kind, PickerKind::Filter)
+    }
+
     /// Whether this is the `L` link-creation picker.
     pub(crate) fn is_create_link(&self) -> bool {
         matches!(self.kind, PickerKind::CreateLink { .. })
     }
+}
+
+/// Priority choices matching `query`, always in high, med, low, none order.
+pub(crate) fn priority_matches(query: &str) -> Vec<Option<Priority>> {
+    let query = query.trim().to_lowercase();
+    [
+        Some(Priority::High),
+        Some(Priority::Med),
+        Some(Priority::Low),
+        None,
+    ]
+    .into_iter()
+    .filter(|priority| {
+        let label = priority.map_or("none", Priority::as_str);
+        query.is_empty() || label.contains(&query)
+    })
+    .collect()
+}
+
+/// One active session-only filter criterion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilterCriterion {
+    /// Match one lifecycle state.
+    State(TaskState),
+    /// Match one exact priority.
+    Priority(Priority),
+    /// Match one tag, including its nested descendants.
+    Tag(String),
+}
+
+impl FilterCriterion {
+    /// Compact label used in the picker and footer.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::State(state) => state.to_string(),
+            Self::Priority(priority) => priority.to_string(),
+            Self::Tag(tag) => format!("#{tag}"),
+        }
+    }
+
+    /// Convert this single criterion into the vault's AND-capable filter.
+    pub(crate) fn task_filter(&self) -> TaskFilter {
+        match self {
+            Self::State(state) => TaskFilter {
+                state: Some(*state),
+                ..TaskFilter::default()
+            },
+            Self::Priority(priority) => TaskFilter {
+                priority: Some(*priority),
+                ..TaskFilter::default()
+            },
+            Self::Tag(tag) => TaskFilter {
+                tag: Some(tag.clone()),
+                ..TaskFilter::default()
+            },
+        }
+    }
+}
+
+/// One entry in the filter picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilterChoice {
+    /// Restore the normal tree.
+    Clear,
+    /// Apply one criterion.
+    Apply(FilterCriterion),
+}
+
+impl FilterChoice {
+    /// Human-readable picker label.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::Clear => "clear filter".to_owned(),
+            Self::Apply(criterion) => criterion.label(),
+        }
+    }
+}
+
+/// Filter-picker choices matching `query`.
+pub(crate) fn filter_matches(query: &str, vault: &Vault, filter_active: bool) -> Vec<FilterChoice> {
+    let mut choices = Vec::new();
+    if filter_active {
+        choices.push(FilterChoice::Clear);
+    }
+    choices.extend([
+        FilterChoice::Apply(FilterCriterion::State(TaskState::Open)),
+        FilterChoice::Apply(FilterCriterion::State(TaskState::Done)),
+        FilterChoice::Apply(FilterCriterion::State(TaskState::Cancelled)),
+        FilterChoice::Apply(FilterCriterion::Priority(Priority::High)),
+        FilterChoice::Apply(FilterCriterion::Priority(Priority::Med)),
+        FilterChoice::Apply(FilterCriterion::Priority(Priority::Low)),
+    ]);
+    choices.extend(
+        all_tags(vault)
+            .into_iter()
+            .map(FilterCriterion::Tag)
+            .map(FilterChoice::Apply),
+    );
+    let query = query.trim().to_lowercase();
+    choices
+        .into_iter()
+        .filter(|choice| query.is_empty() || choice.label().to_lowercase().contains(&query))
+        .collect()
+}
+
+/// Every unique normalized tag in the vault, sorted.
+pub(crate) fn all_tags(vault: &Vault) -> Vec<String> {
+    vault
+        .tasks()
+        .flat_map(|task| task.tags.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Existing tags matching the normalized query, case-insensitively.
+pub(crate) fn tag_matches(query: &str, vault: &Vault) -> Vec<String> {
+    let query = normalize_tag(query).to_lowercase();
+    all_tags(vault)
+        .into_iter()
+        .filter(|tag| query.is_empty() || tag.to_lowercase().contains(&query))
+        .collect()
+}
+
+/// Normalize one typed tag the same way as vault persistence.
+pub(crate) fn normalize_tag(tag: &str) -> String {
+    tag.trim().trim_start_matches('#').trim().to_owned()
 }
 
 /// Task ids whose title contains `query` (case-insensitive), in full tree
