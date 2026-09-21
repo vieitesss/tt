@@ -1,0 +1,34 @@
+# List the available recipes.
+default:
+    @just --list
+
+# Check formatting without modifying files.
+fmt:
+    cargo fmt --check
+
+# Apply rustfmt to the sources.
+fmt-fix:
+    cargo fmt
+
+# Lint all targets with Clippy, warnings as errors.
+clippy:
+    cargo clippy --all-targets -- -D warnings
+
+# Run the test suite.
+test:
+    cargo test
+
+# Run every quality gate: fmt, clippy, test.
+check: fmt clippy test
+
+# Build the debug binary.
+build:
+    cargo build
+
+# Build the release binary.
+build-release:
+    cargo build --release
+
+# Run the TUI, optionally against a vault: just run /tmp/vault
+run vault="":
+    cargo run -- {{ if vault == "" { "" } else { "--vault " + quote(vault) } }}
