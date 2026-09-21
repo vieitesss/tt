@@ -1,0 +1,1518 @@
+//! TUI state and key handling.
+//!
+//! [`App`] owns the vault and all view state. Key handling is deliberately
+//! terminal-free so tests can drive it directly; rendering lives in
+//! [`super::ui`]. Every mutation goes through the public library API, so the
+//! TUI has no privileged write path.
+//!
+//! The list view is the only main view. It owns a single selection over the
+//! flattened task tree, and a persistent preview pane follows that selection.
+
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use chrono::{Local, NaiveDate};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tt::{
+    registry, Config, DeleteOutcome, NewTask, Project, TaskId, TreeNode, Vault, VaultIssue,
+    VaultWatcher,
+};
+
+use super::list::TaskList;
+use super::picker::{self, Picker, PickerKind};
+
+/// How often the event loop wakes to check for external changes.
+pub(crate) const TICK: Duration = Duration::from_millis(250);
+
+/// How many [`TICK`]s a toast stays on screen: 12 ticks is about 3 seconds.
+pub(crate) const TOAST_TICKS: u32 = 12;
+
+const LIST_NAV_HINTS: &str =
+    "j/k move · gg/G ends · h/l fold · tab sel · / find · o links · ? issues · q quit";
+const LIST_ACTION_HINTS: &str =
+    "a/A add · N cap · x state · m mv · d del · L link · r rename · e edit · p/P proj";
+const SELECTION_NAV_HINTS: &str = "tab un/select · j/k move · esc clear";
+const SELECTION_ACTION_HINTS: &str = "m move · d delete · x cycle state";
+const CONFIRM_DELETE_HINTS: &str = "←/→ select · enter confirm · y confirm · esc cancel";
+const ISSUES_HINTS: &str = "? or esc close · q quit";
+const REGISTER_HINTS: &str = "enter register · esc cancel";
+
+/// A transient action message shown as a non-blocking toast popup.
+///
+/// Toasts never take focus and are not persisted; a new message replaces the
+/// previous one and resets the countdown. Expiry is measured in [`TICK`]s so
+/// tests never need to sleep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Toast {
+    /// Message text.
+    pub(crate) text: String,
+    /// Remaining [`TICK`]s before the toast disappears.
+    pub(crate) ticks_left: u32,
+}
+
+/// What the keyboard is currently doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InputMode {
+    /// Navigation and hotkeys.
+    Navigate,
+    /// Typing a title for `a`/`A`; the new task's parent is fixed.
+    Add {
+        /// Parent for the new task; `None` means the vault root.
+        parent: Option<TaskId>,
+    },
+    /// Typing a new title for `r`; the target is the cursor task from when
+    /// the prompt opened, and committing cascades mirror aliases.
+    Rename {
+        /// Task being renamed.
+        id: TaskId,
+    },
+    /// Typing a title for `N` quick capture.
+    Capture,
+    /// Typing a directory path for `P` to register a new project.
+    RegisterPath,
+    /// Confirming a destructive delete (`d`); `ids` is a snapshot of the
+    /// active selection. Every descendant of those tasks dies too, so the
+    /// snapshot only holds the requested roots. The highlight starts on
+    /// Cancel.
+    ConfirmDelete {
+        /// Tasks that would be deleted.
+        ids: Vec<TaskId>,
+        /// Highlighted button: 0 = Delete, 1 = Cancel.
+        button: usize,
+    },
+    /// A `/`, `p`, or `o` picker is open.
+    Pick(Picker),
+}
+
+/// List application state.
+pub(crate) struct App {
+    /// The vault; every mutation goes through it.
+    pub(crate) vault: Vault,
+    /// Selected task; the preview follows it.
+    pub(crate) selected: Option<TaskId>,
+    /// Current keyboard mode.
+    pub(crate) mode: InputMode,
+    /// Text typed in the current input mode.
+    pub(crate) input: String,
+    /// Picker-inline status (for example search's `no matches`); action
+    /// confirmations and errors live in [`App::toast`] instead.
+    pub(crate) status: Option<String>,
+    /// Transient action confirmation or error, auto-dismissed on tick.
+    pub(crate) toast: Option<Toast>,
+    /// Date used for due/overdue rendering, refreshed on every tick so a
+    /// session left open across midnight stays correct.
+    pub(crate) today: NaiveDate,
+    /// Issues from the most recent scan, shown as a persistent badge and in
+    /// the `?` overlay. Kept out of [`App::status`] so reloads never clobber
+    /// action feedback.
+    pub(crate) vault_issues: Vec<VaultIssue>,
+    /// Whether the vault-issue overlay is open.
+    pub(crate) issues_open: bool,
+    /// Highlighted issue in the `?` overlay.
+    pub(crate) issues_cursor: usize,
+    /// Set by `q`/`ctrl-c`; the event loop exits when true.
+    pub(crate) should_quit: bool,
+    /// The flattened task tree, rebuilt on every refresh.
+    pub(crate) list: TaskList,
+    /// Ids whose children are hidden in the list. In-memory only; folds are
+    /// never persisted.
+    pub(crate) collapsed: HashSet<TaskId>,
+    /// Multi-selected rows, independent of the cursor. Marks survive folds
+    /// and navigation, and are pruned when their task vanishes.
+    pub(crate) marked: BTreeSet<TaskId>,
+    /// First row drawn in the list pane; adjusted to keep the selection
+    /// visible.
+    pub(crate) list_scroll: usize,
+    /// Size of the list pane as last measured from the terminal; scrolling
+    /// clamps against it. Set by [`App::set_list_viewport`], never by the
+    /// draw.
+    pub(crate) list_viewport: (u16, u16),
+    /// Registry entry for the current project; `None` for the `--vault`
+    /// escape hatch.
+    pub(crate) project: Option<Project>,
+    /// Loaded configuration: registry, display style, and capture target.
+    pub(crate) config: Config,
+    /// Data directory the project stores live under; `None` disables the
+    /// project picker with a status message.
+    pub(crate) store_root: Option<PathBuf>,
+    /// Set by `e`/`Enter`: the task file the event loop should open in
+    /// `$EDITOR` after the current key press is handled. `handle_key` never
+    /// spawns a process, so tests can assert the request directly.
+    pending_edit: Option<PathBuf>,
+    /// Set by the first `g` of a `gg` chord.
+    pending_g: bool,
+    watcher: Option<VaultWatcher>,
+    /// Set when a watched change arrived while an unsaved buffer was open;
+    /// shown on the context row until the buffer settles and reloads.
+    pub(crate) external_change_pending: bool,
+}
+
+impl App {
+    /// Build the app, starting a best-effort vault watcher.
+    pub(crate) fn new(
+        vault: Vault,
+        config: Config,
+        project: Option<Project>,
+        store_root: Option<PathBuf>,
+    ) -> Self {
+        let watcher = vault.watch().ok();
+        let mut app = Self {
+            vault,
+            selected: None,
+            mode: InputMode::Navigate,
+            input: String::new(),
+            status: None,
+            toast: None,
+            today: Local::now().date_naive(),
+            vault_issues: Vec::new(),
+            issues_open: false,
+            issues_cursor: 0,
+            should_quit: false,
+            list: TaskList::default(),
+            collapsed: HashSet::new(),
+            marked: BTreeSet::new(),
+            list_scroll: 0,
+            list_viewport: (0, 0),
+            project,
+            config,
+            store_root,
+            pending_edit: None,
+            pending_g: false,
+            watcher,
+            external_change_pending: false,
+        };
+        app.refresh();
+        app
+    }
+
+    /// Whether the event loop should exit.
+    pub(crate) fn should_quit(&self) -> bool {
+        self.should_quit
+    }
+
+    /// Id of the selected task, if any.
+    pub(crate) fn selected_id(&self) -> Option<TaskId> {
+        self.selected.clone()
+    }
+
+    /// The open picker, if any.
+    pub(crate) fn picker(&self) -> Option<&Picker> {
+        match &self.mode {
+            InputMode::Pick(picker) => Some(picker),
+            _ => None,
+        }
+    }
+
+    /// The open picker's kind, if any.
+    pub(crate) fn picker_kind(&self) -> Option<&PickerKind> {
+        self.picker().map(|picker| &picker.kind)
+    }
+
+    /// The open picker's highlighted index, if any.
+    pub(crate) fn picker_highlight(&self) -> Option<usize> {
+        self.picker().map(|picker| picker.highlight)
+    }
+
+    /// Re-sync with the vault: rebuild the flattened list, keep the selected
+    /// task when it still exists, otherwise fall back to the first row, and
+    /// pick up the vault's current issue list for the persistent badge.
+    pub(crate) fn refresh(&mut self) {
+        let had_issues = !self.vault_issues.is_empty();
+        // Hygiene: drop folds for tasks that no longer exist.
+        self.collapsed.retain(|id| self.vault.get(id).is_some());
+        // Multi-selection is id-based, so it survives folds; only vanished
+        // tasks are pruned.
+        self.marked.retain(|id| self.vault.get(id).is_some());
+        self.rebuild_list();
+        // A reload (watcher tick, editor round-trip, project switch) can
+        // re-introduce a selection that a fold currently hides; unfold its
+        // ancestors instead of losing the user's place.
+        if let Some(id) = self.selected.clone() {
+            if self.vault.get(&id).is_some() && self.list.index_of(&id).is_none() {
+                self.unfold_ancestors(&id);
+                self.rebuild_list();
+            }
+        }
+        let still_selected = self
+            .selected
+            .as_ref()
+            .is_some_and(|id| self.list.index_of(id).is_some());
+        if !still_selected {
+            self.selected = self.list.id_at(0).cloned();
+            self.list_scroll = 0;
+        }
+        self.vault_issues = self.vault.issues().to_vec();
+        if self.issues_cursor >= self.vault_issues.len() {
+            self.issues_cursor = self.vault_issues.len().saturating_sub(1);
+        }
+        // The editor round-trip reloads the vault: when the issue the user was
+        // looking at is gone, the overlay confirms and closes itself.
+        if self.issues_open && had_issues && self.vault_issues.is_empty() {
+            self.issues_open = false;
+            self.set_toast("all vault issues resolved");
+        }
+        self.ensure_selection_visible();
+    }
+
+    /// Right-aligned badge for the persistent vault-issue count.
+    pub(crate) fn issue_badge(&self) -> Option<String> {
+        let count = self.vault_issues.len();
+        (count > 0).then(|| format!("⚠ {}", issue_count_text(count)))
+    }
+
+    /// Route one key press to the active mode.
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+            self.should_quit = true;
+            return;
+        }
+        // The delete confirmation is modal and handled before the issues
+        // overlay so `?`/Esc can never leak into it.
+        if matches!(self.mode, InputMode::ConfirmDelete { .. }) {
+            self.handle_confirm_delete(key);
+            return;
+        }
+        if self.issues_open {
+            // Modal-lite: movement, edit, close, and quit act; everything else
+            // (including task hotkeys like `x`) stays inert.
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => self.issues_open = false,
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Down | KeyCode::Char('j') => self.move_issues_cursor(1),
+                KeyCode::Up | KeyCode::Char('k') => self.move_issues_cursor(-1),
+                KeyCode::Char('e') | KeyCode::Enter => self.edit_selected_issue(),
+                _ => {}
+            }
+            return;
+        }
+        match self.mode {
+            InputMode::Navigate => self.handle_list(key),
+            InputMode::Add { .. }
+            | InputMode::Capture
+            | InputMode::Rename { .. }
+            | InputMode::RegisterPath => {
+                self.handle_input(key);
+            }
+            InputMode::Pick(_) => self.handle_pick(key),
+            // Handled by the early modal check above; kept exhaustive.
+            InputMode::ConfirmDelete { .. } => self.handle_confirm_delete(key),
+        }
+    }
+
+    /// Poll the watcher: reload while idle, warn and keep the buffer while
+    /// editing. Never writes to the vault.
+    pub(crate) fn on_tick(&mut self) {
+        // Keep "today" fresh: a session left open across midnight must still
+        // render due and overdue correctly.
+        self.today = Local::now().date_naive();
+        // Toasts expire on tick counts, independent of the watcher; this must
+        // run before the `!changed` early return.
+        if let Some(toast) = &mut self.toast {
+            toast.ticks_left = toast.ticks_left.saturating_sub(1);
+        }
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.ticks_left == 0)
+        {
+            self.toast = None;
+        }
+        let changed = self.watcher.as_ref().is_some_and(VaultWatcher::changed);
+        if !changed {
+            return;
+        }
+        if self.has_unsaved_buffer() {
+            self.external_change_pending = true;
+        } else {
+            self.reload_now();
+        }
+    }
+
+    /// Show a transient action message, replacing any previous toast.
+    pub(crate) fn set_toast(&mut self, text: impl Into<String>) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            ticks_left: TOAST_TICKS,
+        });
+    }
+
+    /// Prompt prefix for input modes; `None` while navigating. The `P` path
+    /// prompt renders its buffer inside its own popup, not in the footer.
+    pub(crate) fn prompt_prefix(&self) -> Option<String> {
+        match &self.mode {
+            InputMode::Navigate | InputMode::RegisterPath | InputMode::ConfirmDelete { .. } => None,
+            InputMode::Add { parent } => Some(format!(
+                "new task under {}: ",
+                self.parent_label(parent.as_ref())
+            )),
+            InputMode::Capture => Some(format!(
+                "capture to {}: ",
+                self.parent_label(self.config.capture_target.as_ref())
+            )),
+            InputMode::Rename { .. } => Some("rename to: ".to_owned()),
+            InputMode::Pick(picker) => Some(picker.kind.prompt().to_owned()),
+        }
+    }
+
+    /// Two footer hint rows for the current mode. A live prompt or a
+    /// picker-inline status owns the first row while typing and the second
+    /// stays empty; navigation and selection modes fill both rows with their
+    /// keymap. The sticky external-change flag lives on
+    /// [`App::context_text`], not here.
+    pub(crate) fn status_lines(&self) -> [String; 2] {
+        if let Some(prefix) = self.prompt_prefix() {
+            let prompt = format!("{prefix}{}", self.input);
+            // Search keeps a status line (for example `no matches`) and a
+            // selection hint visible next to the live query.
+            let first = match (&self.mode, &self.status) {
+                (InputMode::Pick(picker), Some(status)) if picker.kind.shows_status() => {
+                    format!("{prompt}  [{status}]")
+                }
+                (InputMode::Pick(picker), None) => {
+                    format!("{prompt}  [{}]", picker.kind.hint())
+                }
+                _ => prompt,
+            };
+            return [first, String::new()];
+        }
+        if matches!(self.mode, InputMode::RegisterPath) {
+            return [REGISTER_HINTS.to_owned(), String::new()];
+        }
+        if matches!(self.mode, InputMode::ConfirmDelete { .. }) {
+            return [CONFIRM_DELETE_HINTS.to_owned(), String::new()];
+        }
+        if let Some(status) = &self.status {
+            return [status.clone(), String::new()];
+        }
+        if self.issues_open {
+            return [ISSUES_HINTS.to_owned(), String::new()];
+        }
+        if !self.marked.is_empty() {
+            return [
+                SELECTION_NAV_HINTS.to_owned(),
+                SELECTION_ACTION_HINTS.to_owned(),
+            ];
+        }
+        [LIST_NAV_HINTS.to_owned(), LIST_ACTION_HINTS.to_owned()]
+    }
+
+    /// Third footer row: project context and the sticky external-change
+    /// flag. Never a transient message; toasts are a popup instead.
+    pub(crate) fn context_text(&self) -> String {
+        let scope = self
+            .project
+            .as_ref()
+            .map_or_else(|| "vault".to_owned(), |project| project.slug.clone());
+        let count = self.vault.len();
+        let tasks = if count == 1 {
+            "1 task".to_owned()
+        } else {
+            format!("{count} tasks")
+        };
+        let mut text = format!("{scope} · {tasks}");
+        if self.external_change_pending {
+            text.push_str("  [external change pending]");
+        }
+        text
+    }
+
+    /// Character length of the active input buffer (for cursor placement).
+    pub(crate) fn input_buffer_len(&self) -> usize {
+        self.input.chars().count()
+    }
+
+    /// Whether an unsaved buffer must block watcher reloads.
+    fn has_unsaved_buffer(&self) -> bool {
+        match &self.mode {
+            InputMode::Add { .. }
+            | InputMode::Capture
+            | InputMode::Rename { .. }
+            | InputMode::RegisterPath
+            | InputMode::ConfirmDelete { .. } => true,
+            InputMode::Pick(picker) => picker.kind.holds_buffer(),
+            InputMode::Navigate => false,
+        }
+    }
+
+    /// The list is the only main view. `j`/`k` (and the arrows) walk the
+    /// flattened tree in order, `gg`/`G` jump to the ends, and the task
+    /// hotkeys operate on the selection.
+    fn handle_list(&mut self, key: KeyEvent) {
+        let was_pending_g = std::mem::take(&mut self.pending_g);
+        match key.code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Char('g') => {
+                if was_pending_g {
+                    self.select_index(0);
+                } else {
+                    self.pending_g = true;
+                }
+            }
+            KeyCode::Char('G') => {
+                if !self.list.is_empty() {
+                    self.select_index(self.list.len() - 1);
+                }
+            }
+            KeyCode::Char('a') => self.start_add(false),
+            KeyCode::Char('A') => self.start_add(true),
+            KeyCode::Char('h') | KeyCode::Left => self.fold_selection(),
+            KeyCode::Char('l') | KeyCode::Right => self.unfold_selection(),
+            KeyCode::Char('N') => {
+                self.mode = InputMode::Capture;
+                self.input.clear();
+                self.status = None;
+            }
+            KeyCode::Char('x') => self.toggle_done(),
+            KeyCode::Char('m') => self.start_move_pick(),
+            KeyCode::Char('d') => self.start_delete(),
+            KeyCode::Char('L') => self.start_create_link(),
+            KeyCode::Char('r') => self.start_rename(),
+            KeyCode::Char('e') | KeyCode::Enter => self.start_edit(),
+            KeyCode::Char('/') => self.start_search(),
+            KeyCode::Char('p') => self.start_project_pick(),
+            KeyCode::Char('P') => self.start_register_path(),
+            KeyCode::Char('o') => self.start_link_pick(),
+            KeyCode::Char('?') => self.open_issues(),
+            KeyCode::Tab => self.toggle_mark(),
+            KeyCode::Esc => {
+                // Selection is the innermost state: Esc clears it first, and
+                // only a second Esc falls through to dismissing a toast or a
+                // stale status.
+                if self.marked.is_empty() {
+                    self.status = None;
+                    self.toast = None;
+                } else {
+                    self.marked.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Move the selection `delta` rows through the flat order, clamped at the
+    /// ends.
+    fn move_selection(&mut self, delta: isize) {
+        let Some(current) = self.selected.as_ref().and_then(|id| self.list.index_of(id)) else {
+            self.select_index(0);
+            return;
+        };
+        let last = self.list.len() as isize - 1;
+        let next = (current as isize + delta).clamp(0, last) as usize;
+        self.select_index(next);
+    }
+
+    /// Select the row at `index` (clamped) and scroll it into view.
+    fn select_index(&mut self, index: usize) {
+        if self.list.is_empty() {
+            return;
+        }
+        let index = index.min(self.list.len() - 1);
+        self.selected = self.list.id_at(index).cloned();
+        self.ensure_selection_visible();
+    }
+
+    /// Rebuild the flattened list from the vault and the current folds.
+    fn rebuild_list(&mut self) {
+        self.list = TaskList::build(&self.vault, &self.collapsed);
+    }
+
+    /// `Tab`: toggle the cursor row in the multi-selection set. Folds never
+    /// hide a mark, and the cursor itself is always a visible row.
+    fn toggle_mark(&mut self) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        if !self.marked.remove(&id) {
+            self.marked.insert(id);
+        }
+    }
+
+    /// The tasks a selection action applies to: the marked ids in full-tree
+    /// pre-order when anything is marked, otherwise the cursor task. Ids
+    /// hidden by a fold stay in the set.
+    fn action_ids(&self) -> Vec<TaskId> {
+        if self.marked.is_empty() {
+            return self.selected.clone().into_iter().collect();
+        }
+        let mut ordered = Vec::new();
+        collect_marked_in_tree_order(&self.vault.tree(), &self.marked, &mut ordered);
+        ordered
+    }
+
+    /// Remove every ancestor of `id` from the collapsed set, so a jump target
+    /// can never land on a hidden row.
+    fn unfold_ancestors(&mut self, id: &TaskId) {
+        let mut current = self.vault.parent(id).cloned();
+        while let Some(parent) = current {
+            self.collapsed.remove(&parent);
+            current = self.vault.parent(&parent).cloned();
+        }
+    }
+
+    /// Select `id`, unfolding its ancestors first. Every programmatic jump
+    /// (search, link, add) goes through here.
+    fn select_id(&mut self, id: TaskId) {
+        self.unfold_ancestors(&id);
+        self.rebuild_list();
+        self.selected = Some(id);
+        self.ensure_selection_visible();
+    }
+
+    /// `h`/Left: collapse the selected parent, or jump to its parent when it
+    /// has no visible children to collapse (navigator behavior).
+    fn fold_selection(&mut self) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        if !self.vault.children(&id).is_empty() && !self.collapsed.contains(&id) {
+            self.collapsed.insert(id);
+            self.rebuild_list();
+            self.ensure_selection_visible();
+            return;
+        }
+        // Already collapsed or childless: go up one level (no-op on a root).
+        if let Some(parent) = self.vault.parent(&id).cloned() {
+            self.select_id(parent);
+        }
+    }
+
+    /// `l`/Right: expand the selected collapsed parent; a no-op otherwise.
+    fn unfold_selection(&mut self) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        if self.collapsed.remove(&id) {
+            self.rebuild_list();
+            self.ensure_selection_visible();
+        }
+    }
+
+    /// Scroll the minimum amount needed to keep the selected row inside the
+    /// list pane. Applies the pure scroll clamp; drawing never mutates this
+    /// state.
+    pub(crate) fn ensure_selection_visible(&mut self) {
+        let Some(index) = self.selected.as_ref().and_then(|id| self.list.index_of(id)) else {
+            return;
+        };
+        self.list_scroll = ensure_selection_visible(
+            self.list.len(),
+            index,
+            self.list_scroll,
+            self.list_viewport.1 as usize,
+        );
+    }
+
+    /// Record the list pane size and re-clamp the scroll so the selection
+    /// stays visible. The event loop calls this before each draw; `render`
+    /// itself takes `&App`.
+    pub(crate) fn set_list_viewport(&mut self, width: u16, height: u16) {
+        self.list_viewport = (width, height);
+        self.ensure_selection_visible();
+    }
+
+    /// Start the project picker (`p`), filtering over the registry.
+    fn start_project_pick(&mut self) {
+        if self.config.projects.is_empty() {
+            self.set_toast("no registered projects");
+            return;
+        }
+        self.mode = InputMode::Pick(Picker::new(PickerKind::Project));
+        self.input.clear();
+        self.status = None;
+    }
+
+    /// Registered projects matching the live query (all of them when empty).
+    pub(crate) fn project_matches(&self) -> Vec<Project> {
+        picker::project_matches(&self.input, &self.config.projects)
+    }
+
+    fn commit_project_pick(&mut self) {
+        let Some(highlight) = self.picker_highlight() else {
+            return;
+        };
+        let matches = self.project_matches();
+        if matches.is_empty() {
+            self.set_toast("no matching projects");
+            return;
+        }
+        let project = matches[highlight.min(matches.len() - 1)].clone();
+        self.switch_project(project);
+    }
+
+    /// Open another project's store and make it current, keeping the capture
+    /// target and display settings.
+    fn switch_project(&mut self, project: Project) {
+        let Some(root) = self.store_root.clone() else {
+            self.mode = InputMode::Navigate;
+            self.input.clear();
+            self.set_toast("no data directory is available");
+            return;
+        };
+        match registry::open_store(&root, &project) {
+            Ok(vault) => {
+                self.vault = vault;
+                self.watcher = self.vault.watch().ok();
+                self.project = Some(project);
+                self.mode = InputMode::Navigate;
+                self.input.clear();
+                self.selected = None;
+                self.list_scroll = 0;
+                self.external_change_pending = false;
+                self.refresh();
+                let slug = self
+                    .project
+                    .as_ref()
+                    .map_or_else(String::new, |project| project.slug.clone());
+                self.set_toast(format!("switched to {slug}"));
+            }
+            Err(error) => {
+                self.mode = InputMode::Navigate;
+                self.input.clear();
+                self.set_toast(format!("error: {error}"));
+            }
+        }
+    }
+
+    /// Start the `P` prompt that registers a new project by path.
+    fn start_register_path(&mut self) {
+        if self.store_root.is_none() {
+            self.set_toast("no data directory is available");
+            return;
+        }
+        self.mode = InputMode::RegisterPath;
+        self.input.clear();
+        self.status = None;
+    }
+
+    /// Commit the `P` path prompt: expand `~`, create the directory if it is
+    /// missing, register it, and switch to its store. Errors toast and keep
+    /// the prompt open so the path can be fixed.
+    fn commit_register_path(&mut self) {
+        let Some(root) = self.store_root.clone() else {
+            self.mode = InputMode::Navigate;
+            self.input.clear();
+            self.set_toast("no data directory is available");
+            return;
+        };
+        let Some(path) = expand_tilde(self.input.trim()) else {
+            self.set_toast("cannot expand ~: HOME is not set");
+            return;
+        };
+        if path.as_os_str().is_empty() {
+            self.set_toast("path cannot be empty");
+            return;
+        }
+        if let Err(error) = fs::create_dir_all(&path) {
+            self.set_toast(format!("error: {error}"));
+            return;
+        }
+        match registry::register_and_save_in(&mut self.config, &path, &root) {
+            Ok(project) => self.switch_project(project),
+            Err(error) => self.set_toast(format!("error: {error:#}")),
+        }
+    }
+
+    /// Start the link picker (`o`) with the selection's outlinks and
+    /// backlinks.
+    fn start_link_pick(&mut self) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        let mut targets = self.vault.links(&id).to_vec();
+        for backlink in self.vault.backlinks(&id) {
+            if !targets.contains(backlink) {
+                targets.push(backlink.clone());
+            }
+        }
+        if targets.is_empty() {
+            self.set_toast("no links on this task");
+            return;
+        }
+        self.mode = InputMode::Pick(Picker::new(PickerKind::Link { targets }));
+        self.input.clear();
+        self.status = None;
+    }
+
+    /// Link targets matching the live query (all of them when empty).
+    pub(crate) fn link_matches(&self) -> Vec<TaskId> {
+        let Some(PickerKind::Link { targets }) = self.picker_kind() else {
+            return Vec::new();
+        };
+        picker::link_matches(&self.input, targets, &self.vault)
+    }
+
+    fn commit_link_pick(&mut self) {
+        let Some(highlight) = self.picker_highlight() else {
+            return;
+        };
+        let matches = self.link_matches();
+        if matches.is_empty() {
+            self.set_toast("no matching links");
+            return;
+        }
+        let target = matches[highlight.min(matches.len() - 1)].clone();
+        self.mode = InputMode::Navigate;
+        self.input.clear();
+        if self.vault.get(&target).is_none() {
+            self.set_toast("not found");
+            return;
+        }
+        self.select_id(target);
+        self.status = None;
+    }
+
+    /// Leave the open picker without committing. Search restores the
+    /// selection from before it opened, then applies any reload held back by
+    /// the buffer.
+    fn cancel_pick(&mut self) {
+        let Some(kind) = self.picker_kind().cloned() else {
+            return;
+        };
+        self.mode = InputMode::Navigate;
+        self.input.clear();
+        self.status = None;
+        if let PickerKind::Search { previous } = kind {
+            if let Some(id) = previous {
+                self.selected = Some(id);
+            }
+            self.settle_pending_reload();
+        }
+    }
+
+    /// Number of matches for the active picker (0 when no picker is open).
+    fn pick_match_count(&self) -> usize {
+        match self.picker_kind() {
+            Some(PickerKind::Search { .. }) => self.search_matches().len(),
+            Some(PickerKind::Project) => self.project_matches().len(),
+            Some(PickerKind::Link { .. }) => self.link_matches().len(),
+            Some(PickerKind::Move { .. }) => self.move_matches().len(),
+            Some(PickerKind::CreateLink { .. }) => self.create_link_matches().len(),
+            None => 0,
+        }
+    }
+
+    fn move_pick_highlight(&mut self, delta: isize) {
+        let count = self.pick_match_count();
+        if count == 0 {
+            return;
+        }
+        if let InputMode::Pick(picker) = &mut self.mode {
+            let last = count as isize - 1;
+            picker.highlight = (picker.highlight as isize + delta).clamp(0, last) as usize;
+        }
+    }
+
+    fn reset_pick_highlight(&mut self) {
+        if let InputMode::Pick(picker) = &mut self.mode {
+            picker.highlight = 0;
+        }
+    }
+
+    /// Route one key press to the open picker. The interaction is shared;
+    /// only Enter and Esc differ per kind, via [`App::commit_pick`] and
+    /// [`App::cancel_pick`].
+    fn handle_pick(&mut self, key: KeyEvent) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.cancel_pick(),
+            KeyCode::Enter => self.commit_pick(),
+            KeyCode::Down => self.move_pick_highlight(1),
+            KeyCode::Up => self.move_pick_highlight(-1),
+            KeyCode::Char('n') if control => self.move_pick_highlight(1),
+            KeyCode::Char('p') if control => self.move_pick_highlight(-1),
+            KeyCode::Backspace => {
+                self.input.pop();
+                self.query_changed();
+            }
+            // Every printable character — including `j`/`k` — is part of the
+            // query; only the arrows and ctrl-n/ctrl-p move the highlight.
+            KeyCode::Char(character) if !control => {
+                self.input.push(character);
+                self.query_changed();
+            }
+            _ => {}
+        }
+    }
+
+    /// A query edit resets the highlight; search also clears any status
+    /// message so stale feedback never sits next to a changed query.
+    fn query_changed(&mut self) {
+        if self
+            .picker_kind()
+            .is_some_and(PickerKind::clears_status_on_query)
+        {
+            self.status = None;
+        }
+        self.reset_pick_highlight();
+    }
+
+    /// Commit the open picker: search selects, project switches, link jumps,
+    /// move reparents.
+    fn commit_pick(&mut self) {
+        let Some(kind) = self.picker_kind().cloned() else {
+            return;
+        };
+        match kind {
+            PickerKind::Search { .. } => self.commit_search(),
+            PickerKind::Project => self.commit_project_pick(),
+            PickerKind::Link { .. } => self.commit_link_pick(),
+            PickerKind::Move { .. } => self.commit_move_pick(),
+            PickerKind::CreateLink { .. } => self.commit_create_link(),
+        }
+    }
+
+    fn handle_input(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.finish_input(),
+            KeyCode::Enter => {
+                if matches!(self.mode, InputMode::RegisterPath) {
+                    self.commit_register_path();
+                } else {
+                    self.commit_input();
+                }
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.push(character);
+            }
+            _ => {}
+        }
+    }
+
+    /// Start a title search, remembering the selection for Esc.
+    fn start_search(&mut self) {
+        self.mode = InputMode::Pick(Picker::new(PickerKind::Search {
+            previous: self.selected.clone(),
+        }));
+        self.input.clear();
+        self.status = None;
+    }
+
+    /// Task ids whose title contains the query (case-insensitive), in full
+    /// tree pre-order. Folds never hide a search match; selecting one unfolds
+    /// its ancestors.
+    pub(crate) fn search_matches(&self) -> Vec<TaskId> {
+        picker::search_matches(&self.input, &self.vault)
+    }
+
+    /// Select the highlighted match and leave search. An empty match list
+    /// keeps the prompt open with a `no matches` status.
+    fn commit_search(&mut self) {
+        self.settle_pending_reload();
+        let Some(highlight) = self.picker_highlight() else {
+            return;
+        };
+        let matches = self.search_matches();
+        if matches.is_empty() {
+            self.status = Some("no matches".to_owned());
+            return;
+        }
+        let selected = matches[highlight.min(matches.len() - 1)].clone();
+        self.mode = InputMode::Navigate;
+        self.input.clear();
+        self.select_id(selected);
+        self.status = None;
+    }
+
+    /// Request the external editor for the selected task (`e`/`Enter`).
+    ///
+    /// The event loop performs the actual suspend/open/re-enter dance, so
+    /// this stays terminal-free and testable.
+    fn start_edit(&mut self) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        if self.vault.get(&id).is_none() {
+            return;
+        }
+        self.pending_edit = Some(self.vault.root().join(format!("{id}.md")));
+        self.status = None;
+    }
+
+    /// Open the `?` overlay on the first issue.
+    fn open_issues(&mut self) {
+        self.issues_open = true;
+        self.issues_cursor = 0;
+    }
+
+    /// Move the overlay highlight `delta` issues, clamped at the ends.
+    fn move_issues_cursor(&mut self, delta: isize) {
+        if self.vault_issues.is_empty() {
+            return;
+        }
+        let last = self.vault_issues.len() as isize - 1;
+        self.issues_cursor = (self.issues_cursor as isize + delta).clamp(0, last) as usize;
+    }
+
+    /// Request the external editor for the highlighted issue. The issue path
+    /// is the vault file, so the existing `pending_edit` hand-off applies
+    /// unchanged.
+    fn edit_selected_issue(&mut self) {
+        if let Some(issue) = self.vault_issues.get(self.issues_cursor) {
+            self.pending_edit = Some(issue.path.clone());
+        }
+    }
+
+    /// Take the pending external-edit request, if any.
+    pub(crate) fn take_pending_edit(&mut self) -> Option<PathBuf> {
+        self.pending_edit.take()
+    }
+
+    /// `r`: open a one-line title prompt prefilled with the cursor task's
+    /// current title. Marks are ignored — only the cursor task is renamed —
+    /// and they survive the prompt. The input buffer starts holding the old
+    /// title with the cursor at its end (see the prompt rendering).
+    fn start_rename(&mut self) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        let Some(title) = self.vault.get(&id).map(|task| task.title.clone()) else {
+            return;
+        };
+        self.mode = InputMode::Rename { id };
+        self.input = title;
+        self.status = None;
+    }
+
+    /// Commit the `r` prompt: persist the new title through the same path as
+    /// the CLI (`Vault::set_title`), then cascade mirror aliases in the same
+    /// action with the id's old title — tt knows old → new, so no reload diff
+    /// is needed. An unchanged title writes nothing; the toast appends the
+    /// number of mirror files the cascade rewrote.
+    fn commit_rename(&mut self, id: TaskId, title: String) {
+        self.settle_pending_reload();
+        let Some(old_title) = self.vault.get(&id).map(|task| task.title.clone()) else {
+            self.mode = InputMode::Navigate;
+            self.input.clear();
+            self.set_toast(format!("error: task not found: {id}"));
+            return;
+        };
+        if title == old_title {
+            self.finish_input();
+            return;
+        }
+        if let Err(error) = self.vault.set_title(&id, &title) {
+            self.mode = InputMode::Navigate;
+            self.input.clear();
+            self.refresh();
+            self.set_toast(format!("error: {error}"));
+            return;
+        }
+        let mut old_titles = BTreeMap::new();
+        old_titles.insert(id, old_title);
+        let sync = self.vault.sync_mirror_aliases(&old_titles);
+        self.mode = InputMode::Navigate;
+        self.input.clear();
+        self.refresh();
+        match sync {
+            Ok(0) => self.set_toast(format!("renamed to {title}")),
+            Ok(written) => self.set_toast(format!(
+                "renamed to {title} · {written} {} updated",
+                if written == 1 { "link" } else { "links" }
+            )),
+            Err(error) => self.set_toast(format!("error: {error}")),
+        }
+    }
+
+    /// Start an add prompt: `child` adds under the selection, otherwise a
+    /// sibling of the selection.
+    fn start_add(&mut self, sibling: bool) {
+        let parent = if sibling {
+            self.selected_id()
+                .and_then(|id| self.vault.parent(&id).cloned())
+        } else {
+            self.selected_id()
+        };
+        self.mode = InputMode::Add { parent };
+        self.input.clear();
+        self.status = None;
+    }
+
+    fn toggle_done(&mut self) {
+        let ids = self.action_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let selection = !self.marked.is_empty();
+        let mut last_task: Option<tt::Task> = None;
+        for id in &ids {
+            let Some(next) = self.vault.get(id).map(|task| task.state.toggle_done()) else {
+                continue;
+            };
+            match self.vault.set_state(id, next) {
+                Ok(task) => last_task = Some(task),
+                Err(error) => {
+                    self.set_toast(format!("error: {error}"));
+                    return;
+                }
+            }
+        }
+        self.refresh();
+        if !selection && ids.len() == 1 {
+            if let Some(task) = last_task {
+                self.set_toast(format!("{} {}", task.state, task.title));
+            }
+        } else {
+            let count = ids.len();
+            self.set_toast(format!(
+                "cycled {count} {}",
+                if count == 1 { "task" } else { "tasks" }
+            ));
+            self.marked.clear();
+        }
+    }
+
+    /// Start the move picker (`m`) for the active selection set.
+    fn start_move_pick(&mut self) {
+        let ids = self.action_ids();
+        if ids.is_empty() {
+            return;
+        }
+        self.mode = InputMode::Pick(Picker::new(PickerKind::Move { moving: ids }));
+        self.input.clear();
+        self.status = None;
+    }
+
+    /// Move targets matching the live query: the root entry, then every task
+    /// outside the moving set and its descendants.
+    pub(crate) fn move_matches(&self) -> Vec<Option<TaskId>> {
+        let Some(PickerKind::Move { moving }) = self.picker_kind() else {
+            return Vec::new();
+        };
+        picker::move_matches(&self.input, &self.vault, moving)
+    }
+
+    /// Commit the move picker: reparent every moving task to the highlighted
+    /// target, unfold the new parent, and select the first moved task.
+    fn commit_move_pick(&mut self) {
+        let Some(highlight) = self.picker_highlight() else {
+            return;
+        };
+        let Some(PickerKind::Move { moving }) = self.picker_kind().cloned() else {
+            return;
+        };
+        let matches = self.move_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let target = matches[highlight.min(matches.len() - 1)].clone();
+        for id in &moving {
+            if let Err(error) = self.vault.set_parent(id, target.as_ref()) {
+                self.mode = InputMode::Navigate;
+                self.input.clear();
+                self.refresh();
+                self.set_toast(format!("error: {error}"));
+                return;
+            }
+        }
+        self.mode = InputMode::Navigate;
+        self.input.clear();
+        self.status = None;
+        if let Some(first) = moving.first().cloned() {
+            self.select_id(first);
+        }
+        let count = moving.len();
+        self.set_toast(format!(
+            "moved {count} {}",
+            if count == 1 { "task" } else { "tasks" }
+        ));
+        self.marked.clear();
+    }
+
+    /// `d`: ask before deleting the active selection (or the cursor task
+    /// when nothing is marked).
+    fn start_delete(&mut self) {
+        let ids = self.action_ids();
+        if ids.is_empty() {
+            return;
+        }
+        // Cancel is the highlighted default: a bare Enter never deletes.
+        self.mode = InputMode::ConfirmDelete { ids, button: 1 };
+        self.status = None;
+    }
+
+    /// Questions shown by the delete confirmation: the title for a single
+    /// task or a count, plus how many descendants die with them. Descendants
+    /// already requested are excluded, matching what [`Vault::delete`] removes
+    /// beyond the requested tasks themselves.
+    pub(crate) fn confirm_delete_lines(&self) -> Vec<String> {
+        let InputMode::ConfirmDelete { ids, .. } = &self.mode else {
+            return Vec::new();
+        };
+        let descendants = self.vault.descendant_count(ids);
+        let descendant_clause = format!(
+            "{descendants} {}",
+            if descendants == 1 {
+                "descendant"
+            } else {
+                "descendants"
+            }
+        );
+        match ids.as_slice() {
+            [only] => {
+                let title = self
+                    .vault
+                    .get(only)
+                    .map_or_else(|| only.to_string(), |task| task.title.clone());
+                if descendants == 0 {
+                    vec![format!("Delete \"{title}\"?")]
+                } else {
+                    vec![format!("Delete \"{title}\" and its {descendant_clause}?")]
+                }
+            }
+            _ => {
+                if descendants == 0 {
+                    vec![format!("Delete {} tasks?", ids.len())]
+                } else {
+                    vec![format!(
+                        "Delete {} tasks and their {descendant_clause}?",
+                        ids.len()
+                    )]
+                }
+            }
+        }
+    }
+
+    /// Labels of the delete-confirmation buttons, in display order.
+    pub(crate) fn confirm_delete_buttons(&self) -> &'static [&'static str] {
+        &["Delete", "Cancel"]
+    }
+
+    /// Index of the highlighted delete-confirmation button.
+    pub(crate) fn confirm_delete_button(&self) -> usize {
+        match &self.mode {
+            InputMode::ConfirmDelete { button, .. } => *button,
+            _ => 0,
+        }
+    }
+
+    /// Route one key press to the delete confirmation: button navigation and
+    /// activation, direct `y`/`d` confirmation, and Esc/`n` cancelling.
+    fn handle_confirm_delete(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => self.move_confirm_button(-1),
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => self.move_confirm_button(1),
+            KeyCode::Enter => self.activate_confirm_button(),
+            KeyCode::Char('y') | KeyCode::Char('d') => self.commit_delete(),
+            KeyCode::Esc | KeyCode::Char('n') => self.cancel_delete(),
+            _ => {}
+        }
+    }
+
+    /// Move the delete-confirmation highlight by `delta`, wrapping around
+    /// Delete and Cancel.
+    fn move_confirm_button(&mut self, delta: isize) {
+        if let InputMode::ConfirmDelete { button, .. } = &mut self.mode {
+            *button = (*button as isize + delta).rem_euclid(2) as usize;
+        }
+    }
+
+    /// Run the highlighted delete-confirmation button.
+    fn activate_confirm_button(&mut self) {
+        match self.mode {
+            InputMode::ConfirmDelete { button: 0, .. } => self.commit_delete(),
+            InputMode::ConfirmDelete { .. } => self.cancel_delete(),
+            _ => {}
+        }
+    }
+
+    /// Leave the delete confirmation without deleting.
+    fn cancel_delete(&mut self) {
+        self.mode = InputMode::Navigate;
+        self.settle_pending_reload();
+    }
+
+    /// `L`: open the link picker for the cursor task. Marks are ignored; a
+    /// link is appended to the task the cursor is on. Toasting instead of
+    /// opening keeps the `L` key honest on a one-task vault.
+    fn start_create_link(&mut self) {
+        let Some(source) = self.selected.clone() else {
+            return;
+        };
+        if self.vault.get(&source).is_none() {
+            return;
+        }
+        if picker::create_link_matches("", &self.vault, &source).is_empty() {
+            self.set_toast("no tasks to link");
+            return;
+        }
+        self.mode = InputMode::Pick(Picker::new(PickerKind::CreateLink { source }));
+        self.input.clear();
+        self.status = None;
+    }
+
+    /// Link-target candidates matching the live query: the full tree minus
+    /// the source task.
+    pub(crate) fn create_link_matches(&self) -> Vec<TaskId> {
+        let Some(PickerKind::CreateLink { source }) = self.picker_kind() else {
+            return Vec::new();
+        };
+        picker::create_link_matches(&self.input, &self.vault, source)
+    }
+
+    /// Commit the link picker: append `[[{id}.md|{Title}]]` to the source
+    /// task's body (or the bare path when the title cannot carry an alias),
+    /// toast the target's title, and stay on the source task so the new
+    /// backlink count is visible in the preview.
+    fn commit_create_link(&mut self) {
+        let Some(highlight) = self.picker_highlight() else {
+            return;
+        };
+        let Some(PickerKind::CreateLink { source }) = self.picker_kind().cloned() else {
+            return;
+        };
+        let matches = self.create_link_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let target = matches[highlight.min(matches.len() - 1)].clone();
+        let title = self
+            .vault
+            .get(&target)
+            .map_or_else(|| target.to_string(), |task| task.title.clone());
+        let body = self
+            .vault
+            .get(&source)
+            .map_or_else(String::new, |task| task.body.clone());
+        match self
+            .vault
+            .set_body(&source, &append_wikilink(&body, &target, &title))
+        {
+            Ok(_) => {
+                self.mode = InputMode::Navigate;
+                self.input.clear();
+                self.status = None;
+                self.refresh();
+                self.set_toast(format!("linked to {title}"));
+            }
+            Err(error) => {
+                self.mode = InputMode::Navigate;
+                self.input.clear();
+                self.set_toast(format!("error: {error}"));
+            }
+        }
+    }
+
+    /// Delete the confirmed snapshot, reload from disk, clear the marks, and
+    /// report what happened. On error the vault may hold a partial delete, so
+    /// it is reloaded too; remaining marks survive the reload's pruning.
+    fn commit_delete(&mut self) {
+        let InputMode::ConfirmDelete { ids, .. } = self.mode.clone() else {
+            return;
+        };
+        self.mode = InputMode::Navigate;
+        match self.vault.delete(&ids) {
+            Ok(outcome) => {
+                self.reload_now();
+                self.marked.clear();
+                self.set_toast(delete_toast(outcome));
+            }
+            Err(error) => {
+                self.reload_now();
+                self.set_toast(format!("error: {error}"));
+            }
+        }
+    }
+
+    fn commit_input(&mut self) {
+        let title = self.input.trim().to_owned();
+        if title.is_empty() {
+            // Matches `a`/`A`: a blank title cancels instead of writing.
+            self.finish_input();
+            return;
+        }
+        if let InputMode::Rename { id } = self.mode.clone() {
+            self.commit_rename(id, title);
+            return;
+        }
+        let parent = match &self.mode {
+            InputMode::Add { parent } => parent.clone(),
+            InputMode::Capture => self.config.capture_target.clone(),
+            InputMode::Navigate
+            | InputMode::Rename { .. }
+            | InputMode::Pick(_)
+            | InputMode::RegisterPath
+            | InputMode::ConfirmDelete { .. } => return,
+        };
+
+        self.settle_pending_reload();
+
+        let new_task = NewTask {
+            parent,
+            ..NewTask::new(title)
+        };
+        match self.vault.add(new_task) {
+            Ok(task) => {
+                self.mode = InputMode::Navigate;
+                self.input.clear();
+                self.refresh();
+                self.select_id(task.id.clone());
+                self.set_toast(format!("added {}", task.id));
+            }
+            Err(error) => self.set_toast(format!("error: {error}")),
+        }
+    }
+
+    /// Cancel the current input mode without adding anything.
+    fn finish_input(&mut self) {
+        self.mode = InputMode::Navigate;
+        self.input.clear();
+        self.settle_pending_reload();
+    }
+
+    /// After leaving an input mode, apply any change that arrived while the
+    /// buffer was held.
+    fn settle_pending_reload(&mut self) {
+        if self.external_change_pending {
+            self.reload_now();
+        }
+    }
+
+    /// Rescan the vault. Issues land in [`App::vault_issues`] for the badge
+    /// and overlay; transient action feedback in `status` is left alone. Both
+    /// the selected task and the scroll position survive: a reload must not
+    /// steal the user's place.
+    ///
+    /// The live title map is snapshotted before the rescan, so a rename this
+    /// reload observes cascades to mirror aliases through
+    /// [`Vault::sync_mirror_aliases`]. A sync failure is toasted but never
+    /// stops the reload; a reload with no title change writes nothing.
+    pub(crate) fn reload_now(&mut self) {
+        let old_titles: BTreeMap<TaskId, String> = self
+            .vault
+            .tasks()
+            .map(|task| (task.id.clone(), task.title.clone()))
+            .collect();
+        self.vault.reload();
+        let sync = self.vault.sync_mirror_aliases(&old_titles);
+        self.external_change_pending = false;
+        self.refresh();
+        if let Err(error) = sync {
+            self.set_toast(format!("error: {error}"));
+        }
+    }
+
+    /// Rescan after the external editor exits. When the edit raised the issue
+    /// count the user is told immediately; a flat or falling count stays
+    /// quiet so existing action feedback (and the all-resolved toast) is not
+    /// clobbered. Watcher reloads use [`App::reload_now`] instead.
+    pub(crate) fn reload_after_edit(&mut self) {
+        let before = self.vault_issues.len();
+        self.reload_now();
+        let after = self.vault_issues.len();
+        if after > before {
+            self.set_toast(format!("⚠ {} — press ?", issue_count_text(after)));
+        }
+    }
+
+    fn parent_label(&self, id: Option<&TaskId>) -> String {
+        match id {
+            Some(id) => self
+                .vault
+                .get(id)
+                .map_or_else(|| id.to_string(), |task| task.title.clone()),
+            None => "root".to_owned(),
+        }
+    }
+}
+
+/// Append the ids of `nodes` and their descendants that are in `wanted`, in
+/// full-tree pre-order. Folds are ignored, so a marked id stays ordered even
+/// when its row is hidden.
+fn collect_marked_in_tree_order(
+    nodes: &[TreeNode<'_>],
+    wanted: &BTreeSet<TaskId>,
+    out: &mut Vec<TaskId>,
+) {
+    for node in nodes {
+        if wanted.contains(&node.task.id) {
+            out.push(node.task.id.clone());
+        }
+        collect_marked_in_tree_order(&node.children, wanted, out);
+    }
+}
+
+/// Append the full link form to `body`: `[[{id}.md|{Title}]]`, or the bare
+/// `[[{id}.md]]` when the title contains `|` or `]` (which would break the
+/// alias syntax). The link stands alone when the body is blank; otherwise
+/// the body loses extra trailing newlines and a blank line separates the
+/// link.
+fn append_wikilink(body: &str, target: &TaskId, title: &str) -> String {
+    let link = if title.contains('|') || title.contains(']') {
+        format!("[[{target}.md]]")
+    } else {
+        format!("[[{target}.md|{title}]]")
+    };
+    let trimmed = body.trim_end_matches(['\n', '\r']);
+    if trimmed.trim().is_empty() {
+        link
+    } else {
+        format!("{trimmed}\n\n{link}")
+    }
+}
+
+/// Toast for a completed delete: the total file count, descendants included.
+fn delete_toast(outcome: DeleteOutcome) -> String {
+    format!(
+        "deleted {} {}",
+        outcome.deleted,
+        if outcome.deleted == 1 {
+            "task"
+        } else {
+            "tasks"
+        }
+    )
+}
+
+/// `1 issue` / `N issues`, shared by the header badge and the edit-return
+/// toast so they always agree.
+fn issue_count_text(count: usize) -> String {
+    match count {
+        1 => "1 issue".to_owned(),
+        _ => format!("{count} issues"),
+    }
+}
+
+/// Expand a leading `~` in a user-typed path using `$HOME`.
+///
+/// Returns `None` only when the path starts with `~` and `$HOME` is unset;
+/// paths without a tilde pass through unchanged. `~user` is not expanded.
+fn expand_tilde(raw: &str) -> Option<PathBuf> {
+    expand_tilde_with_home(raw, env::var_os("HOME").map(PathBuf::from).as_deref())
+}
+
+/// [`expand_tilde`] against an explicit home directory.
+pub(crate) fn expand_tilde_with_home(raw: &str, home: Option<&Path>) -> Option<PathBuf> {
+    if raw == "~" {
+        return home.map(Path::to_path_buf);
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return home.map(|home| home.join(rest));
+    }
+    Some(PathBuf::from(raw))
+}
+
+/// Pure scroll clamp: the first visible row that keeps `selected` inside a
+/// `height`-row viewport of a list with `rows` rows.
+pub(crate) fn ensure_selection_visible(
+    rows: usize,
+    selected: usize,
+    scroll: usize,
+    height: usize,
+) -> usize {
+    let height = height.max(1);
+    let mut scroll = scroll;
+    if selected < scroll {
+        scroll = selected;
+    } else if selected >= scroll + height {
+        scroll = selected + 1 - height;
+    }
+    scroll.min(rows.saturating_sub(height))
+}
