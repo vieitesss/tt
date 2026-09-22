@@ -19,6 +19,7 @@ mod markdown;
 mod picker;
 #[cfg(test)]
 mod tests;
+mod text;
 mod ui;
 
 use std::path::{Path, PathBuf};

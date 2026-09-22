@@ -10,7 +10,7 @@
 //! the heights can never drift from the groups they measure. Terminal-free:
 //! no rendering, no crossterm I/O.
 
-use unicode_width::UnicodeWidthStr;
+use super::text::text_width;
 
 /// One group in the complete keymap reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,12 +141,6 @@ pub(crate) fn keymap_content_lines(columns: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// Display-cell width of one string, mirroring `ui::text_width` without any
-/// rendering.
-fn keymap_text_width(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
-}
-
 /// Display width of the packed keymap content for a column count, measured
 /// exactly like the renderer's line builder: each column is as wide as its
 /// widest row (titles or `2 + key_width + 2 + label`), columns are joined by
@@ -161,7 +155,7 @@ pub(crate) fn keymap_content_width(columns: usize) -> usize {
             group
                 .rows
                 .iter()
-                .map(|(key, _)| keymap_text_width(key))
+                .map(|(key, _)| text_width(key))
                 .max()
                 .unwrap_or_default()
         })
@@ -176,10 +170,10 @@ pub(crate) fn keymap_content_width(columns: usize) -> usize {
                 packed[column].push((0, false));
             }
             let group = &KEYMAP_GROUPS[*group_index];
-            packed[column].push((keymap_text_width(group.title), true));
+            packed[column].push((text_width(group.title), true));
             let key_width = key_widths[*group_index];
             for (_, label) in group.rows {
-                packed[column].push((2 + key_width + 2 + keymap_text_width(label), true));
+                packed[column].push((2 + key_width + 2 + text_width(label), true));
             }
         }
     }
