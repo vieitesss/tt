@@ -597,7 +597,7 @@ fn edit(vault: &mut Vault, args: &EditArgs, json: bool) -> Result<()> {
 
     let task_path = vault
         .get(&id)
-        .map(|_| vault.root().join(format!("{id}.md")))
+        .map(|_| vault.root().join(id.file_name()))
         .with_context(|| format!("task not found: {id}"))?;
     crate::editor::open(&task_path)?;
 

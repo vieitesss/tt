@@ -23,7 +23,7 @@ use thiserror::Error;
 use crate::index::{
     display_order, rewrite_mirror_aliases, tag_matches, Index, TaskFilter, TreeNode,
 };
-use crate::model::{normalize_tags, ParseError, Priority, Task, TaskId, TaskState};
+use crate::model::{normalize_tags, ParseError, Priority, Task, TaskId, TaskState, TASK_EXTENSION};
 use crate::watcher::{VaultWatcher, WatchError};
 
 /// Errors from vault operations.
@@ -831,7 +831,7 @@ impl Vault {
     }
 
     fn path_for(&self, id: &TaskId) -> PathBuf {
-        self.root.join(format!("{id}.md"))
+        self.root.join(id.file_name())
     }
 
     fn cloned(&self, id: &TaskId) -> Result<Task, VaultError> {
@@ -901,7 +901,7 @@ fn scan(root: &Path) -> (BTreeMap<TaskId, Task>, Vec<VaultIssue>) {
     let mut paths: Vec<PathBuf> = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.is_file() && path.extension() == Some(OsStr::new("md")))
+        .filter(|path| path.is_file() && path.extension() == Some(OsStr::new(TASK_EXTENSION)))
         .collect();
     paths.sort();
 

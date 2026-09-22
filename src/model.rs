@@ -26,6 +26,10 @@ pub const GENERATED_ID_LEN: usize = 10;
 /// Maximum accepted length of a task ID read from a document.
 pub const MAX_ID_LEN: usize = 64;
 
+/// Extension of every task file in a store. The stem is the Identity, so the
+/// filename of a task is exactly [`TaskId::file_name`].
+pub const TASK_EXTENSION: &str = "md";
+
 /// Number of generation attempts before widening the candidate ID.
 const MAX_GENERATE_ATTEMPTS: usize = 1_000;
 
@@ -130,6 +134,14 @@ impl TaskId {
         &self.0
     }
 
+    /// The task's store filename: the Identity stem plus [`TASK_EXTENSION`].
+    ///
+    /// The store is flat, so joining this onto a store root always yields the
+    /// one file that holds the task.
+    pub fn file_name(&self) -> String {
+        format!("{}.{TASK_EXTENSION}", self.0)
+    }
+
     /// Parse the target portion of a `[[...]]` wikilink into a task id.
     ///
     /// The store is flat and identity is the file stem, so a link target is
@@ -140,7 +152,10 @@ impl TaskId {
     /// remaining stem is not a valid [`TaskId`].
     pub fn parse_link_target(target: &str) -> Option<Self> {
         let trimmed = target.trim();
-        let without_suffix = trimmed.strip_suffix(".md").unwrap_or(trimmed);
+        let without_suffix = trimmed
+            .strip_suffix(TASK_EXTENSION)
+            .and_then(|stem| stem.strip_suffix('.'))
+            .unwrap_or(trimmed);
         let stem = without_suffix
             .rsplit(['/', '\\'])
             .next()

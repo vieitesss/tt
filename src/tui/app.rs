@@ -1158,7 +1158,7 @@ impl App {
         if self.vault.get(&id).is_none() {
             return;
         }
-        self.pending_edit = Some(self.vault.root().join(format!("{id}.md")));
+        self.pending_edit = Some(self.vault.root().join(id.file_name()));
         self.status = None;
     }
 
@@ -1883,10 +1883,11 @@ fn collect_marked_in_tree_order(
 /// the body loses extra trailing newlines and a blank line separates the
 /// link.
 fn append_wikilink(body: &str, target: &TaskId, title: &str) -> String {
+    let file = target.file_name();
     let link = if title.contains('|') || title.contains(']') {
-        format!("[[{target}.md]]")
+        format!("[[{file}]]")
     } else {
-        format!("[[{target}.md|{title}]]")
+        format!("[[{file}|{title}]]")
     };
     let trimmed = body.trim_end_matches(['\n', '\r']);
     if trimmed.trim().is_empty() {

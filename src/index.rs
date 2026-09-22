@@ -231,7 +231,7 @@ fn task_issue(
     kind: VaultIssueKind,
     detail: impl Into<String>,
 ) -> VaultIssue {
-    VaultIssue::new(root.join(format!("{id}.md")), kind, detail)
+    VaultIssue::new(root.join(id.file_name()), kind, detail)
 }
 
 /// A non-code `[[...]]` wikilink occurrence in a task body.
