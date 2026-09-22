@@ -72,7 +72,7 @@ and preserves it when the config is rewritten.
 Every task-producing command returns this shape:
 
 ```json
-{"id":"bzfca8bm5j","title":"Write the plan","state":"open","parent":null,"tags":[],"due":null,"priority":null}
+{"id":"bzfca8bm5j","title":"Write the plan","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":null}
 ```
 
 - `id` — the task's identity: the stem of its store file (10 characters from
@@ -84,6 +84,9 @@ Every task-producing command returns this shape:
 - `parent` — parent task id or `null` (strict tree, one parent max).
 - `tags` — without a leading `#`; a `work` filter also matches `work/admin`.
 - `due` — `YYYY-MM-DD`, date only. `priority` — `high` | `med` | `low`.
+- `rank` — the task's optional manual place among its siblings (same parent,
+  or roots together), lower first; `null` when unranked. It is sibling-only
+  and independent of `priority`.
 
 ## Commands
 
@@ -107,11 +110,11 @@ $ export TT_CONFIG=/tmp/tt-demo/config.toml XDG_DATA_HOME=/tmp/tt-demo/data
 $ tt --json project add
 {"path":"/tmp/tt-demo/project","slug":"project"}
 $ tt --json add --title "Write the plan"
-{"id":"8d7jfebh28","title":"Write the plan","state":"open","parent":null,"tags":[],"due":null,"priority":null}
+{"id":"8d7jfebh28","title":"Write the plan","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":0}
 $ tt --json add "Ship it" --parent 8d7jfebh28 --tag work/admin --due 2026-09-17 --priority high --body "See [[8d7jfebh28]]."
-{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high"}
+{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0}
 $ printf 'body from stdin\n' | tt --json add "Stdin task" --body -
-{"id":"yubpl8hb0y","title":"Stdin task","state":"open","parent":null,"tags":[],"due":null,"priority":null}
+{"id":"yubpl8hb0y","title":"Stdin task","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":1}
 ```
 
 ### `tt list`
@@ -122,14 +125,16 @@ tt list [--flat] [--tag TAG] [--state open|done|cancelled] [--due-today]
 
 Tree by default: `{"tasks":[{...task,"children":[...]}]}`. A matching task whose
 parent does not match is promoted to a root; ancestors of matches are excluded.
-`--flat` returns `{"tasks":[{...task}]}` sorted by id, without `children`.
+Siblings display in `rank` order — ranked first ascending, then unranked by
+lowercased title, then id. `--flat` returns `{"tasks":[{...task}]}` sorted by
+id, without `children`.
 `--due-today` includes overdue tasks; filters combine with AND.
 
 ```console
 $ tt --json list --flat --tag work
-{"tasks":[{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high"}]}
+{"tasks":[{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0}]}
 $ tt --json list
-{"tasks":[{"id":"yubpl8hb0y","title":"Stdin task","state":"open","parent":null,"tags":[],"due":null,"priority":null,"children":[]},{"id":"8d7jfebh28","title":"Write the plan","state":"open","parent":null,"tags":[],"due":null,"priority":null,"children":[{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","children":[]}]}]}
+{"tasks":[{"id":"8d7jfebh28","title":"Write the plan","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":0,"children":[{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0,"children":[]}]},{"id":"yubpl8hb0y","title":"Stdin task","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":1,"children":[]}]}
 ```
 
 ### `tt show <ID>`
@@ -139,9 +144,9 @@ Dangling link targets are allowed and reported as-is.
 
 ```console
 $ tt --json show 3wcss7oxg4
-{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","body":"See [[8d7jfebh28]].","links":["8d7jfebh28"],"backlinks":[],"children":[]}
+{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0,"body":"See [[8d7jfebh28]].","links":["8d7jfebh28"],"backlinks":[],"children":[]}
 $ tt --json show 8d7jfebh28
-{"id":"8d7jfebh28","title":"Write the plan","state":"open","parent":null,"tags":[],"due":null,"priority":null,"body":"","links":[],"backlinks":["3wcss7oxg4"],"children":["3wcss7oxg4"]}
+{"id":"8d7jfebh28","title":"Write the plan","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":0,"body":"","links":[],"backlinks":["3wcss7oxg4"],"children":["3wcss7oxg4"]}
 ```
 
 ### `tt done <ID>` / `tt cancel <ID>` / `tt reopen <ID>`
@@ -150,9 +155,9 @@ Set the state (`reopen` sets `open`) and return the task object.
 
 ```console
 $ tt --json done 3wcss7oxg4
-{"id":"3wcss7oxg4","title":"Ship it","state":"done","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high"}
+{"id":"3wcss7oxg4","title":"Ship it","state":"done","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0}
 $ tt --json reopen 3wcss7oxg4
-{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high"}
+{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0}
 ```
 
 ### `tt edit <ID> [--title TITLE]`
@@ -164,7 +169,7 @@ form is for humans.
 
 ```console
 $ tt --json edit 3wcss7oxg4 --title "Ship it v2"
-{"id":"3wcss7oxg4","title":"Ship it v2","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high"}
+{"id":"3wcss7oxg4","title":"Ship it v2","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0}
 ```
 
 ### `tt project list` / `tt project add [DIR]` / `tt project remove DIR|SLUG`
@@ -220,10 +225,11 @@ Link and backlink navigation stays on `o`.
 | Key | Action |
 | --- | --- |
 | `j`/`k`, `↓`/`↑` | Move the selection through the flat list |
+| `J`/`K` | Move the cursor task later/earlier among its siblings (marks are ignored; clear a filter first) |
 | `gg`/`G` | Jump to the first/last row |
 | `h`/`←` | Collapse the selected parent; if already collapsed or childless, jump to its parent |
 | `l`/`→` | Expand the selected collapsed parent (no-op otherwise) |
-| `a`/`A` | Add a child under / a sibling of the selection |
+| `a`/`A` | Add a child under the selection / a sibling immediately after it |
 | `N` | Quick capture to the configured `capture_target`, else the project root |
 | `x` | Cycle the selection (or every marked task) open ↔ done; cancelled tasks are left unchanged |
 | `!` | Set or clear priority on the selection (or every marked task) |
@@ -246,6 +252,12 @@ Link and backlink navigation stays on `o`.
 left gutter over a yellow background, and the footer switches to selection
 hints. While anything is marked, `m`, `d`, `x`, `!`, and `t` act on every marked task;
 with nothing marked they act on the selection alone.
+`A` inserts the new sibling immediately after the selection, while `a`, `N`,
+`m`, and CLI `tt add` append to the destination sibling group; any of these
+writes materialize consecutive ranks `0..n-1` for the group. `J`/`K` move the
+cursor task one place later/earlier among its siblings, ignoring marks; with a
+filter active, no siblings, or already at that end, they toast and write
+nothing.
 `m` opens a `move under…` picker offering `⌂ root` plus every task outside the
 moving set and its descendants; committing unfolds the new parent and selects
 the first moved task. `d` opens a confirmation: one task asks
@@ -301,6 +313,7 @@ tags:
 - work/admin
 due: 2026-09-17
 priority: high
+rank: 0
 ---
 See [[8d7jfebh28]].
 ```
@@ -314,6 +327,8 @@ See [[8d7jfebh28]].
   later appears, the task reattaches on the next scan because nothing rewrote
   the file. `[[id]]` links may dangle (for example cross-project); they are
   not warnings.
+- `rank` is an optional integer sibling position; `tt` omits the key when the
+  task is unranked.
 - Rewrites preserve unknown frontmatter keys and are atomic (temp file + rename).
 - `[[...]]` links are extracted from the body; backlinks are computed, never
   stored. Link by id (the filename stem), not by title or alias.

@@ -109,6 +109,12 @@ or Tag. Matches appear as independent depth-zero rows regardless of their
 parent relationships; clearing the Filter restores the default tree.
 _Avoid_: sort, search
 
+**Rank**:
+A Task's optional manual place among its siblings: Tasks with the same parent,
+or root Tasks together. Rank is independent of Priority and has no meaning
+across sibling groups.
+_Avoid_: Sort, order, position, priority
+
 **List**:
 The only main view: by default, the current project's task tree as an indented
 list in pre-order, parents above children; a Filter temporarily flattens its
@@ -116,7 +122,9 @@ matching Tasks. A Task whose parent is missing or part of a
 cycle renders as a root (see **Dangling**). Each row is a state glyph (`○` open, `●`
 done, `—` cancelled), the title, and quiet right-aligned metadata only when
 present (relative due, priority, `done/total` rollup); parents also carry a
-fold marker. Selection is linear (`j`/`k`, `gg`/`G`), and `Tab` adds
+fold marker. Selection is linear (`j`/`k`, `gg`/`G`); `J`/`K` change the
+cursor Task's Rank among its siblings (never across sibling groups, and
+disabled while a Filter is active), and `Tab` adds
 rows to a multi-selection; `/` searches titles, `p` switches projects, and
 `o` jumps through the selected task's links. While anything is marked, `m`
 moves the marked tasks under another task (or the root) and `d` deletes them
