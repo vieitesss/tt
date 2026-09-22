@@ -36,3 +36,7 @@ run vault="":
 install: build-release
     rm ~/.local/bin/tt | true
     ln -sf "$(pwd)/target/release/tt" ~/.local/bin/tt
+
+# Run the throwaway footer-design prototypes.
+proto:
+    cargo run --manifest-path prototypes/footer/Cargo.toml

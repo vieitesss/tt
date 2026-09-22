@@ -1,4 +1,5 @@
 /target
+prototypes/footer/target/
 *.rs.bk
 .pi-subagent-runs/
 app.log
