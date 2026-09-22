@@ -12,9 +12,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use tt::{path_display, Priority, Task, TaskId, TaskState, VaultIssue};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::{App, FooterLine, Hint, InputMode};
+use super::app::{App, FooterLine, Hint, InputMode, PickerPopup};
 use super::keymap::{
     keymap_columns, keymap_content_lines, keymap_content_width, keymap_geometry,
     packed_group_indices, KeymapGroup, KEYMAP_GROUPS,
@@ -22,6 +21,8 @@ use super::keymap::{
 use super::launch::Launch;
 use super::list::ListRow;
 use super::markdown;
+use super::picker;
+use super::text::{text_width, truncate_title, truncate_to_width};
 
 /// Maximum matches shown in the search popup.
 const SEARCH_POPUP_MATCHES: usize = 5;
@@ -87,14 +88,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &App) {
 
     render_header(frame, areas.header, app);
     render_list(frame, areas.list, app);
-    render_search_popup(frame, areas.list, app);
-    render_project_popup(frame, areas.list, app);
-    render_link_popup(frame, areas.list, app);
-    render_move_popup(frame, areas.list, app);
-    render_priority_popup(frame, areas.list, app);
-    render_tag_popup(frame, areas.list, app);
-    render_filter_popup(frame, areas.list, app);
-    render_create_link_popup(frame, areas.list, app);
+    render_open_picker(frame, areas.list, app);
     render_preview(frame, areas.preview, app);
     render_register_popup(frame, areas.middle, app);
     frame.render_widget(Paragraph::new(""), areas.spacer);
@@ -509,225 +503,47 @@ fn title_style(task: Option<&Task>, today: NaiveDate) -> Style {
     style
 }
 
-fn text_width(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
-}
+/// Maximum popup width shared by every picker.
+const PICKER_POPUP_MAX_WIDTH: u16 = 40;
 
-/// Keep the longest prefix of `text` that fits in `max_width` terminal cells.
-fn truncate_to_width(text: &str, max_width: usize) -> String {
-    let mut width = 0;
-    text.chars()
-        .take_while(|character| {
-            let character_width = UnicodeWidthChar::width(*character).unwrap_or_default();
-            if width + character_width > max_width {
-                return false;
-            }
-            width += character_width;
-            true
-        })
-        .collect()
-}
-
-/// Truncate text to `max_width` terminal cells, appending `…` when it does not fit.
-fn truncate_title(text: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
+/// Draw the open picker's popup, if any.
+///
+/// The title and entries come from [`App::picker_popup`], the one seam between
+/// [`super::picker::PickerKind`] and its presentation; this function owns only
+/// geometry, so adding a picker kind never touches `ui`.
+fn render_open_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let popup_width = area.width.min(PICKER_POPUP_MAX_WIDTH);
+    let row_width = popup_width.saturating_sub(2) as usize;
+    if let Some(popup) = app.picker_popup(row_width) {
+        render_picker_popup(frame, area, popup_width, &popup);
     }
-    if text_width(text) <= max_width {
-        return text.to_owned();
-    }
-    let mut truncated = truncate_to_width(text, max_width.saturating_sub(1));
-    truncated.push('…');
-    truncated
-}
-
-/// Live title-search matches: a small popup at the bottom of the list pane.
-fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let Some(picker) = app.picker() else {
-        return;
-    };
-    if !picker.is_search() {
-        return;
-    }
-    let entries: Vec<String> = app
-        .search_matches()
-        .iter()
-        .map(|id| resolve_title(app, id))
-        .collect();
-    render_picker_popup(frame, area, "matches", &entries, picker.highlight);
-}
-
-const PROJECT_PATH_MIN_WIDTH: usize = 8;
-
-/// Shared slug-column width for a project picker row. Long slugs yield space
-/// to a useful path suffix instead of pushing the entire path off-screen.
-fn project_slug_width<'a>(slugs: impl Iterator<Item = &'a str>, row_width: usize) -> usize {
-    let measured = slugs.map(text_width).max().unwrap_or_default();
-    let path_width = PROJECT_PATH_MIN_WIDTH.min(row_width.saturating_sub(2));
-    measured.min(row_width.saturating_sub(path_width + 2))
-}
-
-fn project_entry(slug: &str, path: &str, slug_width: usize, row_width: usize) -> String {
-    if slug_width == 0 {
-        return truncate_title(path, row_width);
-    }
-    let slug = truncate_title(slug, slug_width);
-    let padding = " ".repeat(slug_width.saturating_sub(text_width(&slug)));
-    truncate_title(&format!("{slug}{padding}  {path}"), row_width)
-}
-
-/// Project picker for `p`: slug plus shortened project path.
-fn render_project_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let Some(picker) = app.picker() else {
-        return;
-    };
-    if !picker.is_project() {
-        return;
-    }
-    let projects = app.project_matches();
-    let row_width = area.width.min(40).saturating_sub(2) as usize;
-    let slug_width = project_slug_width(
-        projects.iter().map(|project| project.slug.as_str()),
-        row_width,
-    );
-    let entries: Vec<String> = projects
-        .iter()
-        .map(|project| {
-            project_entry(
-                &project.slug,
-                &path_display::shorten(&project.path, &app.config.path_display),
-                slug_width,
-                row_width,
-            )
-        })
-        .collect();
-    render_picker_popup(frame, area, "projects", &entries, picker.highlight);
-}
-
-/// Link picker for `o`: resolved titles (or ids) of the selection's links.
-fn render_link_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let Some(picker) = app.picker() else {
-        return;
-    };
-    if !picker.is_link() {
-        return;
-    }
-    let entries: Vec<String> = app
-        .link_matches()
-        .iter()
-        .map(|id| resolve_title(app, id))
-        .collect();
-    render_picker_popup(frame, area, "links", &entries, picker.highlight);
-}
-
-/// Move picker for `m`: the synthetic `⌂ root` entry plus candidate titles.
-fn render_move_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let Some(picker) = app.picker() else {
-        return;
-    };
-    if !picker.is_move() {
-        return;
-    }
-    let entries: Vec<String> = app
-        .move_matches()
-        .iter()
-        .map(|target| match target {
-            None => "⌂ root".to_owned(),
-            Some(id) => resolve_title(app, id),
-        })
-        .collect();
-    render_picker_popup(frame, area, "move under…", &entries, picker.highlight);
-}
-
-/// Priority picker for `!`: high, med, low, and none.
-fn render_priority_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let Some(picker) = app.picker() else {
-        return;
-    };
-    if !picker.is_priority() {
-        return;
-    }
-    let entries: Vec<String> = app
-        .priority_matches()
-        .into_iter()
-        .map(|priority| priority.map_or_else(|| "none".to_owned(), |value| value.to_string()))
-        .collect();
-    render_picker_popup(frame, area, "priority", &entries, picker.highlight);
-}
-
-/// Tag picker for `t`: unique tags already present in the vault.
-fn render_tag_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let Some(picker) = app.picker() else {
-        return;
-    };
-    if !picker.is_tags() {
-        return;
-    }
-    let entries = app.tag_matches();
-    render_picker_popup(frame, area, "tags", &entries, picker.highlight);
-}
-
-/// Session-only filter picker for `f`.
-fn render_filter_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let Some(picker) = app.picker() else {
-        return;
-    };
-    if !picker.is_filter() {
-        return;
-    }
-    let entries: Vec<String> = app
-        .filter_matches()
-        .into_iter()
-        .map(|choice| choice.label())
-        .collect();
-    render_picker_popup(frame, area, "filter", &entries, picker.highlight);
-}
-
-/// Link-creation picker for `L`: every task except the source.
-fn render_create_link_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let Some(picker) = app.picker() else {
-        return;
-    };
-    if !picker.is_create_link() {
-        return;
-    }
-    let entries: Vec<String> = app
-        .create_link_matches()
-        .iter()
-        .map(|id| resolve_title(app, id))
-        .collect();
-    render_picker_popup(frame, area, "link to…", &entries, picker.highlight);
 }
 
 /// A picker popup listing at most [`SEARCH_POPUP_MATCHES`] entries, scrolled
 /// to keep the highlighted one visible.
-fn render_picker_popup(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    title: &str,
-    entries: &[String],
-    highlight: usize,
-) {
+fn render_picker_popup(frame: &mut Frame<'_>, area: Rect, popup_width: u16, popup: &PickerPopup) {
+    let entries = &popup.entries;
     if entries.is_empty() || area.height < 3 || area.width < 4 {
         return;
     }
 
     let visible = entries.len().min(SEARCH_POPUP_MATCHES);
     let height = (visible as u16 + 2).min(area.height);
-    let popup = Rect::new(
+    let popup_area = Rect::new(
         area.x,
         area.y + area.height.saturating_sub(height),
-        area.width.min(40),
+        popup_width,
         height,
     );
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Clear, popup_area);
     let block = Block::bordered()
-        .title(title)
+        .title(popup.title)
         .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
 
-    let start = highlight
+    let start = popup
+        .highlight
         .saturating_sub(SEARCH_POPUP_MATCHES.saturating_sub(1))
         .min(entries.len().saturating_sub(SEARCH_POPUP_MATCHES));
     let lines: Vec<Line<'static>> = entries
@@ -736,7 +552,7 @@ fn render_picker_popup(
         .skip(start)
         .take(visible)
         .map(|(index, label)| {
-            let style = if index == highlight {
+            let style = if index == popup.highlight {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
@@ -941,23 +757,14 @@ fn render_launch_picker(
         let start = highlight
             .saturating_sub(visible.saturating_sub(1))
             .min(projects.len().saturating_sub(visible));
-        let slug_width = project_slug_width(
-            projects.iter().map(|project| project.slug.as_str()),
-            inner_width,
-        );
-        for (index, project) in projects.iter().enumerate().skip(start).take(visible) {
-            let label = project_entry(
-                &project.slug,
-                &path_display::shorten(&project.path, launch.path_display()),
-                slug_width,
-                inner_width,
-            );
+        let rows = picker::project_rows(projects, launch.path_display(), inner_width);
+        for (index, label) in rows.iter().enumerate().skip(start).take(visible) {
             let style = if index == highlight {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
             };
-            lines.push(Line::from(Span::styled(label, style)));
+            lines.push(Line::from(Span::styled(label.clone(), style)));
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
@@ -1112,7 +919,7 @@ fn preview_backlinks(app: &App, task: &Task) -> Vec<Line<'static>> {
     });
     let dim = Style::default().fg(Color::DarkGray);
     ids.into_iter()
-        .map(|id| Line::from(Span::styled(format!("↩ {}", resolve_title(app, &id)), dim)))
+        .map(|id| Line::from(Span::styled(format!("↩ {}", app.resolve_title(&id)), dim)))
         .collect()
 }
 
@@ -1149,28 +956,16 @@ fn preview_metadata(app: &App, task: &Task) -> Vec<Span<'static>> {
     spans
 }
 
-/// Title of a task, or `id (missing)` for a dangling reference.
-fn resolve_title(app: &App, id: &TaskId) -> String {
-    app.vault
-        .get(id)
-        .map_or_else(|| format!("{id} (missing)"), |task| task.title.clone())
-}
-
 /// One footer hint row: prompts and inline picker status remain plain text,
 /// while structured hints use cyan keys and dark-gray labels separated by
 /// exactly three spaces.
 fn render_hint(frame: &mut Frame<'_>, area: Rect, app: &App) {
     match app.status_line() {
         FooterLine::Text(text) => {
-            let style = match app.mode {
-                InputMode::Navigate => Style::default().fg(Color::DarkGray),
-                InputMode::Add { .. }
-                | InputMode::Capture
-                | InputMode::Rename { .. }
-                | InputMode::Tag
-                | InputMode::Pick(_)
-                | InputMode::RegisterPath
-                | InputMode::ConfirmDelete { .. } => Style::default().fg(Color::Cyan),
+            let style = if matches!(app.mode, InputMode::Navigate) {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Cyan)
             };
             frame.render_widget(Paragraph::new(text).style(style), area);
         }

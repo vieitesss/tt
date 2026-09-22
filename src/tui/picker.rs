@@ -8,7 +8,11 @@
 
 use std::collections::BTreeSet;
 
-use tt::{Priority, Project, TaskFilter, TaskId, TaskState, TreeNode, Vault};
+use tt::{
+    path_display, PathDisplay, Priority, Project, TaskFilter, TaskId, TaskState, TreeNode, Vault,
+};
+
+use super::text::{text_width, truncate_title};
 
 /// What a picker is choosing between, and how its keys differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +98,20 @@ impl PickerKind {
             Self::CreateLink { .. } => "↑↓ select · enter link · esc cancel",
         }
     }
+
+    /// Title of this picker's popup.
+    pub(crate) fn popup_title(&self) -> &'static str {
+        match self {
+            Self::Search { .. } => "matches",
+            Self::Project => "projects",
+            Self::Link { .. } => "links",
+            Self::Move { .. } => "move under…",
+            Self::Priority => "priority",
+            Self::Tags => "tags",
+            Self::Filter => "filter",
+            Self::CreateLink { .. } => "link to…",
+        }
+    }
 }
 
 /// Highlight state for one open picker.
@@ -109,46 +127,6 @@ impl Picker {
     /// Open a picker at the first match.
     pub(crate) fn new(kind: PickerKind) -> Self {
         Self { kind, highlight: 0 }
-    }
-
-    /// Whether this is the `/` title search.
-    pub(crate) fn is_search(&self) -> bool {
-        matches!(self.kind, PickerKind::Search { .. })
-    }
-
-    /// Whether this is the `p` project picker.
-    pub(crate) fn is_project(&self) -> bool {
-        matches!(self.kind, PickerKind::Project)
-    }
-
-    /// Whether this is the `o` link picker.
-    pub(crate) fn is_link(&self) -> bool {
-        matches!(self.kind, PickerKind::Link { .. })
-    }
-
-    /// Whether this is the `m` move picker.
-    pub(crate) fn is_move(&self) -> bool {
-        matches!(self.kind, PickerKind::Move { .. })
-    }
-
-    /// Whether this is the `!` priority picker.
-    pub(crate) fn is_priority(&self) -> bool {
-        matches!(self.kind, PickerKind::Priority)
-    }
-
-    /// Whether this is the `t` tag picker.
-    pub(crate) fn is_tags(&self) -> bool {
-        matches!(self.kind, PickerKind::Tags)
-    }
-
-    /// Whether this is the `f` filter picker.
-    pub(crate) fn is_filter(&self) -> bool {
-        matches!(self.kind, PickerKind::Filter)
-    }
-
-    /// Whether this is the `L` link-creation picker.
-    pub(crate) fn is_create_link(&self) -> bool {
-        matches!(self.kind, PickerKind::CreateLink { .. })
     }
 }
 
@@ -321,8 +299,40 @@ pub(crate) fn project_matches(query: &str, projects: &[Project]) -> Vec<Project>
         .collect()
 }
 
-/// Link targets matching `query` over title or id (all of them when the query
-/// is empty).
+/// Minimum path cells reserved in a project row, so long slugs yield space to
+/// a useful path suffix instead of pushing the path off-screen.
+const PROJECT_PATH_MIN_WIDTH: usize = 8;
+
+/// Project picker rows: a shared slug column plus each shortened project
+/// path, truncated to `row_width` cells.
+///
+/// Presentation for the `p` picker lives here, next to [`PickerKind::Project`],
+/// so `ui` only draws the strings.
+pub(crate) fn project_rows(
+    projects: &[Project],
+    display: &PathDisplay,
+    row_width: usize,
+) -> Vec<String> {
+    let measured = projects
+        .iter()
+        .map(|project| text_width(&project.slug))
+        .max()
+        .unwrap_or_default();
+    let path_width = PROJECT_PATH_MIN_WIDTH.min(row_width.saturating_sub(2));
+    let slug_width = measured.min(row_width.saturating_sub(path_width + 2));
+    projects
+        .iter()
+        .map(|project| {
+            let path = path_display::shorten(&project.path, display);
+            if slug_width == 0 {
+                return truncate_title(&path, row_width);
+            }
+            let slug = truncate_title(&project.slug, slug_width);
+            let padding = " ".repeat(slug_width.saturating_sub(text_width(&slug)));
+            truncate_title(&format!("{slug}{padding}  {path}"), row_width)
+        })
+        .collect()
+}
 pub(crate) fn link_matches(query: &str, targets: &[TaskId], vault: &Vault) -> Vec<TaskId> {
     let query = query.trim().to_lowercase();
     targets

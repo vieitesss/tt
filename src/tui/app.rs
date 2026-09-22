@@ -196,6 +196,69 @@ pub(crate) enum InputMode {
     Pick(Picker),
 }
 
+impl InputMode {
+    /// Whether an unsaved buffer in this mode must block watcher reloads.
+    ///
+    /// Typed text worth protecting lives in the mode's buffer; pickers only
+    /// hold one for search and tags.
+    pub(crate) fn holds_buffer(&self) -> bool {
+        match self {
+            Self::Add { .. }
+            | Self::Capture
+            | Self::Rename { .. }
+            | Self::Tag
+            | Self::RegisterPath
+            | Self::ConfirmDelete { .. } => true,
+            Self::Pick(picker) => picker.kind.holds_buffer(),
+            Self::Navigate => false,
+        }
+    }
+
+    /// The prompt this mode shows, before [`App`] resolves any task labels;
+    /// `None` while navigating or while a mode draws its own popup.
+    pub(crate) fn prompt(&self) -> Option<Prompt> {
+        match self {
+            Self::Add { parent, .. } => Some(Prompt::NewTask {
+                parent: parent.clone(),
+            }),
+            Self::Capture => Some(Prompt::Capture),
+            Self::Rename { .. } => Some(Prompt::Rename),
+            Self::Tag => Some(Prompt::Tag),
+            Self::Pick(picker) => Some(Prompt::Picker(picker.kind.prompt())),
+            Self::Navigate | Self::RegisterPath | Self::ConfirmDelete { .. } => None,
+        }
+    }
+}
+
+/// A prompt shape owned by [`InputMode`], resolved into text by [`App`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Prompt {
+    /// Typing a title for `a`/`A`, under a fixed parent.
+    NewTask {
+        /// Parent for the new task; `None` means the vault root.
+        parent: Option<TaskId>,
+    },
+    /// Typing a title for `N` quick capture.
+    Capture,
+    /// Typing a new title for `r`.
+    Rename,
+    /// Typing the first tag when the vault has no defined tags yet.
+    Tag,
+    /// A picker's own prompt prefix.
+    Picker(&'static str),
+}
+
+/// A picker's popup content, ready for [`super::ui`] to draw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PickerPopup {
+    /// Popup title.
+    pub(crate) title: &'static str,
+    /// One display row per live match, already formatted for the row width.
+    pub(crate) entries: Vec<String>,
+    /// Highlighted entry index.
+    pub(crate) highlight: usize,
+}
+
 /// List application state.
 pub(crate) struct App {
     /// The vault; every mutation goes through it.
@@ -481,19 +544,18 @@ impl App {
     /// Prompt prefix for input modes; `None` while navigating. The `P` path
     /// prompt renders its buffer inside its own popup, not in the footer.
     pub(crate) fn prompt_prefix(&self) -> Option<String> {
-        match &self.mode {
-            InputMode::Navigate | InputMode::RegisterPath | InputMode::ConfirmDelete { .. } => None,
-            InputMode::Add { parent, .. } => Some(format!(
+        match self.mode.prompt()? {
+            Prompt::NewTask { parent } => Some(format!(
                 "new task under {}: ",
                 self.parent_label(parent.as_ref())
             )),
-            InputMode::Capture => Some(format!(
+            Prompt::Capture => Some(format!(
                 "capture to {}: ",
                 self.parent_label(self.config.capture_target.as_ref())
             )),
-            InputMode::Rename { .. } => Some("rename to: ".to_owned()),
-            InputMode::Tag => Some("tag: ".to_owned()),
-            InputMode::Pick(picker) => Some(picker.kind.prompt().to_owned()),
+            Prompt::Rename => Some("rename to: ".to_owned()),
+            Prompt::Tag => Some("tag: ".to_owned()),
+            Prompt::Picker(prompt) => Some(prompt.to_owned()),
         }
     }
 
@@ -564,16 +626,7 @@ impl App {
 
     /// Whether an unsaved buffer must block watcher reloads.
     fn has_unsaved_buffer(&self) -> bool {
-        match &self.mode {
-            InputMode::Add { .. }
-            | InputMode::Capture
-            | InputMode::Rename { .. }
-            | InputMode::Tag
-            | InputMode::RegisterPath
-            | InputMode::ConfirmDelete { .. } => true,
-            InputMode::Pick(picker) => picker.kind.holds_buffer(),
-            InputMode::Navigate => false,
-        }
+        self.mode.holds_buffer()
     }
 
     /// The list is the only main view. `j`/`k` (and the arrows) walk the
@@ -989,19 +1042,76 @@ impl App {
         }
     }
 
+    /// The open picker's popup title and live entries, formatted for a
+    /// `row_width`-cell row. `None` when no picker is open.
+    ///
+    /// The single seam between [`PickerKind`] and its presentation: `ui` draws
+    /// whatever comes back and never matches on the kind itself.
+    pub(crate) fn picker_popup(&self, row_width: usize) -> Option<PickerPopup> {
+        let picker = self.picker()?;
+        let entries = match &picker.kind {
+            PickerKind::Search { .. } => self
+                .search_matches()
+                .iter()
+                .map(|id| self.resolve_title(id))
+                .collect(),
+            PickerKind::Project => picker::project_rows(
+                &self.project_matches(),
+                &self.config.path_display,
+                row_width,
+            ),
+            PickerKind::Link { .. } => self
+                .link_matches()
+                .iter()
+                .map(|id| self.resolve_title(id))
+                .collect(),
+            PickerKind::Move { .. } => self
+                .move_matches()
+                .iter()
+                .map(|target| match target {
+                    None => "⌂ root".to_owned(),
+                    Some(id) => self.resolve_title(id),
+                })
+                .collect(),
+            PickerKind::Priority => self
+                .priority_matches()
+                .into_iter()
+                .map(|priority| {
+                    priority.map_or_else(|| "none".to_owned(), |value| value.to_string())
+                })
+                .collect(),
+            PickerKind::Tags => self.tag_matches(),
+            PickerKind::Filter => self
+                .filter_matches()
+                .into_iter()
+                .map(|choice| choice.label())
+                .collect(),
+            PickerKind::CreateLink { .. } => self
+                .create_link_matches()
+                .iter()
+                .map(|id| self.resolve_title(id))
+                .collect(),
+        };
+        Some(PickerPopup {
+            title: picker.kind.popup_title(),
+            entries,
+            highlight: picker.highlight,
+        })
+    }
+
+    /// A task's live title, or `<id> (missing)` when it is not loaded.
+    pub(crate) fn resolve_title(&self, id: &TaskId) -> String {
+        self.vault
+            .get(id)
+            .map_or_else(|| format!("{id} (missing)"), |task| task.title.clone())
+    }
+
     /// Number of matches for the active picker (0 when no picker is open).
+    ///
+    /// The entry count does not depend on the row width, so any width gives
+    /// the same length; `0` only skips needless project-row formatting.
     fn pick_match_count(&self) -> usize {
-        match self.picker_kind() {
-            Some(PickerKind::Search { .. }) => self.search_matches().len(),
-            Some(PickerKind::Project) => self.project_matches().len(),
-            Some(PickerKind::Link { .. }) => self.link_matches().len(),
-            Some(PickerKind::Move { .. }) => self.move_matches().len(),
-            Some(PickerKind::Priority) => self.priority_matches().len(),
-            Some(PickerKind::Tags) => self.tag_matches().len(),
-            Some(PickerKind::Filter) => self.filter_matches().len(),
-            Some(PickerKind::CreateLink { .. }) => self.create_link_matches().len(),
-            None => 0,
-        }
+        self.picker_popup(0).map_or(0, |popup| popup.entries.len())
     }
 
     fn move_pick_highlight(&mut self, delta: isize) {
