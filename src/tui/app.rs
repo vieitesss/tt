@@ -17,8 +17,8 @@ use std::time::Duration;
 use chrono::{Local, NaiveDate};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tt::{
-    registry, Config, DeleteOutcome, NewTask, Priority, Project, TaskId, TreeNode, Vault,
-    VaultIssue, VaultWatcher,
+    registry, Config, DeleteOutcome, NewTask, Priority, Project, ShiftOutcome, TaskId, TreeNode,
+    Vault, VaultIssue, VaultWatcher,
 };
 
 use super::list::TaskList;
@@ -31,10 +31,10 @@ pub(crate) const TICK: Duration = Duration::from_millis(250);
 pub(crate) const TOAST_TICKS: u32 = 12;
 
 const LIST_NAV_HINTS: &str =
-    "j/k move·gg/G ends·h/l fold·tab sel·/ find·f filter·o links·? issues·q quit";
+    "j/k move·J/K rank·gg/G·h/l fold·tab sel·/ find·f filter·o links·? issues·q quit";
 const LIST_ACTION_HINTS: &str =
     "a/A add·N cap·x state·! pri·t tags·m mv·d del·L link·r rename·e edit·p/P proj";
-const SELECTION_NAV_HINTS: &str = "tab un/select · j/k move · esc clear";
+const SELECTION_NAV_HINTS: &str = "tab un/select · j/k move · J/K rank · esc clear";
 const SELECTION_ACTION_HINTS: &str = "m move · d delete · x cycle state · ! priority · t tags";
 const CONFIRM_DELETE_HINTS: &str = "←/→ select · enter confirm · y confirm · esc cancel";
 const ISSUES_HINTS: &str = "? or esc close · q quit";
@@ -62,6 +62,8 @@ pub(crate) enum InputMode {
     Add {
         /// Parent for the new task; `None` means the vault root.
         parent: Option<TaskId>,
+        /// Current sibling after which `A` inserts; `a` leaves this unset.
+        insert_after: Option<TaskId>,
     },
     /// Typing a new title for `r`; the target is the cursor task from when
     /// the prompt opened, and committing cascades mirror aliases.
@@ -354,7 +356,7 @@ impl App {
     pub(crate) fn prompt_prefix(&self) -> Option<String> {
         match &self.mode {
             InputMode::Navigate | InputMode::RegisterPath | InputMode::ConfirmDelete { .. } => None,
-            InputMode::Add { parent } => Some(format!(
+            InputMode::Add { parent, .. } => Some(format!(
                 "new task under {}: ",
                 self.parent_label(parent.as_ref())
             )),
@@ -461,6 +463,8 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Char('J') => self.shift_selected_rank(1),
+            KeyCode::Char('K') => self.shift_selected_rank(-1),
             KeyCode::Char('g') => {
                 if was_pending_g {
                     self.select_index(0);
@@ -522,6 +526,27 @@ impl App {
         let last = self.list.len() as isize - 1;
         let next = (current as isize + delta).clamp(0, last) as usize;
         self.select_index(next);
+    }
+
+    /// Move the cursor task one place among its siblings. Rank changes never
+    /// use or clear the multi-selection.
+    fn shift_selected_rank(&mut self, delta: i32) {
+        if self.active_filter.is_some() {
+            self.set_toast("clear the filter to change rank");
+            return;
+        }
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        match self.vault.shift_rank(&id, delta) {
+            Ok(ShiftOutcome::Shifted) => self.refresh(),
+            Ok(ShiftOutcome::OnlyChild) => self.set_toast("task has no siblings"),
+            Ok(ShiftOutcome::AtBound) if delta < 0 => {
+                self.set_toast("already first among siblings");
+            }
+            Ok(ShiftOutcome::AtBound) => self.set_toast("already last among siblings"),
+            Err(error) => self.set_toast(format!("error: {error}")),
+        }
     }
 
     /// Select the row at `index` (clamped) and scroll it into view.
@@ -1077,13 +1102,18 @@ impl App {
     /// Start an add prompt: `child` adds under the selection, otherwise a
     /// sibling of the selection.
     fn start_add(&mut self, sibling: bool) {
+        let insert_after = sibling.then(|| self.selected_id()).flatten();
         let parent = if sibling {
-            self.selected_id()
-                .and_then(|id| self.vault.parent(&id).cloned())
+            insert_after
+                .as_ref()
+                .and_then(|id| self.vault.parent(id).cloned())
         } else {
             self.selected_id()
         };
-        self.mode = InputMode::Add { parent };
+        self.mode = InputMode::Add {
+            parent,
+            insert_after,
+        };
         self.input.clear();
         self.status = None;
     }
@@ -1572,9 +1602,12 @@ impl App {
             self.commit_tag_prompt();
             return;
         }
-        let parent = match &self.mode {
-            InputMode::Add { parent } => parent.clone(),
-            InputMode::Capture => self.config.capture_target.clone(),
+        let (parent, insert_after) = match &self.mode {
+            InputMode::Add {
+                parent,
+                insert_after,
+            } => (parent.clone(), insert_after.clone()),
+            InputMode::Capture => (self.config.capture_target.clone(), None),
             InputMode::Navigate
             | InputMode::Rename { .. }
             | InputMode::Tag
@@ -1587,6 +1620,7 @@ impl App {
 
         let new_task = NewTask {
             parent,
+            insert_after,
             ..NewTask::new(title)
         };
         match self.vault.add(new_task) {

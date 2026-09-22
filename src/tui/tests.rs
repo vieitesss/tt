@@ -19,7 +19,7 @@ use tt::{
 
 use super::app::{ensure_selection_visible, expand_tilde_with_home, App, InputMode, TOAST_TICKS};
 use super::launch::Launch;
-use super::picker::PickerKind;
+use super::picker::{FilterCriterion, PickerKind};
 use super::ui::{layout, render, render_launch};
 
 fn setup() -> (tempfile::TempDir, App) {
@@ -162,8 +162,8 @@ fn pane_rows(lines: &[String], area: Rect) -> Vec<String> {
 #[test]
 fn list_starts_with_the_first_root_selected() {
     let (_dir, mut app) = setup();
-    add_task(&mut app, "Second", None);
-    let first = add_task(&mut app, "First", None);
+    let first = add_task(&mut app, "Second", None);
+    add_task(&mut app, "First", None);
     app.refresh();
 
     assert_eq!(app.selected_id(), Some(first));
@@ -212,6 +212,81 @@ fn j_k_and_arrows_move_in_pre_order() {
         app.handle_key(key(KeyCode::Char('k')));
     }
     assert_eq!(app.selected_id(), Some(parent), "clamped at the top");
+}
+
+#[test]
+fn uppercase_j_and_k_move_only_the_cursor_task_and_keep_it_selected() {
+    let (_dir, mut app) = setup();
+    let alpha = add_task(&mut app, "Alpha", None);
+    let beta = add_task(&mut app, "Beta", None);
+    let gamma = add_task(&mut app, "Gamma", None);
+    app.refresh();
+    app.marked.insert(gamma.clone());
+    app.selected = Some(alpha.clone());
+
+    app.handle_key(key(KeyCode::Char('J')));
+    assert_eq!(
+        app.vault.roots(),
+        &[beta.clone(), alpha.clone(), gamma.clone()]
+    );
+    assert_eq!(app.selected_id(), Some(alpha.clone()));
+    assert_eq!(
+        app.marked,
+        std::collections::BTreeSet::from([gamma.clone()])
+    );
+
+    app.handle_key(key(KeyCode::Char('K')));
+    assert_eq!(app.vault.roots(), &[alpha.clone(), beta, gamma]);
+    assert_eq!(app.selected_id(), Some(alpha));
+}
+
+#[test]
+fn rank_keys_toast_without_writing_in_a_filter_or_at_a_bound() {
+    let (dir, mut app) = setup();
+    let alpha = add_task(&mut app, "Alpha", None);
+    add_task(&mut app, "Beta", None);
+    app.refresh();
+    let path = dir.path().join(format!("{alpha}.md"));
+    let before = fs::read_to_string(&path).expect("read before");
+
+    app.active_filter = Some(FilterCriterion::State(TaskState::Open));
+    app.refresh();
+    app.handle_key(key(KeyCode::Char('J')));
+    assert_eq!(
+        app.toast.as_ref().map(|toast| toast.text.as_str()),
+        Some("clear the filter to change rank")
+    );
+    assert_eq!(
+        fs::read_to_string(&path).expect("read after filter"),
+        before
+    );
+
+    app.active_filter = None;
+    app.refresh();
+    app.selected = Some(alpha);
+    app.handle_key(key(KeyCode::Char('K')));
+    assert_eq!(
+        app.toast.as_ref().map(|toast| toast.text.as_str()),
+        Some("already first among siblings")
+    );
+    assert_eq!(fs::read_to_string(&path).expect("read after bound"), before);
+}
+
+#[test]
+fn rank_key_toasts_for_a_task_without_siblings() {
+    let (dir, mut app) = setup();
+    let only = add_task(&mut app, "Only", None);
+    app.refresh();
+    let path = dir.path().join(format!("{only}.md"));
+    let before = fs::read_to_string(&path).expect("read before");
+
+    app.handle_key(key(KeyCode::Char('J')));
+
+    assert_eq!(
+        app.toast.as_ref().map(|toast| toast.text.as_str()),
+        Some("task has no siblings")
+    );
+    assert_eq!(fs::read_to_string(path).expect("read after"), before);
 }
 
 #[test]
@@ -1046,7 +1121,7 @@ fn selection_hints_replace_the_list_hints_while_marked() {
     let lines = render_lines(&mut app, 170, 20);
     let nav = &lines[lines.len() - 3];
     let actions = &lines[lines.len() - 2];
-    for expected in ["tab un/select", "j/k move", "esc clear"] {
+    for expected in ["tab un/select", "j/k move", "J/K rank", "esc clear"] {
         assert!(
             nav.contains(expected),
             "selection hint {expected:?} missing: {nav:?}"
@@ -2402,15 +2477,8 @@ fn hints_describe_the_list_keymap() {
     // Every Navigate key is advertised across the two hint rows.
     let [nav, actions] = app.status_lines();
     for expected in [
-        "j/k move",
-        "gg/G ends",
-        "h/l fold",
-        "tab sel",
-        "/ find",
-        "f filter",
-        "o links",
-        "? issues",
-        "q quit",
+        "j/k move", "J/K rank", "gg/G", "h/l fold", "tab sel", "/ find", "f filter", "o links",
+        "? issues", "q quit",
     ] {
         assert!(
             nav.contains(expected),
@@ -2430,8 +2498,8 @@ fn hints_describe_the_list_keymap() {
     // one of them.
     let all_hints = format!("{nav} {actions}");
     for key in [
-        "j/k", "gg/G", "h/l", "tab", "/", "f", "o", "?", "q", "a/A", "N", "x", "!", "t", "m", "d",
-        "L", "r", "e", "p/P",
+        "j/k", "J/K", "gg/G", "h/l", "tab", "/", "f", "o", "?", "q", "a/A", "N", "x", "!", "t",
+        "m", "d", "L", "r", "e", "p/P",
     ] {
         assert!(
             all_hints.contains(key),
@@ -2542,7 +2610,7 @@ fn a_opens_a_prompt_and_commits_a_child_on_disk() {
     app.refresh();
 
     app.handle_key(key(KeyCode::Char('a')));
-    assert!(matches!(app.mode, InputMode::Add { parent: Some(ref id) } if id == &parent));
+    assert!(matches!(app.mode, InputMode::Add { parent: Some(ref id), .. } if id == &parent));
 
     for character in "New child".chars() {
         app.handle_key(key(KeyCode::Char(character)));
@@ -2581,7 +2649,7 @@ fn shift_a_opens_a_prompt_for_a_sibling() {
     assert_eq!(app.selected_id(), Some(child.clone()));
 
     app.handle_key(key(KeyCode::Char('A')));
-    assert!(matches!(app.mode, InputMode::Add { parent: Some(ref id) } if id == &parent));
+    assert!(matches!(app.mode, InputMode::Add { parent: Some(ref id), .. } if id == &parent));
 
     for character in "Sibling".chars() {
         app.handle_key(key(KeyCode::Char(character)));
@@ -2594,6 +2662,30 @@ fn shift_a_opens_a_prompt_for_a_sibling() {
         .find(|task| task.title == "Sibling")
         .expect("created task");
     assert_eq!(created.parent, Some(parent));
+}
+
+#[test]
+fn shift_a_inserts_the_new_task_after_the_cursor_sibling() {
+    let (_dir, mut app) = setup();
+    let alpha = add_task(&mut app, "Alpha", None);
+    let beta = add_task(&mut app, "Beta", None);
+    let gamma = add_task(&mut app, "Gamma", None);
+    app.refresh();
+    app.selected = Some(alpha.clone());
+
+    app.handle_key(key(KeyCode::Char('A')));
+    for character in "After alpha".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+
+    let created = app
+        .vault
+        .tasks()
+        .find(|task| task.title == "After alpha")
+        .expect("created task");
+    assert_eq!(app.vault.roots(), &[alpha, created.id.clone(), beta, gamma]);
+    assert_eq!(app.selected_id(), Some(created.id.clone()));
 }
 
 #[test]
