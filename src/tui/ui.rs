@@ -15,6 +15,7 @@ use tt::{path_display, Priority, Task, TaskId, TaskState, VaultIssue};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{App, FooterLine, Hint, InputMode};
+use super::keymap::{
     keymap_columns, keymap_content_lines, keymap_content_width, keymap_geometry,
     packed_group_indices, KeymapGroup, KEYMAP_GROUPS,
 };
@@ -107,6 +108,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &App) {
 
     if app.issues_open {
         render_issues_overlay(frame, areas.middle, app);
+    }
+    if app.keymap_open {
+        render_keymap_overlay(frame, areas.middle, app);
     }
 
     if let Some(prefix) = app.prompt_prefix() {
@@ -1259,9 +1263,194 @@ fn render_toast(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+#[derive(Clone, Copy)]
+enum KeymapRow {
+    Title(&'static str),
+    Binding {
+        key: &'static str,
+        label: &'static str,
+        key_width: usize,
+    },
+    Blank,
+}
+
+impl KeymapRow {
+    fn text_width(self) -> usize {
+        match self {
+            Self::Title(title) => text_width(title),
+            Self::Binding {
+                label, key_width, ..
+            } => 2 + key_width + 2 + text_width(label),
+            Self::Blank => 0,
+        }
+    }
+
+    fn is_content(self) -> bool {
+        !matches!(self, Self::Blank)
+    }
+}
+
+fn format_keymap_group(group: &KeymapGroup) -> Vec<KeymapRow> {
+    let key_width = group
+        .rows
+        .iter()
+        .map(|(key, _)| text_width(key))
+        .max()
+        .unwrap_or_default();
+    let mut rows = Vec::with_capacity(group.rows.len() + 1);
+    rows.push(KeymapRow::Title(group.title));
+    for (key, label) in group.rows {
+        rows.push(KeymapRow::Binding {
+            key,
+            label,
+            key_width,
+        });
+    }
+    rows
+}
+
+/// Pack keymap groups into balanced columns. Each group stays intact, so no
+/// binding can wrap or be split across columns. The column plan comes from
+/// [`packed_group_indices`], the same packing the scroll clamp measures, so
+/// rendering and geometry can never disagree.
+fn keymap_lines(columns: usize) -> Vec<Line<'static>> {
+    let columns = columns.max(1);
+    let groups: Vec<Vec<KeymapRow>> = KEYMAP_GROUPS.iter().map(format_keymap_group).collect();
+    let plan = packed_group_indices(columns);
+    let mut packed: Vec<Vec<KeymapRow>> = vec![Vec::new(); columns];
+    for (column, indices) in plan.iter().enumerate() {
+        for (position, group) in indices.iter().enumerate() {
+            if position > 0 {
+                packed[column].push(KeymapRow::Blank);
+            }
+            packed[column].extend(groups[*group].iter().copied());
+        }
+    }
+    let heights: Vec<usize> = packed.iter().map(Vec::len).collect();
+
+    let widths: Vec<usize> = packed
+        .iter()
+        .map(|column| {
+            column
+                .iter()
+                .map(|row| row.text_width())
+                .max()
+                .unwrap_or_default()
+        })
+        .collect();
+    let height = heights.into_iter().max().unwrap_or_default();
+    let mut lines = Vec::with_capacity(height);
+    for row in 0..height {
+        let last = packed.iter().enumerate().rev().find_map(|(column, rows)| {
+            rows.get(row)
+                .copied()
+                .filter(|row| row.is_content())
+                .map(|_| column)
+        });
+        let Some(last) = last else {
+            lines.push(Line::from(""));
+            continue;
+        };
+        let mut spans = Vec::new();
+        for (column, rows) in packed.iter().enumerate().take(last + 1) {
+            if column > 0 {
+                spans.push(Span::raw("    "));
+            }
+            let cell = rows.get(row).copied().unwrap_or(KeymapRow::Blank);
+            match cell {
+                KeymapRow::Title(title) => {
+                    spans.push(Span::styled(
+                        title,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                KeymapRow::Binding {
+                    key,
+                    label,
+                    key_width,
+                } => {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(key, Style::default().fg(Color::Cyan)));
+                    spans.push(Span::raw(" ".repeat(key_width - text_width(key) + 2)));
+                    spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+                }
+                KeymapRow::Blank => {}
+            }
+            let used = cell.text_width();
+            if widths[column] > used {
+                spans.push(Span::raw(" ".repeat(widths[column] - used)));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// Centered, scrollable keymap reference. The footer line is kept inside the
+/// border and the body uses no wrapping, so long tokens are only clipped by a
+/// genuinely narrow terminal rather than wrapped mid-token. Every size and
+/// the scroll offset come from [`keymap_geometry`], the same derivation the
+/// scroll clamp uses.
+fn render_keymap_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let columns = keymap_columns(area.width);
+    let content = keymap_lines(columns);
+    let content_lines = keymap_content_lines(columns);
+    let content_width = keymap_content_width(columns);
+    let geometry = keymap_geometry(
+        area.width,
+        area.height,
+        content_width,
+        content_lines,
+        app.keymap_scroll,
+    );
+    let popup = centered_rect(area, geometry.popup_width, geometry.popup_height);
+
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(" Keymap ")
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let body_height = geometry.body_height as u16;
+    if body_height > 0 {
+        let body = Rect {
+            height: body_height,
+            ..inner
+        };
+        frame.render_widget(
+            Paragraph::new(content).scroll((geometry.scroll as u16, 0)),
+            body,
+        );
+    }
+    let footer = Rect {
+        y: inner.y.saturating_add(inner.height.saturating_sub(1)),
+        height: 1.min(inner.height),
+        ..inner
+    };
+    frame.render_widget(
+        Paragraph::new("esc or ? to close")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        footer,
+    );
+}
+
+/// Center a popup within an area while respecting its bounds.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
+}
+
 /// Modal overlay listing every issue from the most recent scan: relative
 /// path, kind, and detail. The highlighted issue is reversed, the content
-/// scrolls to keep it visible, and `e`/Enter opens it in `$EDITOR`.
+/// scrolls to keep the highlighted issue visible, and `e`/Enter opens it in
+/// `$EDITOR`.
 fn render_issues_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Clear, area);
 

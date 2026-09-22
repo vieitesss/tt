@@ -66,6 +66,20 @@ fn parse_id(value: &str) -> TaskId {
     TaskId::parse(value).expect("valid id")
 }
 
+/// Test-only view of the shared clamp: the maximum scroll [`keymap_geometry`]
+/// honours for a middle-area size. Delegates to the single geometry
+/// derivation, so the test and the app can never drift.
+fn keymap_max_scroll(width: u16, height: u16) -> usize {
+    let columns = keymap_columns(width);
+    keymap_geometry(
+        width,
+        height,
+        keymap_content_width(columns),
+        keymap_content_lines(columns),
+        0,
+    )
+    .max_scroll
+}
 
 fn project(path: &str, slug: &str) -> Project {
     Project {
@@ -89,8 +103,9 @@ fn add_task(app: &mut App, title: &str, parent: Option<&TaskId>) -> TaskId {
 fn render_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
-    let list = layout(Rect::new(0, 0, width, height)).list;
-    app.set_list_viewport(list.width, list.height);
+    let areas = layout(Rect::new(0, 0, width, height));
+    app.set_list_viewport(areas.list.width, areas.list.height);
+    app.set_middle_viewport(areas.middle.width, areas.middle.height);
     terminal.draw(|frame| render(frame, app)).expect("draw");
     let buffer = terminal.backend().buffer();
 
@@ -111,8 +126,9 @@ fn render_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
 fn render_cells(app: &mut App, width: u16, height: u16) -> Vec<Vec<(char, Style)>> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
-    let list = layout(Rect::new(0, 0, width, height)).list;
-    app.set_list_viewport(list.width, list.height);
+    let areas = layout(Rect::new(0, 0, width, height));
+    app.set_list_viewport(areas.list.width, areas.list.height);
+    app.set_middle_viewport(areas.middle.width, areas.middle.height);
     terminal.draw(|frame| render(frame, app)).expect("draw");
     let buffer = terminal.backend().buffer();
 
@@ -3548,19 +3564,422 @@ fn preview_resolves_rich_link_forms_and_never_shows_aliases() {
 }
 
 #[test]
-fn question_mark_opens_and_closes_the_overlay() {
+fn question_mark_opens_and_closes_the_keymap() {
     let (_dir, mut app) = setup_with_issues(&["CONTEXT.md"]);
 
     app.handle_key(key(KeyCode::Char('?')));
-    assert!(app.issues_open, "? should open the overlay from the list");
+    assert!(app.keymap_open, "? should open the keymap from the list");
+    assert!(!app.issues_open);
 
     app.handle_key(key(KeyCode::Esc));
-    assert!(!app.issues_open, "Esc should close the overlay");
+    assert!(!app.keymap_open, "Esc should close the keymap");
+    app.handle_key(key(KeyCode::Char('g')));
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.issues_open, "g? should open the issues overlay");
+}
+
+#[test]
+fn keymap_scroll_is_modal_and_clamped() {
+    let (_dir, mut app) = setup();
+    let id = add_task(&mut app, "Only", None);
+    app.refresh();
+
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.keymap_open);
+    app.set_middle_viewport(80, 10);
+    let selected_before = app.selected_id();
+    app.handle_key(key(KeyCode::Char('j')));
+    assert!(app.keymap_scroll > 0, "j scrolls the keymap");
+    app.handle_key(key(KeyCode::Char('x')));
+    assert_eq!(
+        app.vault.get(&id).expect("task").state,
+        TaskState::Open,
+        "task hotkeys are inert while the keymap is open"
+    );
+    assert_eq!(app.selected_id(), selected_before);
+
+    for _ in 0..100 {
+        app.handle_key(key(KeyCode::Char('j')));
+    }
+    let end = app.keymap_scroll;
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.keymap_scroll, end, "scroll clamps at the end");
+    for _ in 0..100 {
+        app.handle_key(key(KeyCode::Char('k')));
+    }
+    assert_eq!(app.keymap_scroll, 0, "scroll clamps at the beginning");
+
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(!app.keymap_open, "? closes the keymap");
+    app.handle_key(key(KeyCode::Char('?')));
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.keymap_open, "Esc closes the keymap");
+}
+
+#[test]
+fn keymap_overlay_shows_grouped_bindings_and_close_hint() {
+    let (_dir, mut app) = setup();
+    add_task(&mut app, "Only", None);
+    app.refresh();
+    app.handle_key(key(KeyCode::Char('?')));
+
+    let text = render_lines(&mut app, 100, 40).join("\n");
+    for expected in [
+        "Keymap",
+        "Movement",
+        "j / k",
+        "move selection (also up/down arrows)",
+        "Tasks",
+        "Jump",
+        "Vault",
+        "g ?",
+        "Pickers",
+        "Modals",
+        "esc or ? to close",
+    ] {
+        assert!(
+            text.contains(expected),
+            "keymap missing {expected:?}: {text}"
+        );
+    }
+}
+
+#[test]
+fn keymap_overlay_uses_yellow_titles_cyan_keys_and_dim_labels() {
+    let (_dir, mut app) = setup();
+    add_task(&mut app, "Only", None);
+    app.refresh();
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.keymap_open);
+
+    let cells = render_cells(&mut app, 130, 30);
+    let title = style_at_text(&cells, "Movement");
+    assert_eq!(
+        title.fg,
+        Some(Color::Yellow),
+        "group title is yellow: {title:?}"
+    );
+    assert!(
+        title.add_modifier.contains(Modifier::BOLD),
+        "group title is bold: {title:?}"
+    );
+    let binding = style_at_text(&cells, "gg / G");
+    assert_eq!(
+        binding.fg,
+        Some(Color::Cyan),
+        "binding key is cyan: {binding:?}"
+    );
+    let label = style_at_text(&cells, "first / last");
+    assert_eq!(
+        label.fg,
+        Some(Color::DarkGray),
+        "binding label is dim: {label:?}"
+    );
+}
+
+#[test]
+fn keymap_columns_follow_the_120_width_threshold() {
+    let (_dir, mut app) = setup();
+    add_task(&mut app, "Only", None);
+    app.refresh();
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.keymap_open);
+
+    let narrow = render_lines(&mut app, 100, 40);
+    let row = narrow
+        .iter()
+        .find(|row| row.contains("Movement") && row.contains("Tasks"))
+        .expect("two columns share a row below 120");
+    assert!(
+        !row.contains("Jump"),
+        "Jump is not on the first row below 120: {row:?}"
+    );
+
+    let wide = render_lines(&mut app, 130, 40);
+    assert!(
+        wide.iter()
+            .any(|row| row.contains("Movement") && row.contains("Tasks") && row.contains("Jump")),
+        "three columns share a row at 120 or more: {wide:?}"
+    );
+}
+
+#[test]
+fn footer_hint_keys_are_cyan_and_labels_are_dim() {
+    let (_dir, mut app) = setup();
+    add_task(&mut app, "Only", None);
+    app.refresh();
+
+    let cells = render_cells(&mut app, 100, 20);
+    let key = style_at_text(&cells, "j/k");
+    assert_eq!(key.fg, Some(Color::Cyan), "hint key is cyan: {key:?}");
+    let label = style_at_text(&cells, "move");
+    assert_eq!(
+        label.fg,
+        Some(Color::DarkGray),
+        "hint label is dim: {label:?}"
+    );
+}
+
+#[test]
+fn keymap_scroll_clamps_at_the_max_and_reclamps_on_resize() {
+    let (_dir, mut app) = setup();
+    add_task(&mut app, "Only", None);
+    app.refresh();
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.keymap_open);
+
+    // A short terminal so the keymap actually needs to scroll.
+    app.set_middle_viewport(80, 10);
+    let max = keymap_max_scroll(80, 10);
+    assert!(max > 0, "the test size must require scrolling");
+    for _ in 0..200 {
+        app.handle_key(key(KeyCode::Char('j')));
+    }
+    assert_eq!(app.keymap_scroll, max, "scroll stops at the maximum");
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(
+        app.keymap_scroll, max,
+        "one more j does not move past the maximum"
+    );
+
+    // A taller viewport fits more rows, so the offset re-clamps down.
+    app.set_middle_viewport(80, 40);
+    assert_eq!(
+        app.keymap_scroll,
+        keymap_max_scroll(80, 40),
+        "resize re-clamps the scroll"
+    );
+}
+
+#[test]
+fn keymap_scroll_max_matches_renderer_body_for_all_sizes() {
+    // The single-geometry invariant: for every middle-area size, the app's
+    // maximum scroll and the renderer's drawn body rows agree, so no scroll
+    // position is unreachable or overshoots. Covers the tiny heights (1..=5,
+    // including height 3 where the old visible-lines clamp returned 1 while
+    // the renderer drew 0 rows) at both column counts.
+    let (_dir, mut app) = setup();
+    add_task(&mut app, "Only", None);
+    app.refresh();
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.keymap_open);
+
+    for width in [80u16, 130u16] {
+        let columns = keymap_columns(width);
+        let content_lines = keymap_content_lines(columns);
+        let content_width = keymap_content_width(columns);
+        assert!(
+            content_lines > 0,
+            "the keymap must need scrolling at {width}"
+        );
+        for height in 1u16..=40 {
+            let geometry = keymap_geometry(width, height, content_width, content_lines, usize::MAX);
+            // The renderer draws `body_height` rows; at maximum scroll the
+            // remaining rows must be exactly the body, so nothing is hidden
+            // or overshoots.
+            assert_eq!(
+                geometry.max_scroll,
+                content_lines.saturating_sub(geometry.body_height),
+                "max must match the drawn body at {width}x{height}"
+            );
+            assert_eq!(
+                geometry.scroll, geometry.max_scroll,
+                "saturating scroll must clamp to the max at {width}x{height}"
+            );
+            assert_eq!(
+                content_lines.saturating_sub(geometry.max_scroll),
+                content_lines.min(geometry.body_height),
+                "drawn rows at max must be the body at {width}x{height}"
+            );
+
+            // The app reaches exactly the renderer's max through keys and
+            // never exceeds it, including via resize re-clamping.
+            app.set_middle_viewport(width, height);
+            app.keymap_scroll = 0;
+            for _ in 0..content_lines + 10 {
+                app.handle_key(key(KeyCode::Char('j')));
+            }
+            assert_eq!(
+                app.keymap_scroll, geometry.max_scroll,
+                "app scroll must reach the renderer max at {width}x{height}"
+            );
+            app.handle_key(key(KeyCode::Char('j')));
+            assert_eq!(
+                app.keymap_scroll, geometry.max_scroll,
+                "app scroll must not overshoot at {width}x{height}"
+            );
+            app.keymap_scroll = content_lines + 100;
+            app.set_middle_viewport(width, height);
+            assert_eq!(
+                app.keymap_scroll, geometry.max_scroll,
+                "resize must re-clamp an overshoot at {width}x{height}"
+            );
+        }
+    }
+}
+
+#[test]
+fn keymap_overlay_rendering_honours_shared_geometry_scroll_and_body() {
+    // Regression guard: `render_keymap_overlay` in `ui.rs` must draw exactly
+    // `geometry.body_height` content rows starting at `geometry.scroll`, where
+    // the geometry is the shared `keymap_geometry` derivation. If the renderer
+    // re-introduced its own popup/body sizing or ignored the scroll offset,
+    // the first/last-line visibility below would be wrong and this test would
+    // fail — unlike pure-geometry assertions, which compare `keymap_geometry`
+    // against itself and pass either way.
+    let (_dir, mut app) = setup();
+    add_task(&mut app, "Only", None);
+    app.refresh();
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.keymap_open);
+
+    // A terminal small enough that the keymap content cannot fit, so
+    // scrolling is actually required. Verified, not assumed.
+    const WIDTH: u16 = 80;
+    const HEIGHT: u16 = 10;
+    let middle = layout(Rect::new(0, 0, WIDTH, HEIGHT)).middle;
+    let columns = keymap_columns(middle.width);
+    let content_lines = keymap_content_lines(columns);
+    let content_width = keymap_content_width(columns);
+    let geometry = keymap_geometry(middle.width, middle.height, content_width, content_lines, 0);
+    assert!(
+        geometry.max_scroll > 0,
+        "the test size must require scrolling: {middle:?} fits {content_lines} lines into {} body rows",
+        geometry.body_height
+    );
+    assert!(
+        geometry.body_height < content_lines,
+        "the body must be shorter than the content: {geometry:?}"
+    );
+    let visible = content_lines.min(geometry.body_height);
+    assert!(visible > 0, "the body must draw at least one row");
+
+    // The popup body rectangle, mirroring the renderer: a centered popup,
+    // a one-cell border inset, and exactly `body_height` drawn rows.
+    let popup = Rect {
+        x: middle.x + middle.width.saturating_sub(geometry.popup_width) / 2,
+        y: middle.y + middle.height.saturating_sub(geometry.popup_height) / 2,
+        width: geometry.popup_width.min(middle.width),
+        height: geometry.popup_height.min(middle.height),
+    };
+    let body = Rect {
+        x: popup.x.saturating_add(1),
+        y: popup.y.saturating_add(1),
+        width: popup.width.saturating_sub(2),
+        height: (geometry.body_height as u16).min(popup.height.saturating_sub(2)),
+    };
+    assert_eq!(
+        body.height as usize, visible,
+        "the body draws exactly the shared body height"
+    );
+    let body_text = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .skip(body.y as usize)
+            .take(body.height as usize)
+            .map(|row| {
+                row.chars()
+                    .skip(body.x as usize)
+                    .take(body.width as usize)
+                    .collect()
+            })
+            .collect()
+    };
+
+    // Distinctive left-column needles for the first window (content rows
+    // `0..visible`), the row just past it, the last window
+    // (`max_scroll..max_scroll + visible`), and the row just before it. The
+    // left column is never clipped by the popup width, unlike the right
+    // column's tail, so these survive horizontal clipping. Update them if the
+    // keymap table or the test size changes.
+    let first_window = ["Movement", "move selection", "first / last"];
+    let last_window = [
+        "confirm / cancel delete",
+        "move through issues",
+        "edit the issue",
+    ];
+    assert_eq!(
+        visible,
+        first_window.len(),
+        "the test size must show exactly the hardcoded first window; update the needles instead of assuming"
+    );
+    assert_eq!(
+        visible,
+        last_window.len(),
+        "the test size must show exactly the hardcoded last window; update the needles instead of assuming"
+    );
+
+    // At scroll 0 the renderer honours `geometry.scroll`: the first content
+    // rows are drawn, in order, and the last content line is nowhere on
+    // screen. The row just past the body must also be absent, proving the
+    // renderer drew no more than `body_height` rows.
+    app.keymap_scroll = 0;
+    let top = render_lines(&mut app, WIDTH, HEIGHT);
+    let top_body = body_text(&top);
+    assert_eq!(
+        top_body.len(),
+        visible,
+        "the body draws min(content, body_height) rows at scroll 0"
+    );
+    for (row, needle) in top_body.iter().zip(first_window) {
+        assert!(
+            row.contains(needle),
+            "body row must show {needle:?} at scroll 0: {row:?}"
+        );
+    }
+    let top_screen = top.join("\n");
+    assert!(
+        !top_screen.contains("edit the issue"),
+        "the last content line must be hidden at scroll 0"
+    );
+    assert!(
+        !top_screen.contains("fold / unfold"),
+        "the row just past the body must not be drawn at scroll 0"
+    );
+
+    // Drive to the maximum scroll through the same `j` path the app uses,
+    // then render again: the last content rows are drawn, in order, and the
+    // first content line has scrolled away. The row just before the window
+    // must be absent, proving the renderer started exactly at the scroll.
+    for _ in 0..content_lines + 10 {
+        app.handle_key(key(KeyCode::Char('j')));
+    }
+    assert_eq!(
+        app.keymap_scroll, geometry.max_scroll,
+        "j must reach the shared maximum scroll"
+    );
+    let bottom = render_lines(&mut app, WIDTH, HEIGHT);
+    let bottom_body = body_text(&bottom);
+    assert_eq!(
+        bottom_body.len(),
+        visible,
+        "the body draws min(content, body_height) rows at max scroll"
+    );
+    for (row, needle) in bottom_body.iter().zip(last_window) {
+        assert!(
+            row.contains(needle),
+            "body row must show {needle:?} at max scroll: {row:?}"
+        );
+    }
+    let bottom_screen = bottom.join("\n");
+    assert!(
+        bottom_screen.contains("edit the issue"),
+        "the last content line must be visible at max scroll"
+    );
+    assert!(
+        !bottom_screen.contains("Movement"),
+        "the first content line must have scrolled away at max scroll"
+    );
+    assert!(
+        !bottom_screen.contains("choose button"),
+        "the row just before the last window must not be drawn at max scroll"
+    );
 }
 
 #[test]
 fn issue_overlay_kinds_share_a_fixed_column() {
     let (_dir, mut app) = setup_with_issues(&["x.md", "a-much-longer-name.md", "猫.md"]);
+    app.handle_key(key(KeyCode::Char('g')));
     app.handle_key(key(KeyCode::Char('?')));
 
     let lines = render_lines(&mut app, 100, 20);
@@ -3617,6 +4036,7 @@ fn issue_overlay_kinds_share_a_fixed_column() {
 #[test]
 fn issue_overlay_content_stays_inside_its_border_at_narrow_widths() {
     let (_dir, mut app) = setup_with_issues(&["CONTEXT.md", "SKILL.md"]);
+    app.handle_key(key(KeyCode::Char('g')));
     app.handle_key(key(KeyCode::Char('?')));
     assert!(app.issues_open);
 
@@ -3693,7 +4113,7 @@ fn edit_return_warns_only_when_the_issue_count_rises() {
     app.reload_after_edit();
     assert_eq!(
         app.toast.as_ref().map(|toast| toast.text.as_str()),
-        Some("⚠ 1 issue — press ?")
+        Some("⚠ 1 issue — press g?")
     );
 
     // A second break pluralizes and reports the new total.
@@ -3705,7 +4125,7 @@ fn edit_return_warns_only_when_the_issue_count_rises() {
     app.reload_after_edit();
     assert_eq!(
         app.toast.as_ref().map(|toast| toast.text.as_str()),
-        Some("⚠ 2 issues — press ?")
+        Some("⚠ 2 issues — press g?")
     );
 
     // A flat count must not clobber existing action feedback.
@@ -3855,6 +4275,7 @@ fn issue_overlay_shows_id_mismatch_and_edit_requests_the_file() {
     app.reload_now();
     assert_eq!(app.vault_issues.len(), 1);
 
+    app.handle_key(key(KeyCode::Char('g')));
     app.handle_key(key(KeyCode::Char('?')));
     let text = render_lines(&mut app, 100, 20).join("\n");
     assert!(text.contains("id mismatch"), "kind missing: {text}");
@@ -3872,12 +4293,13 @@ fn issue_overlay_shows_id_mismatch_and_edit_requests_the_file() {
 }
 
 #[test]
-fn question_mark_opens_the_issue_overlay_and_esc_closes_it() {
+fn store_issues_open_on_g_then_question_mark_and_close_on_esc() {
     let (_dir, mut app) = setup_with_issues(&["CONTEXT.md", "SKILL.md"]);
     assert!(!app.issues_open);
 
+    app.handle_key(key(KeyCode::Char('g')));
     app.handle_key(key(KeyCode::Char('?')));
-    assert!(app.issues_open, "? should open the overlay");
+    assert!(app.issues_open, "g? should open the overlay");
 
     let text = render_lines(&mut app, 100, 20).join("\n");
     assert!(text.contains("vault issues (2)"), "{text}");
@@ -3893,18 +4315,26 @@ fn question_mark_opens_the_issue_overlay_and_esc_closes_it() {
         "overlay remains: {text}"
     );
 
-    // `?` also closes; while open, unrelated keys are ignored.
+    // While open, unrelated keys are ignored and `?` stays inert; only Esc
+    // closes.
+    app.handle_key(key(KeyCode::Char('g')));
     app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.issues_open, "g? should reopen the overlay");
     let id = add_task(&mut app, "Still open", None);
     app.refresh();
     app.handle_key(key(KeyCode::Char('x')));
     assert_eq!(
         app.vault.get(&id).expect("task").state,
         TaskState::Open,
-        "keys other than q/?/esc must be inert while the overlay is open"
+        "keys other than q/esc must be inert while the overlay is open"
     );
     app.handle_key(key(KeyCode::Char('?')));
-    assert!(!app.issues_open, "? should toggle the overlay closed");
+    assert!(
+        app.issues_open,
+        "? must stay inert while the issues overlay is open"
+    );
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.issues_open, "Esc should close the overlay");
 }
 
 #[test]
@@ -3912,6 +4342,7 @@ fn issue_overlay_cursor_moves_and_clamps() {
     let (_dir, mut app) = setup_with_issues(&["bad-one.md", "bad-two.md", "bad-three.md"]);
     assert_eq!(app.vault_issues.len(), 3);
 
+    app.handle_key(key(KeyCode::Char('g')));
     app.handle_key(key(KeyCode::Char('?')));
     assert_eq!(app.issues_cursor, 0, "opens on the first issue");
     app.handle_key(key(KeyCode::Char('j')));
@@ -3931,6 +4362,7 @@ fn issue_overlay_cursor_moves_and_clamps() {
     app.handle_key(key(KeyCode::Esc));
     app.handle_key(key(KeyCode::Up));
     assert_eq!(app.issues_cursor, 0);
+    app.handle_key(key(KeyCode::Char('g')));
     app.handle_key(key(KeyCode::Char('?')));
     assert_eq!(app.issues_cursor, 0);
 }
@@ -3938,6 +4370,7 @@ fn issue_overlay_cursor_moves_and_clamps() {
 #[test]
 fn issue_overlay_edit_requests_the_highlighted_file() {
     let (_dir, mut app) = setup_with_issues(&["bad-one.md", "bad-two.md"]);
+    app.handle_key(key(KeyCode::Char('g')));
     app.handle_key(key(KeyCode::Char('?')));
     app.handle_key(key(KeyCode::Char('j')));
     let expected = app.vault_issues[1].path.clone();
@@ -3960,6 +4393,7 @@ fn issue_overlay_edit_requests_the_highlighted_file() {
 #[test]
 fn issue_overlay_highlights_the_selected_issue() {
     let (_dir, mut app) = setup_with_issues(&["bad-one.md", "bad-two.md"]);
+    app.handle_key(key(KeyCode::Char('g')));
     app.handle_key(key(KeyCode::Char('?')));
 
     let first = app.vault_issues[0]
@@ -3999,6 +4433,7 @@ fn issue_overlay_highlights_the_selected_issue() {
 #[test]
 fn issue_overlay_closes_with_a_toast_when_the_files_are_fixed() {
     let (dir, mut app) = setup_with_issues(&["bad-one.md", "bad-two.md"]);
+    app.handle_key(key(KeyCode::Char('g')));
     app.handle_key(key(KeyCode::Char('?')));
     assert!(app.issues_open);
 
@@ -4036,6 +4471,7 @@ fn issue_overlay_edit_is_a_noop_on_a_clean_vault() {
     add_task(&mut app, "Only", None);
     app.refresh();
 
+    app.handle_key(key(KeyCode::Char('g')));
     app.handle_key(key(KeyCode::Char('?')));
     assert!(app.vault_issues.is_empty());
     app.handle_key(key(KeyCode::Enter));
@@ -4056,6 +4492,7 @@ fn clean_vault_has_no_badge_and_the_overlay_reports_no_issues() {
     let text = render_lines(&mut app, 100, 20).join("\n");
     assert!(!text.contains('⚠'), "unexpected badge: {text}");
 
+    app.handle_key(key(KeyCode::Char('g')));
     app.handle_key(key(KeyCode::Char('?')));
     assert!(app.issues_open);
     let text = render_lines(&mut app, 100, 20).join("\n");

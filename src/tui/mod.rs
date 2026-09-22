@@ -138,8 +138,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 /// draws, so scrolling clamps from events instead of during the draw.
 fn sync_list_viewport(terminal: &DefaultTerminal, app: &mut App) -> Result<()> {
     let size = terminal.size().context("reading the terminal size")?;
-    let list = ui::layout(Rect::new(0, 0, size.width, size.height)).list;
-    app.set_list_viewport(list.width, list.height);
+    let areas = ui::layout(Rect::new(0, 0, size.width, size.height));
+    app.set_list_viewport(areas.list.width, areas.list.height);
+    app.set_middle_viewport(areas.middle.width, areas.middle.height);
     Ok(())
 }
 

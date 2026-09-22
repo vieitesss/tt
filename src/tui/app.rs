@@ -21,6 +21,7 @@ use tt::{
     Vault, VaultIssue, VaultWatcher,
 };
 
+use super::keymap::{keymap_columns, keymap_content_lines, keymap_content_width, keymap_geometry};
 use super::list::TaskList;
 use super::picker::{self, FilterChoice, FilterCriterion, Picker, PickerKind};
 
@@ -214,13 +215,20 @@ pub(crate) struct App {
     /// session left open across midnight stays correct.
     pub(crate) today: NaiveDate,
     /// Issues from the most recent scan, shown as a persistent badge and in
-    /// the `?` overlay. Kept out of [`App::status`] so reloads never clobber
+    /// the `g?` overlay. Kept out of [`App::status`] so reloads never clobber
     /// action feedback.
     pub(crate) vault_issues: Vec<VaultIssue>,
     /// Whether the vault-issue overlay is open.
     pub(crate) issues_open: bool,
-    /// Highlighted issue in the `?` overlay.
+    /// Whether the complete keymap overlay is open.
+    pub(crate) keymap_open: bool,
+    /// Scroll offset in the keymap overlay.
+    pub(crate) keymap_scroll: usize,
+    /// Highlighted issue in the `g?` overlay.
     pub(crate) issues_cursor: usize,
+    /// Middle pane size last measured from the terminal; keymap scrolling
+    /// clamps against it before drawing.
+    pub(crate) middle_viewport: (u16, u16),
     /// Set by `q`/`ctrl-c`; the event loop exits when true.
     pub(crate) should_quit: bool,
     /// The flattened task tree, rebuilt on every refresh.
@@ -280,7 +288,10 @@ impl App {
             today: Local::now().date_naive(),
             vault_issues: Vec::new(),
             issues_open: false,
+            keymap_open: false,
+            keymap_scroll: 0,
             issues_cursor: 0,
+            middle_viewport: (0, 0),
             should_quit: false,
             list: TaskList::default(),
             active_filter: None,
@@ -390,11 +401,23 @@ impl App {
             self.handle_confirm_delete(key);
             return;
         }
+        if self.keymap_open {
+            // The keymap is modal: only scrolling, closing, and quitting are
+            // active. Task hotkeys must never leak through to the list.
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => self.keymap_open = false,
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_keymap(1),
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_keymap(-1),
+                _ => {}
+            }
+            return;
+        }
         if self.issues_open {
             // Modal-lite: movement, edit, close, and quit act; everything else
             // (including task hotkeys like `x`) stays inert.
             match key.code {
-                KeyCode::Esc | KeyCode::Char('?') => self.issues_open = false,
+                KeyCode::Esc => self.issues_open = false,
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Down | KeyCode::Char('j') => self.move_issues_cursor(1),
                 KeyCode::Up | KeyCode::Char('k') => self.move_issues_cursor(-1),
@@ -598,7 +621,8 @@ impl App {
             KeyCode::Char('p') => self.start_project_pick(),
             KeyCode::Char('P') => self.start_register_path(),
             KeyCode::Char('o') => self.start_link_pick(),
-            KeyCode::Char('?') => self.open_issues(),
+            KeyCode::Char('?') if was_pending_g => self.open_issues(),
+            KeyCode::Char('?') => self.open_keymap(),
             KeyCode::Tab => self.toggle_mark(),
             KeyCode::Esc => {
                 // Selection is the innermost state: Esc clears it first, and
@@ -768,6 +792,31 @@ impl App {
     pub(crate) fn set_list_viewport(&mut self, width: u16, height: u16) {
         self.list_viewport = (width, height);
         self.ensure_selection_visible();
+    }
+
+    /// Record the middle pane size and re-clamp keymap scrolling. The event
+    /// loop calls this on startup and resize so scrolling never gets stuck
+    /// beyond the end after the terminal shrinks. The clamp is the single
+    /// [`keymap_geometry`] derivation, so there is one clamp, not two.
+    pub(crate) fn set_middle_viewport(&mut self, width: u16, height: u16) {
+        self.middle_viewport = (width, height);
+        self.keymap_scroll = self.keymap_geometry(self.keymap_scroll).scroll;
+    }
+
+    /// Popup geometry for the current middle viewport and a requested scroll.
+    /// The single shared derivation behind clamping; rendering uses the same
+    /// function, so the two can never disagree.
+    fn keymap_geometry(&self, scroll: usize) -> super::keymap::KeymapGeometry {
+        let columns = keymap_columns(self.middle_viewport.0);
+        let content_lines = keymap_content_lines(columns);
+        let content_width = keymap_content_width(columns);
+        keymap_geometry(
+            self.middle_viewport.0,
+            self.middle_viewport.1,
+            content_width,
+            content_lines,
+            scroll,
+        )
     }
 
     /// Start the project picker (`p`), filtering over the registry.
@@ -1113,10 +1162,25 @@ impl App {
         self.status = None;
     }
 
-    /// Open the `?` overlay on the first issue.
+    /// Open the `g?` overlay on the first issue, closing the keymap first.
     fn open_issues(&mut self) {
+        self.keymap_open = false;
         self.issues_open = true;
         self.issues_cursor = 0;
+    }
+
+    /// Open the `?` keymap, closing the issues overlay first.
+    fn open_keymap(&mut self) {
+        self.issues_open = false;
+        self.keymap_open = true;
+        self.keymap_scroll = 0;
+    }
+
+    /// Move the keymap scroll offset and clamp it to the measured viewport.
+    /// Every number comes from [`keymap_geometry`].
+    fn scroll_keymap(&mut self, delta: isize) {
+        let requested = (self.keymap_scroll as isize + delta).max(0) as usize;
+        self.keymap_scroll = self.keymap_geometry(requested).scroll;
     }
 
     /// Move the overlay highlight `delta` issues, clamped at the ends.
@@ -1782,7 +1846,7 @@ impl App {
         self.reload_now();
         let after = self.vault_issues.len();
         if after > before {
-            self.set_toast(format!("⚠ {} — press ?", issue_count_text(after)));
+            self.set_toast(format!("⚠ {} — press g?", issue_count_text(after)));
         }
     }
 
