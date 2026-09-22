@@ -159,6 +159,14 @@ fn pane_rows(lines: &[String], area: Rect) -> Vec<String> {
         .collect()
 }
 
+/// Character column where `needle` starts in `row`.
+fn column(row: &str, needle: &str) -> usize {
+    let byte = row
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle:?} not in {row:?}"));
+    row[..byte].chars().count()
+}
+
 #[test]
 fn list_starts_with_the_first_root_selected() {
     let (_dir, mut app) = setup();
@@ -2045,6 +2053,147 @@ fn cancelled_rows_are_struck_through() {
 }
 
 #[test]
+fn list_rows_share_fixed_columns_across_depths_and_missing_metadata() {
+    let (_dir, mut app) = setup();
+    let today = NaiveDate::from_ymd_opt(2026, 6, 15).expect("date");
+    app.today = today;
+    let all_fields = app
+        .vault
+        .add(NewTask {
+            due: Some(today),
+            priority: Some(Priority::High),
+            ..NewTask::new("All fields")
+        })
+        .expect("add")
+        .id;
+    add_task(&mut app, "Nested bare", Some(&all_fields));
+    app.vault
+        .add(NewTask {
+            due: Some(today),
+            ..NewTask::new("Wide 猫")
+        })
+        .expect("add wide");
+    app.vault
+        .add(NewTask {
+            due: NaiveDate::from_ymd_opt(2020, 1, 1),
+            ..NewTask::new("Due rollup")
+        })
+        .expect("add due parent");
+    let priority_rollup = app
+        .vault
+        .add(NewTask {
+            priority: Some(Priority::Low),
+            ..NewTask::new("Priority rollup")
+        })
+        .expect("add priority parent")
+        .id;
+    add_task(&mut app, "Priority child", Some(&priority_rollup));
+    let due_rollup = app
+        .vault
+        .tasks()
+        .find(|task| task.title == "Due rollup")
+        .expect("due parent")
+        .id
+        .clone();
+    add_task(&mut app, "Due child", Some(&due_rollup));
+    app.refresh();
+
+    let width = 120;
+    let areas = layout(Rect::new(0, 0, width, 20));
+    let rows = pane_rows(&render_lines(&mut app, width, 20), areas.list);
+    let row = |needle: &str| {
+        rows.iter()
+            .find(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("row containing {needle:?}: {rows:?}"))
+    };
+
+    let fold_columns =
+        ["All fields", "Due rollup", "Priority rollup"].map(|title| column(row(title), "▾"));
+    assert!(
+        fold_columns
+            .windows(2)
+            .all(|columns| columns[0] == columns[1]),
+        "fold markers share one fixed column: {rows:?}"
+    );
+    assert_eq!(
+        column(row("Nested bare"), "└"),
+        column(row("Priority child"), "└"),
+        "indent guides share one fixed column"
+    );
+    let state_columns = ["All fields", "Nested bare", "Due rollup", "Priority rollup"]
+        .map(|title| column(row(title), "○"));
+    assert!(
+        state_columns
+            .windows(2)
+            .all(|columns| columns[0] == columns[1]),
+        "state glyphs share one fixed column: {rows:?}"
+    );
+    let title_columns = [
+        "All fields",
+        "Nested bare",
+        "Wide 猫",
+        "Due rollup",
+        "Priority rollup",
+    ]
+    .map(|title| column(row(title), title));
+    assert!(
+        title_columns
+            .windows(2)
+            .all(|columns| columns[0] == columns[1]),
+        "titles share one fixed column: {rows:?}"
+    );
+    assert_eq!(
+        column(row("All fields"), "today"),
+        column(row("Due rollup"), "overdue"),
+        "due values share one fixed column"
+    );
+    assert_eq!(
+        column(row("All fields"), "today"),
+        column(row("Wide 猫"), "today"),
+        "a wide title does not shift the due column"
+    );
+    assert_eq!(
+        column(row("All fields"), "!"),
+        column(row("Priority rollup"), "↓"),
+        "priority stays aligned when due is missing"
+    );
+    assert_eq!(
+        column(row("All fields"), "0/1"),
+        column(row("Due rollup"), "0/1"),
+        "rollup stays aligned when priority is missing"
+    );
+}
+
+#[test]
+fn narrow_list_keeps_a_fixed_visible_title_column() {
+    let (_dir, mut app) = setup();
+    let today = NaiveDate::from_ymd_opt(2026, 6, 15).expect("date");
+    app.today = today;
+    let parent = app
+        .vault
+        .add(NewTask {
+            due: Some(today),
+            priority: Some(Priority::High),
+            ..NewTask::new("All metadata")
+        })
+        .expect("add")
+        .id;
+    add_task(&mut app, "Nested title", Some(&parent));
+    app.refresh();
+
+    let width = 40;
+    let areas = layout(Rect::new(0, 0, width, 12));
+    let rows = pane_rows(&render_lines(&mut app, width, 12), areas.list);
+    let parent = rows.iter().find(|row| row.contains("All")).expect("parent");
+    let child = rows.iter().find(|row| row.contains("Nes")).expect("child");
+    assert_eq!(
+        column(parent, "All"),
+        column(child, "Nes"),
+        "narrow rows keep the visible title column aligned: {rows:?}"
+    );
+}
+
+#[test]
 fn overdue_and_today_due_meta_render_red() {
     let (_dir, mut app) = setup();
     let today = NaiveDate::from_ymd_opt(2026, 6, 15).expect("date");
@@ -3409,6 +3558,62 @@ fn question_mark_opens_and_closes_the_overlay() {
 }
 
 #[test]
+fn issue_overlay_kinds_share_a_fixed_column() {
+    let (_dir, mut app) = setup_with_issues(&["x.md", "a-much-longer-name.md", "猫.md"]);
+    app.handle_key(key(KeyCode::Char('?')));
+
+    let lines = render_lines(&mut app, 100, 20);
+    let short = lines
+        .iter()
+        .find(|row| row.contains("x.md"))
+        .expect("short");
+    let long = lines
+        .iter()
+        .find(|row| row.contains("a-much-longer-name.md"))
+        .expect("long");
+    let wide = lines.iter().find(|row| row.contains('猫')).expect("wide");
+    assert_eq!(
+        column(short, "x.md"),
+        column(long, "a-much-longer-name.md"),
+        "issue paths share one left-aligned column: {lines:?}"
+    );
+    assert_eq!(
+        column(wide, "猫"),
+        column(long, "a-much-longer-name.md"),
+        "wide issue paths share the path column: {lines:?}"
+    );
+    assert_eq!(
+        column(short, "["),
+        column(long, "["),
+        "issue kinds share one left-aligned column: {lines:?}"
+    );
+    assert_eq!(
+        column(wide, "["),
+        column(long, "["),
+        "a wide issue path does not shift the kind column: {lines:?}"
+    );
+
+    app.handle_key(key(KeyCode::Char('j')));
+    let cells = render_cells(&mut app, 100, 20);
+    let (row, text) = cells
+        .iter()
+        .map(|row| {
+            let text: String = row.iter().map(|(symbol, _)| *symbol).collect();
+            (row, text)
+        })
+        .find(|(_, text)| text.contains("x.md"))
+        .expect("selected short issue");
+    let padding_start = column(&text, "x.md") + "x.md".chars().count();
+    let kind_start = column(&text, "[");
+    assert!(
+        row[padding_start..kind_start]
+            .iter()
+            .all(|(_, style)| style.add_modifier.contains(Modifier::REVERSED)),
+        "selected issue keeps reverse video through reserved path padding"
+    );
+}
+
+#[test]
 fn issue_overlay_content_stays_inside_its_border_at_narrow_widths() {
     let (_dir, mut app) = setup_with_issues(&["CONTEXT.md", "SKILL.md"]);
     app.handle_key(key(KeyCode::Char('?')));
@@ -3974,6 +4179,56 @@ fn nested_launch() -> (tempfile::TempDir, Launch, PathBuf) {
         dir.path().join("data"),
     );
     (dir, launch, config_path)
+}
+
+#[test]
+fn project_picker_paths_share_a_fixed_column() {
+    let (_dir, mut app) = setup();
+    app.config.projects = vec![
+        project("/one", "x"),
+        project("/two", "much-longer"),
+        project("/wide", "猫"),
+    ];
+
+    app.handle_key(key(KeyCode::Char('p')));
+    let lines = render_lines(&mut app, 100, 20);
+    let one = lines.iter().find(|row| row.contains("/one")).expect("one");
+    let two = lines.iter().find(|row| row.contains("/two")).expect("two");
+    let wide = lines
+        .iter()
+        .find(|row| row.contains("/wide"))
+        .expect("wide");
+    assert_eq!(
+        column(one, "x"),
+        column(two, "much-longer"),
+        "project slugs share one left-aligned column: {lines:?}"
+    );
+    assert_eq!(
+        column(one, "/one"),
+        column(two, "/two"),
+        "project paths share one left-aligned column: {lines:?}"
+    );
+    assert_eq!(
+        column(wide, "/wide"),
+        column(two, "/two"),
+        "a wide slug does not shift the project path column: {lines:?}"
+    );
+}
+
+#[test]
+fn narrow_project_picker_reserves_a_visible_path_column() {
+    let (_dir, mut app) = setup();
+    app.config.projects = vec![
+        project("/one", "a-very-long-project-slug-that-does-not-fit"),
+        project("/two", "x"),
+    ];
+
+    app.handle_key(key(KeyCode::Char('p')));
+    let text = render_lines(&mut app, 50, 12).join("\n");
+    assert!(
+        text.contains("/one") && text.contains("/two"),
+        "narrow picker keeps paths visible: {text}"
+    );
 }
 
 #[test]
@@ -4679,6 +4934,69 @@ fn unregistered_p_with_empty_registry_opens_the_path_prompt() {
     assert_eq!(
         project.path,
         fs::canonicalize(other).expect("canonical registered path")
+    );
+}
+
+#[test]
+fn launch_project_picker_paths_share_a_fixed_column() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let one = project("/one", "x");
+    let two = project("/two", "much-longer");
+    let wide = project("/wide", "猫");
+    let mut config = Config::default();
+    config.projects = vec![one, two, wide];
+    let launch = Launch::new_projects(
+        config,
+        Resolution::Unregistered {
+            path: dir.path().join("fresh"),
+        },
+        dir.path().join("data"),
+    );
+
+    let lines = render_launch_lines(&launch, 90, 16);
+    let one = lines.iter().find(|row| row.contains("/one")).expect("one");
+    let two = lines.iter().find(|row| row.contains("/two")).expect("two");
+    let wide = lines
+        .iter()
+        .find(|row| row.contains("/wide"))
+        .expect("wide");
+    assert_eq!(
+        column(one, "x"),
+        column(two, "much-longer"),
+        "launch project slugs share one left-aligned column: {lines:?}"
+    );
+    assert_eq!(
+        column(one, "/one"),
+        column(two, "/two"),
+        "launch project paths share one left-aligned column: {lines:?}"
+    );
+    assert_eq!(
+        column(wide, "/wide"),
+        column(two, "/two"),
+        "a wide slug does not shift the launch path column: {lines:?}"
+    );
+}
+
+#[test]
+fn narrow_launch_project_picker_reserves_a_visible_path_column() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut config = Config::default();
+    config.projects = vec![
+        project("/one", "a-very-long-project-slug-that-does-not-fit"),
+        project("/two", "x"),
+    ];
+    let launch = Launch::new_projects(
+        config,
+        Resolution::Unregistered {
+            path: dir.path().join("fresh"),
+        },
+        dir.path().join("data"),
+    );
+
+    let text = render_launch_lines(&launch, 24, 12).join("\n");
+    assert!(
+        text.contains("/one") && text.contains("/two"),
+        "narrow launch picker keeps paths visible: {text}"
     );
 }
 
