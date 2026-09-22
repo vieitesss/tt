@@ -510,6 +510,7 @@ fn add(vault: &mut Vault, config: &Config, args: &AddArgs, json: bool) -> Result
         .add(NewTask {
             title,
             parent,
+            insert_after: None,
             tags: args.tag.clone(),
             due,
             priority: args.priority.map(Priority::from),
@@ -750,6 +751,7 @@ struct TaskJson {
     tags: Vec<String>,
     due: Option<String>,
     priority: Option<&'static str>,
+    rank: Option<i32>,
 }
 
 impl TaskJson {
@@ -762,6 +764,7 @@ impl TaskJson {
             tags: task.tags.clone(),
             due: task.due.map(|due| due.format("%Y-%m-%d").to_string()),
             priority: task.priority.map(Priority::as_str),
+            rank: task.rank,
         }
     }
 }

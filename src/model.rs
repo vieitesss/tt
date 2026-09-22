@@ -3,7 +3,8 @@
 //!
 //! A task is stored as one markdown file per task. The frontmatter holds the
 //! structured fields (`id`, `title`, `state`, `parent`, `tags`, `due`,
-//! `priority`); the body holds free markdown including untyped `[[id]]` links.
+//! `priority`, `rank`); the body holds free markdown including untyped `[[id]]`
+//! links.
 //! The tree lives in the `parent` pointer, never in folder structure.
 //!
 //! Unknown frontmatter keys are preserved on round-trip so rewriting a file
@@ -272,6 +273,8 @@ pub struct Task {
     pub due: Option<NaiveDate>,
     /// Optional priority.
     pub priority: Option<Priority>,
+    /// Optional manual place among siblings, lower first.
+    pub rank: Option<i32>,
     /// Free markdown body; may contain untyped `[[id]]` links.
     pub body: String,
     /// Unknown frontmatter keys, preserved so external edits round-trip.
@@ -279,7 +282,7 @@ pub struct Task {
 }
 
 impl Task {
-    /// Create an open task with no parent, tags, dates, priority, or body.
+    /// Create an open task with no parent, tags, dates, priority, rank, or body.
     pub fn new(id: TaskId, title: impl Into<String>) -> Self {
         Self {
             declared_id: id.clone(),
@@ -290,6 +293,7 @@ impl Task {
             tags: Vec::new(),
             due: None,
             priority: None,
+            rank: None,
             body: String::new(),
             extra: BTreeMap::new(),
         }
@@ -353,6 +357,7 @@ impl Task {
             tags: normalize_tags(frontmatter.tags),
             due: frontmatter.due,
             priority: frontmatter.priority,
+            rank: frontmatter.rank,
             body: after_open[body_start..].to_owned(),
             extra: frontmatter.extra,
         })
@@ -409,6 +414,8 @@ struct Frontmatter {
     due: Option<NaiveDate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     priority: Option<Priority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rank: Option<i32>,
     /// Unrecognized keys, preserved verbatim.
     #[serde(flatten)]
     extra: BTreeMap<String, serde_yaml::Value>,
@@ -424,6 +431,7 @@ impl From<&Task> for Frontmatter {
             tags: task.tags.clone(),
             due: task.due,
             priority: task.priority,
+            rank: task.rank,
             extra: task.extra.clone(),
         }
     }
@@ -464,6 +472,7 @@ mod tests {
             tags: vec!["work/admin".to_owned(), "home".to_owned()],
             due: Some(date(2026, 1, 2)),
             priority: Some(Priority::High),
+            rank: Some(3),
             body: "# Heading\n\nSee [[abc1234567]] and `inline code`.\n\n- [ ] item\n".to_owned(),
             extra: BTreeMap::new(),
         }
@@ -488,9 +497,21 @@ mod tests {
         assert!(task.tags.is_empty());
         assert_eq!(task.due, None);
         assert_eq!(task.priority, None);
+        assert_eq!(task.rank, None);
         assert_eq!(task.body, "");
         assert!(task.extra.is_empty());
         assert_eq!(task.state, TaskState::Open);
+    }
+
+    #[test]
+    fn rank_roundtrips_and_none_is_omitted() {
+        let mut task = Task::new(id("abc1234567"), "Ranked");
+        assert!(!task.to_document().contains("rank:"));
+
+        task.rank = Some(4);
+        let document = task.to_document();
+        assert!(document.contains("rank: 4"));
+        assert_eq!(Task::from_document(&document).expect("parse").rank, Some(4));
     }
 
     #[test]

@@ -132,6 +132,7 @@ fn add_prints_task_json_and_writes_file() {
     assert_eq!(value["tags"], serde_json::json!([]));
     assert!(value["due"].is_null());
     assert!(value["priority"].is_null());
+    assert_eq!(value["rank"], 0);
 
     let id = id_of(&value);
     assert_eq!(id.len(), 10);
@@ -139,6 +140,20 @@ fn add_prints_task_json_and_writes_file() {
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
     assert!(dir.path().join(format!("{id}.md")).is_file());
+}
+
+#[test]
+fn json_reports_null_rank_for_an_unranked_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    fs::write(
+        dir.path().join("unranked01.md"),
+        "---\nid: unranked01\ntitle: Old task\nstate: open\n---\n",
+    )
+    .expect("write task");
+
+    let value = run_json(base_command(dir.path()).args(["show", "unranked01"]));
+
+    assert!(value["rank"].is_null());
 }
 
 #[test]

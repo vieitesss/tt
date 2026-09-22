@@ -137,6 +137,9 @@ pub struct NewTask {
     pub title: String,
     /// Parent task id, if this is a sub-task.
     pub parent: Option<TaskId>,
+    /// Destination sibling after which to insert. When absent, or when the id
+    /// is not in the destination sibling group, the task is appended.
+    pub insert_after: Option<TaskId>,
     /// Tags, with or without a leading `#`; normalized on add.
     pub tags: Vec<String>,
     /// Due date, if any.
@@ -153,12 +156,25 @@ impl NewTask {
         Self {
             title: title.into(),
             parent: None,
+            insert_after: None,
             tags: Vec::new(),
             due: None,
             priority: None,
             body: String::new(),
         }
     }
+}
+
+/// Result of moving a task one place among its siblings with
+/// [`Vault::shift_rank`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftOutcome {
+    /// The task exchanged places with an adjacent sibling.
+    Shifted,
+    /// The task was already at the requested edge of its sibling group.
+    AtBound,
+    /// The task has no sibling to move past.
+    OnlyChild,
 }
 
 /// Result of a [`Vault::delete`] call.
@@ -269,7 +285,7 @@ impl Vault {
         self.tasks.get(id)
     }
 
-    /// Root task ids in display order (lowercased title, then id).
+    /// Root task ids in display order (rank, then lowercased title and id).
     pub fn roots(&self) -> &[TaskId] {
         self.index.roots()
     }
@@ -411,17 +427,22 @@ impl Vault {
         }
     }
 
-    /// Create a task, assign it a fresh id, and persist it atomically.
+    /// Create a task, assign it a fresh id, and place it in its destination
+    /// sibling group. Existing display order is materialized as consecutive
+    /// ranks; the new task appends unless [`NewTask::insert_after`] names a
+    /// destination sibling.
     ///
     /// # Errors
     ///
     /// Returns [`VaultError::EmptyTitle`] for a blank title, or
-    /// [`VaultError::Io`] when the file cannot be written. On error the
-    /// in-memory cache is left unchanged.
+    /// [`VaultError::Io`] when a file cannot be written. Rank writes completed
+    /// before an I/O failure stay written, and the in-memory cache matches
+    /// disk.
     pub fn add(&mut self, new: NewTask) -> Result<Task, VaultError> {
         let NewTask {
             title,
             parent,
+            insert_after,
             tags,
             due,
             priority,
@@ -443,7 +464,59 @@ impl Vault {
         task.due = due;
         task.priority = priority;
         task.body = body;
+
+        let siblings = self.destination_siblings(task.parent.as_ref());
+        let insertion = insert_after
+            .as_ref()
+            .and_then(|after| siblings.iter().position(|id| id == after))
+            .map_or(siblings.len(), |index| index + 1);
+        for (index, sibling) in siblings.iter().enumerate() {
+            let rank = index + usize::from(index >= insertion);
+            let mut sibling = self.cloned(sibling)?;
+            sibling.rank = Some(rank as i32);
+            self.persist(sibling)?;
+        }
+        task.rank = Some(insertion as i32);
         self.persist(task)
+    }
+
+    /// Move a task one place earlier (`delta < 0`) or later (`delta > 0`)
+    /// among its siblings, materializing consecutive ranks for the group.
+    /// A zero delta is an at-bound no-op. Bound and only-child outcomes never
+    /// write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::NotFound`] for an unknown id or
+    /// [`VaultError::Io`] when a rank cannot be persisted. Rank writes
+    /// completed before an I/O failure stay written, and the in-memory cache
+    /// matches disk.
+    pub fn shift_rank(&mut self, id: &TaskId, delta: i32) -> Result<ShiftOutcome, VaultError> {
+        self.cloned(id)?;
+        if delta == 0 {
+            return Ok(ShiftOutcome::AtBound);
+        }
+        let mut siblings = self.sibling_ids(id);
+        if siblings.len() == 1 {
+            return Ok(ShiftOutcome::OnlyChild);
+        }
+        let current = siblings
+            .iter()
+            .position(|sibling| sibling == id)
+            .expect("a loaded task is present in its effective sibling group");
+        let target = if delta < 0 {
+            current.checked_sub(1)
+        } else if delta > 0 && current + 1 < siblings.len() {
+            Some(current + 1)
+        } else {
+            None
+        };
+        let Some(target) = target else {
+            return Ok(ShiftOutcome::AtBound);
+        };
+        siblings.swap(current, target);
+        self.persist_ranks(&siblings)?;
+        Ok(ShiftOutcome::Shifted)
     }
 
     /// Set the state of an existing task and persist it.
@@ -585,14 +658,18 @@ impl Vault {
     }
 
     /// Move an existing task under `new_parent`, or to the vault root when
-    /// `new_parent` is `None`.
+    /// `new_parent` is `None`. The task appends to the destination sibling
+    /// group, whose ranks are materialized; a ranked source group is closed
+    /// up after the move.
     ///
     /// # Errors
     ///
     /// Returns [`VaultError::InvalidParent`] when `new_parent` is the task
     /// itself or one of its descendants (the strict tree forbids cycles),
     /// [`VaultError::NotFound`] for an unknown task or an unknown parent, or
-    /// [`VaultError::Io`] when the file cannot be written.
+    /// [`VaultError::Io`] when a file cannot be written. Rank writes completed
+    /// before an I/O failure stay written, and the in-memory cache matches
+    /// disk.
     pub fn set_parent(
         &mut self,
         id: &TaskId,
@@ -610,8 +687,38 @@ impl Vault {
                 return Err(VaultError::NotFound(parent.clone()));
             }
         }
+
+        let old_parent = self.index.parent(id).cloned();
+        let old_siblings = self.sibling_ids(id);
+        let old_group_had_ranks = old_siblings.iter().any(|sibling| {
+            self.tasks
+                .get(sibling)
+                .is_some_and(|task| task.rank.is_some())
+        });
+        let same_group = old_parent.as_ref() == new_parent;
+
+        let mut destination = self.destination_siblings(new_parent);
+        destination.retain(|sibling| sibling != id);
+        destination.push(id.clone());
         task.parent = new_parent.cloned();
-        self.persist(task)
+        for (rank, sibling) in destination.iter().enumerate() {
+            let mut sibling = if sibling == id {
+                task.clone()
+            } else {
+                self.cloned(sibling)?
+            };
+            sibling.rank = Some(rank as i32);
+            self.persist(sibling)?;
+        }
+
+        if !same_group && old_group_had_ranks {
+            let remaining: Vec<TaskId> = old_siblings
+                .into_iter()
+                .filter(|sibling| sibling != id)
+                .collect();
+            self.persist_ranks(&remaining)?;
+        }
+        self.cloned(id)
     }
 
     /// Delete tasks and their whole subtrees.
@@ -694,6 +801,33 @@ impl Vault {
             stack.extend(self.children(&id).iter().cloned());
         }
         closure
+    }
+
+    /// Current destination sibling group for a new or reparented task. A
+    /// missing requested parent makes the task an effective root.
+    fn destination_siblings(&self, parent: Option<&TaskId>) -> Vec<TaskId> {
+        match parent.filter(|parent| self.tasks.contains_key(*parent)) {
+            Some(parent) => self.index.children(parent).to_vec(),
+            None => self.index.roots().to_vec(),
+        }
+    }
+
+    /// Effective sibling group for a loaded task, in current display order.
+    fn sibling_ids(&self, id: &TaskId) -> Vec<TaskId> {
+        match self.index.parent(id) {
+            Some(parent) => self.index.children(parent).to_vec(),
+            None => self.index.roots().to_vec(),
+        }
+    }
+
+    /// Persist `ids` with consecutive ranks matching their slice order.
+    fn persist_ranks(&mut self, ids: &[TaskId]) -> Result<(), VaultError> {
+        for (rank, id) in ids.iter().enumerate() {
+            let mut task = self.cloned(id)?;
+            task.rank = Some(rank as i32);
+            self.persist(task)?;
+        }
+        Ok(())
     }
 
     fn path_for(&self, id: &TaskId) -> PathBuf {
@@ -888,6 +1022,93 @@ mod tests {
             let stored = Task::from_document(&read_task_file(&vault, &task.id)).expect("parse");
             assert_eq!(&stored, task);
         }
+    }
+
+    #[test]
+    fn add_appends_instead_of_title_sorting() {
+        let (_dir, mut vault) = open_vault();
+        let zebra = vault.add(NewTask::new("Zebra")).expect("add zebra");
+        let apple = vault.add(NewTask::new("Apple")).expect("add apple");
+
+        assert_eq!(vault.roots(), &[zebra.id.clone(), apple.id.clone()]);
+        assert_eq!(vault.get(&zebra.id).expect("zebra").rank, Some(0));
+        assert_eq!(vault.get(&apple.id).expect("apple").rank, Some(1));
+    }
+
+    #[test]
+    fn add_can_insert_immediately_after_a_sibling() {
+        let (_dir, mut vault) = open_vault();
+        let zebra = vault.add(NewTask::new("Zebra")).expect("add zebra");
+        let apple = vault.add(NewTask::new("Apple")).expect("add apple");
+        let mango = vault
+            .add(NewTask {
+                insert_after: Some(zebra.id.clone()),
+                ..NewTask::new("Mango")
+            })
+            .expect("insert mango");
+
+        assert_eq!(
+            vault.roots(),
+            &[zebra.id.clone(), mango.id.clone(), apple.id.clone()]
+        );
+        for (rank, id) in vault.roots().iter().enumerate() {
+            assert_eq!(vault.get(id).expect("task").rank, Some(rank as i32));
+        }
+    }
+
+    #[test]
+    fn shift_rank_moves_one_slot_and_persists_consecutive_ranks() {
+        let (_dir, mut vault) = open_vault();
+        let alpha = vault.add(NewTask::new("Alpha")).expect("add alpha");
+        let beta = vault.add(NewTask::new("Beta")).expect("add beta");
+        let charlie = vault.add(NewTask::new("Charlie")).expect("add charlie");
+
+        let outcome = vault.shift_rank(&alpha.id, 1).expect("shift down");
+
+        assert_eq!(outcome, ShiftOutcome::Shifted);
+        assert_eq!(
+            vault.roots(),
+            &[beta.id.clone(), alpha.id.clone(), charlie.id.clone()]
+        );
+        for (expected, id) in vault.roots().iter().enumerate() {
+            assert_eq!(vault.get(id).expect("task").rank, Some(expected as i32));
+            let stored = Task::from_document(&read_task_file(&vault, id)).expect("parse");
+            assert_eq!(stored.rank, Some(expected as i32));
+        }
+    }
+
+    #[test]
+    fn shift_rank_at_a_bound_or_without_a_sibling_does_not_materialize_ranks() {
+        let (dir, mut vault) = open_vault();
+        let alpha = Task::new(parse_id("alpha00001"), "Alpha");
+        let beta = Task::new(parse_id("beta000001"), "Beta");
+        let parent = Task::new(parse_id("parent0001"), "Parent");
+        let mut only_child = Task::new(parse_id("child00001"), "Only child");
+        only_child.parent = Some(parent.id.clone());
+        for task in [&alpha, &beta, &parent, &only_child] {
+            fs::write(
+                dir.path().join(format!("{}.md", task.id)),
+                task.to_document(),
+            )
+            .expect("write task");
+        }
+        vault.reload();
+        let before_alpha = read_task_file(&vault, &alpha.id);
+        let before_child = read_task_file(&vault, &only_child.id);
+
+        assert_eq!(
+            vault.shift_rank(&alpha.id, -1).expect("at first"),
+            ShiftOutcome::AtBound
+        );
+        assert_eq!(
+            vault.shift_rank(&only_child.id, 1).expect("only child"),
+            ShiftOutcome::OnlyChild
+        );
+        assert_eq!(read_task_file(&vault, &alpha.id), before_alpha);
+        assert_eq!(read_task_file(&vault, &only_child.id), before_child);
+        assert_eq!(vault.get(&alpha.id).expect("alpha").rank, None);
+        assert_eq!(vault.get(&beta.id).expect("beta").rank, None);
+        assert_eq!(vault.get(&only_child.id).expect("child").rank, None);
     }
 
     #[test]
@@ -1332,6 +1553,42 @@ mod tests {
             vault.set_title(&task.id, "\t"),
             Err(VaultError::EmptyTitle)
         ));
+    }
+
+    #[test]
+    fn set_parent_appends_to_the_destination_and_closes_the_old_rank_gap() {
+        let (_dir, mut vault) = open_vault();
+        let moving = vault.add(NewTask::new("Moving")).expect("add moving");
+        let parent = vault.add(NewTask::new("Parent")).expect("add parent");
+        let zebra = vault
+            .add(NewTask {
+                parent: Some(parent.id.clone()),
+                ..NewTask::new("Zebra")
+            })
+            .expect("add zebra");
+        let apple = vault
+            .add(NewTask {
+                parent: Some(parent.id.clone()),
+                ..NewTask::new("Apple")
+            })
+            .expect("add apple");
+
+        vault
+            .set_parent(&moving.id, Some(&parent.id))
+            .expect("reparent");
+
+        assert_eq!(
+            vault.children(&parent.id),
+            &[zebra.id.clone(), apple.id.clone(), moving.id.clone()]
+        );
+        assert_eq!(vault.get(&zebra.id).expect("zebra").rank, Some(0));
+        assert_eq!(vault.get(&apple.id).expect("apple").rank, Some(1));
+        assert_eq!(vault.get(&moving.id).expect("moving").rank, Some(2));
+        assert_eq!(
+            vault.get(&parent.id).expect("remaining root").rank,
+            Some(0),
+            "the ranked old group is closed up"
+        );
     }
 
     #[test]

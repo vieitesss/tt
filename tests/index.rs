@@ -75,8 +75,8 @@ fn three_level_tree_has_correct_roots_and_children() {
 
     assert_eq!(
         vault.roots().to_vec(),
-        vec![second_root.id.clone(), root.id.clone()],
-        "roots are ordered by title, case-insensitively"
+        vec![root.id.clone(), second_root.id.clone()],
+        "new roots keep their insertion ranks"
     );
     assert_eq!(vault.children(&root.id).to_vec(), vec![child.id.clone()]);
     assert_eq!(
@@ -88,12 +88,71 @@ fn three_level_tree_has_correct_roots_and_children() {
 
     let tree = vault.tree();
     assert_eq!(tree.len(), 2);
-    assert_eq!(tree[0].task.id, second_root.id);
-    assert_eq!(tree[1].task.id, root.id);
-    assert_eq!(tree[1].children.len(), 1);
-    assert_eq!(tree[1].children[0].task.id, child.id);
-    assert_eq!(tree[1].children[0].children[0].task.id, grandchild.id);
-    assert!(tree[1].children[0].children[0].children.is_empty());
+    assert_eq!(tree[0].task.id, root.id);
+    assert_eq!(tree[1].task.id, second_root.id);
+    assert_eq!(tree[0].children.len(), 1);
+    assert_eq!(tree[0].children[0].task.id, child.id);
+    assert_eq!(tree[0].children[0].children[0].task.id, grandchild.id);
+    assert!(tree[0].children[0].children[0].children.is_empty());
+}
+
+#[test]
+fn unranked_roots_keep_title_then_id_display_order() {
+    let (dir, mut vault) = open_vault();
+    let same_later_id = Task::new(parse_id("zeta000001"), "Same");
+    let beta = Task::new(parse_id("beta000001"), "beta");
+    let same_earlier_id = Task::new(parse_id("alpha00001"), "Same");
+    for task in [&same_later_id, &beta, &same_earlier_id] {
+        fs::write(
+            dir.path().join(format!("{}.md", task.id)),
+            task.to_document(),
+        )
+        .expect("write task");
+    }
+    vault.reload();
+
+    assert_eq!(
+        vault.roots(),
+        &[
+            beta.id.clone(),
+            same_earlier_id.id.clone(),
+            same_later_id.id.clone()
+        ]
+    );
+}
+
+#[test]
+fn ranked_roots_precede_unranked_roots_in_display_order() {
+    let (dir, mut vault) = open_vault();
+    let mut later = Task::new(parse_id("later00001"), "Zebra ranked");
+    later.rank = Some(8);
+    let mut earlier = Task::new(parse_id("earlier001"), "Yak ranked");
+    earlier.rank = Some(2);
+    let apple = Task::new(parse_id("apple00001"), "Apple unranked");
+    let banana = Task::new(parse_id("banana0001"), "banana unranked");
+    for task in [&later, &earlier, &apple, &banana] {
+        fs::write(
+            dir.path().join(format!("{}.md", task.id)),
+            task.to_document(),
+        )
+        .expect("write task");
+    }
+    vault.reload();
+
+    let titles: Vec<&str> = vault
+        .tree()
+        .iter()
+        .map(|node| node.task.title.as_str())
+        .collect();
+    assert_eq!(
+        titles,
+        vec![
+            "Yak ranked",
+            "Zebra ranked",
+            "Apple unranked",
+            "banana unranked"
+        ]
+    );
 }
 
 #[test]
@@ -116,7 +175,7 @@ fn filter_tree_root_order_matches_tree_order() {
         .collect();
 
     assert_eq!(filtered, unfiltered, "filtered roots keep the Index order");
-    assert_eq!(filtered, vec!["Alpha", "beta", "zeta"]);
+    assert_eq!(filtered, vec!["zeta", "Alpha", "beta"]);
 }
 
 #[test]

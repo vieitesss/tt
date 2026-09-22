@@ -54,8 +54,8 @@ impl Index {
     ///
     /// Dangling parent targets and parent cycles are dropped from the
     /// effective forest and reported as [`VaultIssue`]s; the tasks themselves
-    /// still load as roots. Siblings and roots are ordered by lowercased
-    /// title, then id.
+    /// still load as roots. Ranked siblings and roots come first by ascending
+    /// rank; unranked tasks follow by lowercased title, then id.
     pub(crate) fn build(tasks: &BTreeMap<TaskId, Task>, root: &Path) -> (Self, Vec<VaultIssue>) {
         let mut issues = Vec::new();
         let mut parents: BTreeMap<TaskId, TaskId> = BTreeMap::new();
@@ -204,15 +204,25 @@ fn break_cycles(
     }
 }
 
-/// Display order for sibling tasks: lowercased title, then id.
+/// Display order for sibling tasks: ranked first by ascending rank, then
+/// unranked by lowercased title, with title/id breaking ties deterministically.
 pub(crate) fn display_order(tasks: &BTreeMap<TaskId, Task>, a: &TaskId, b: &TaskId) -> Ordering {
-    let title = |id: &TaskId| {
-        tasks
-            .get(id)
-            .map(|task| task.title.to_lowercase())
-            .unwrap_or_default()
+    let key = |id: &TaskId| {
+        tasks.get(id).map_or_else(
+            || (None, String::new()),
+            |task| (task.rank, task.title.to_lowercase()),
+        )
     };
-    title(a).cmp(&title(b)).then_with(|| a.cmp(b))
+    let (a_rank, a_title) = key(a);
+    let (b_rank, b_title) = key(b);
+    match (a_rank, b_rank) {
+        (Some(a_rank), Some(b_rank)) => a_rank.cmp(&b_rank),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+    .then_with(|| a_title.cmp(&b_title))
+    .then_with(|| a.cmp(b))
 }
 
 fn task_issue(

@@ -24,7 +24,9 @@ pub use model::{IdError, ParseError, Priority, Task, TaskId, TaskState};
 pub use path_display::{shorten, shorten_with_home};
 pub use registry::RegistryError;
 pub use resolve::{resolve, Resolution};
-pub use vault::{DeleteOutcome, NewTask, Vault, VaultError, VaultIssue, VaultIssueKind};
+pub use vault::{
+    DeleteOutcome, NewTask, ShiftOutcome, Vault, VaultError, VaultIssue, VaultIssueKind,
+};
 pub use watcher::{VaultWatcher, WatchError, DEBOUNCE};
 
 /// Crate version, as reported by the `tt` binary.
