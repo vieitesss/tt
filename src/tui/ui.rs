@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use tt::{path_display, Priority, Task, TaskId, TaskState, VaultIssue};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{App, InputMode};
 use super::launch::Launch;
@@ -164,8 +165,11 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let selected = app.selected.clone();
     let scroll = app.list_scroll;
     let rows: Vec<ListRow> = app.list.rows().to_vec();
-    for (offset, row) in rows
+    let metadata: Vec<RowMeta> = rows.iter().map(|row| row_meta(app, &row.id)).collect();
+    let columns = ListColumns::measure(&rows, &metadata, area.width);
+    for (offset, (row, meta)) in rows
         .iter()
+        .zip(&metadata)
         .skip(scroll)
         .take(area.height as usize)
         .enumerate()
@@ -173,9 +177,10 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let line = row_line(
             app,
             row,
+            meta,
             selected.as_ref() == Some(&row.id),
             app.marked.contains(&row.id),
-            area.width,
+            &columns,
         );
         let position = Rect::new(area.x, area.y + offset as u16, area.width, 1);
         frame.render_widget(Paragraph::new(line), position);
@@ -211,15 +216,116 @@ fn priority_glyph(priority: Priority) -> (&'static str, Style) {
     )
 }
 
-/// One task row: selection gutter, guides, state glyph, title, and
-/// right-aligned metadata.
+/// Widths shared by every row in one rendering of the List.
+struct ListColumns {
+    guides: usize,
+    title: usize,
+    due: usize,
+    priority: usize,
+    rollup: usize,
+}
+
+impl ListColumns {
+    /// Measure every variable column once so row content never chooses its own
+    /// horizontal offsets. Metadata columns reserve their width even when a
+    /// particular task has no value.
+    fn measure(rows: &[ListRow], metadata: &[RowMeta], width: u16) -> Self {
+        let measured_guides = rows
+            .iter()
+            .map(|row| text_width(&row.guides()))
+            .max()
+            .unwrap_or_default();
+        let measured_due = metadata
+            .iter()
+            .filter_map(|meta| meta.due.as_ref())
+            .map(span_width)
+            .max()
+            .unwrap_or_default();
+        let measured_priority = metadata
+            .iter()
+            .filter_map(|meta| meta.priority.as_ref())
+            .map(span_width)
+            .max()
+            .unwrap_or_default();
+        let measured_rollup = metadata
+            .iter()
+            .filter_map(|meta| meta.rollup.as_ref())
+            .map(span_width)
+            .max()
+            .unwrap_or_default();
+        // Gutter (2), fold marker (2), and state glyph plus space (2) are
+        // fixed. At narrow widths, retain a small title before admitting
+        // metadata columns; the columns that still fit remain shared by every
+        // row. Guide content clips to its shared slot rather than shifting the
+        // columns after it.
+        let width = width as usize;
+        let minimum_title = width.saturating_sub(6).min(4);
+        let guides = measured_guides.min(width.saturating_sub(6 + minimum_title));
+        let metadata_space = width.saturating_sub(6 + guides + minimum_title);
+        let measured_metadata_width = [measured_due, measured_priority, measured_rollup]
+            .into_iter()
+            .filter(|column| *column > 0)
+            .map(|column| column + 1)
+            .sum::<usize>();
+        let (due, priority, rollup) = if measured_metadata_width <= metadata_space {
+            (measured_due, measured_priority, measured_rollup)
+        } else {
+            let mut remaining = metadata_space;
+            let mut fit = |column: usize| {
+                let needed = column + usize::from(column > 0);
+                if column > 0 && needed <= remaining {
+                    remaining -= needed;
+                    column
+                } else {
+                    0
+                }
+            };
+            (
+                fit(measured_due),
+                fit(measured_priority),
+                fit(measured_rollup),
+            )
+        };
+        let metadata_width = [due, priority, rollup]
+            .into_iter()
+            .filter(|column| *column > 0)
+            .map(|column| column + 1)
+            .sum::<usize>();
+        let title = width
+            .saturating_sub(guides + 6)
+            .saturating_sub(metadata_width);
+        Self {
+            guides,
+            title,
+            due,
+            priority,
+            rollup,
+        }
+    }
+}
+
+#[derive(Default)]
+struct RowMeta {
+    due: Option<Span<'static>>,
+    priority: Option<Span<'static>>,
+    rollup: Option<Span<'static>>,
+}
+
+/// One task row: fixed-width selection gutter, guide, fold, state, title,
+/// relative-due, priority, and rollup columns.
 ///
 /// Every row opens with a reserved two-column selection gutter: `▪ ` when the
-/// row is marked, two spaces otherwise, so guides and titles never shift.
-/// Marked rows get a Yellow background across the whole row; the cursor row is
-/// reversed on top of it, so the state glyph colors and the fold column stay
-/// readable.
-fn row_line(app: &App, row: &ListRow, selected: bool, marked: bool, width: u16) -> Line<'static> {
+/// row is marked, two spaces otherwise. Marked rows get a Yellow background
+/// across the whole row; the cursor row is reversed on top of it, so the state
+/// glyph colors and fold column stay readable.
+fn row_line(
+    app: &App,
+    row: &ListRow,
+    meta: &RowMeta,
+    selected: bool,
+    marked: bool,
+    columns: &ListColumns,
+) -> Line<'static> {
     let mut selection = Style::default();
     if selected {
         selection = selection.add_modifier(Modifier::REVERSED);
@@ -230,17 +336,11 @@ fn row_line(app: &App, row: &ListRow, selected: bool, marked: bool, width: u16) 
 
     let task = app.vault.get(&row.id);
     let (glyph, glyph_style) = state_glyph(task.map(|task| task.state));
-
     let title = task.map_or_else(
         || format!("{} (missing)", row.id),
         |task| task.title.clone(),
     );
     let title_style = title_style(task, app.today);
-
-    let meta = row_meta(app, &row.id);
-    let meta_width: usize = meta.iter().map(|span| span.content.chars().count()).sum();
-    // A reserved two-column fold marker keeps every title aligned whether or
-    // not the row is a parent.
     let fold = if row.folded {
         "▸ "
     } else if row.has_children {
@@ -248,53 +348,71 @@ fn row_line(app: &App, row: &ListRow, selected: bool, marked: bool, width: u16) 
     } else {
         "  "
     };
-    // The selection gutter is reserved on every row, marker or not, so
-    // marking a row never shifts its guides or title.
     let gutter = if marked { "▪ " } else { "  " };
-    let prefix = format!("{gutter}{}{}{} ", row.guides(), fold, glyph);
-    let prefix_width = prefix.chars().count();
-    let reserved = meta_width + usize::from(meta_width > 0);
-    let title_width = (width as usize)
-        .saturating_sub(prefix_width)
-        .saturating_sub(reserved);
-    let title = truncate_title(&title, title_width);
-    let used = prefix_width + title.chars().count() + meta_width;
-    let pad = (width as usize).saturating_sub(used);
+    let guides = truncate_to_width(&row.guides(), columns.guides);
+    let prefix = format!(
+        "{gutter}{guides}{}{fold}{glyph} ",
+        " ".repeat(columns.guides.saturating_sub(text_width(&guides)))
+    );
+    let title = truncate_title(&title, columns.title);
 
     let mut spans = vec![
         Span::styled(prefix, glyph_style.patch(selection)),
-        Span::styled(title, title_style.patch(selection)),
+        Span::styled(title.clone(), title_style.patch(selection)),
+        Span::styled(
+            " ".repeat(columns.title.saturating_sub(text_width(&title))),
+            selection,
+        ),
     ];
-    if meta_width > 0 {
-        spans.push(Span::styled(" ".repeat(pad), selection));
-        spans.extend(meta.into_iter().map(|span| {
-            // Badges set their own background; do not inherit the row's
-            // reverse-video selection or their fg/bg will invert.
-            let style = if span.style.bg.is_some() {
-                span.style
-            } else {
-                span.style.patch(selection)
-            };
-            Span::styled(span.content, style)
-        }));
-    } else if selected || marked {
-        // Fill the rest of the row so the highlight spans it.
-        spans.push(Span::styled(" ".repeat(pad), selection));
-    }
+    push_row_column(&mut spans, meta.due.as_ref(), columns.due, selection);
+    push_row_column(
+        &mut spans,
+        meta.priority.as_ref(),
+        columns.priority,
+        selection,
+    );
+    push_row_column(&mut spans, meta.rollup.as_ref(), columns.rollup, selection);
     Line::from(spans)
 }
 
-/// Right-aligned metadata spans for one row, in display order: relative due,
-/// priority marker, and open rollup for parents. Links are deliberately
-/// absent: outgoing links are visible in the body and incoming ones in the
-/// Preview's backlink list.
-fn row_meta(app: &App, id: &TaskId) -> Vec<Span<'static>> {
-    let Some(task) = app.vault.get(id) else {
-        return Vec::new();
-    };
-    let mut spans: Vec<Span<'static>> = Vec::new();
+/// Append one fixed-width metadata column, including its leading separator.
+fn push_row_column(
+    spans: &mut Vec<Span<'static>>,
+    value: Option<&Span<'static>>,
+    width: usize,
+    selection: Style,
+) {
+    if width == 0 {
+        return;
+    }
+    spans.push(Span::styled(" ", selection));
+    let value_width = value.map_or(0, span_width);
+    if let Some(value) = value {
+        // Badges set their own background; do not inherit the row's
+        // reverse-video selection or their fg/bg will invert.
+        let style = if value.style.bg.is_some() {
+            value.style
+        } else {
+            value.style.patch(selection)
+        };
+        spans.push(Span::styled(value.content.clone(), style));
+    }
+    spans.push(Span::styled(
+        " ".repeat(width.saturating_sub(value_width)),
+        selection,
+    ));
+}
 
-    if let Some(due) = task.due {
+fn span_width(span: &Span<'_>) -> usize {
+    text_width(span.content.as_ref())
+}
+
+/// Metadata for one List row, split into independently aligned columns.
+fn row_meta(app: &App, id: &TaskId) -> RowMeta {
+    let Some(task) = app.vault.get(id) else {
+        return RowMeta::default();
+    };
+    let due = task.due.map(|due| {
         let today = app.today;
         let (text, style) = if due < today {
             ("overdue".to_owned(), Style::default().fg(Color::Red))
@@ -306,28 +424,28 @@ fn row_meta(app: &App, id: &TaskId) -> Vec<Span<'static>> {
                 Style::default().fg(Color::DarkGray),
             )
         };
-        push_meta(&mut spans, Span::styled(text, style));
-    }
-
-    if let Some(priority) = task.priority {
+        Span::styled(text, style)
+    });
+    let priority = task.priority.map(|priority| {
         let (text, style) = priority_glyph(priority);
-        push_meta(&mut spans, Span::styled(text, style));
-    }
-
-    if !app.vault.children(id).is_empty() {
+        Span::styled(text, style)
+    });
+    let rollup = if app.vault.children(id).is_empty() {
+        None
+    } else {
         let (done, total) = app.vault.rollup(id);
-        if total > 0 {
-            push_meta(
-                &mut spans,
-                Span::styled(
-                    format!("{done}/{total}"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            );
-        }
+        (total > 0).then(|| {
+            Span::styled(
+                format!("{done}/{total}"),
+                Style::default().fg(Color::DarkGray),
+            )
+        })
+    };
+    RowMeta {
+        due,
+        priority,
+        rollup,
     }
-
-    spans
 }
 
 /// Append a metadata span, separating it from earlier ones with a space.
@@ -356,15 +474,34 @@ fn title_style(task: Option<&Task>, today: NaiveDate) -> Style {
     style
 }
 
-/// Truncate a title to `max_chars`, appending `…` when it does not fit.
-fn truncate_title(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
+fn text_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+/// Keep the longest prefix of `text` that fits in `max_width` terminal cells.
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    let mut width = 0;
+    text.chars()
+        .take_while(|character| {
+            let character_width = UnicodeWidthChar::width(*character).unwrap_or_default();
+            if width + character_width > max_width {
+                return false;
+            }
+            width += character_width;
+            true
+        })
+        .collect()
+}
+
+/// Truncate text to `max_width` terminal cells, appending `…` when it does not fit.
+fn truncate_title(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
         return String::new();
     }
-    if text.chars().count() <= max_chars {
+    if text_width(text) <= max_width {
         return text.to_owned();
     }
-    let mut truncated: String = text.chars().take(max_chars - 1).collect();
+    let mut truncated = truncate_to_width(text, max_width.saturating_sub(1));
     truncated.push('…');
     truncated
 }
@@ -385,6 +522,25 @@ fn render_search_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     render_picker_popup(frame, area, "matches", &entries, picker.highlight);
 }
 
+const PROJECT_PATH_MIN_WIDTH: usize = 8;
+
+/// Shared slug-column width for a project picker row. Long slugs yield space
+/// to a useful path suffix instead of pushing the entire path off-screen.
+fn project_slug_width<'a>(slugs: impl Iterator<Item = &'a str>, row_width: usize) -> usize {
+    let measured = slugs.map(text_width).max().unwrap_or_default();
+    let path_width = PROJECT_PATH_MIN_WIDTH.min(row_width.saturating_sub(2));
+    measured.min(row_width.saturating_sub(path_width + 2))
+}
+
+fn project_entry(slug: &str, path: &str, slug_width: usize, row_width: usize) -> String {
+    if slug_width == 0 {
+        return truncate_title(path, row_width);
+    }
+    let slug = truncate_title(slug, slug_width);
+    let padding = " ".repeat(slug_width.saturating_sub(text_width(&slug)));
+    truncate_title(&format!("{slug}{padding}  {path}"), row_width)
+}
+
 /// Project picker for `p`: slug plus shortened project path.
 fn render_project_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(picker) = app.picker() else {
@@ -393,14 +549,20 @@ fn render_project_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if !picker.is_project() {
         return;
     }
-    let entries: Vec<String> = app
-        .project_matches()
+    let projects = app.project_matches();
+    let row_width = area.width.min(40).saturating_sub(2) as usize;
+    let slug_width = project_slug_width(
+        projects.iter().map(|project| project.slug.as_str()),
+        row_width,
+    );
+    let entries: Vec<String> = projects
         .iter()
         .map(|project| {
-            format!(
-                "{}  {}",
-                project.slug,
-                path_display::shorten(&project.path, &app.config.path_display)
+            project_entry(
+                &project.slug,
+                &path_display::shorten(&project.path, &app.config.path_display),
+                slug_width,
+                row_width,
             )
         })
         .collect();
@@ -744,21 +906,23 @@ fn render_launch_picker(
         let start = highlight
             .saturating_sub(visible.saturating_sub(1))
             .min(projects.len().saturating_sub(visible));
+        let slug_width = project_slug_width(
+            projects.iter().map(|project| project.slug.as_str()),
+            inner_width,
+        );
         for (index, project) in projects.iter().enumerate().skip(start).take(visible) {
-            let label = format!(
-                "{}  {}",
-                project.slug,
-                path_display::shorten(&project.path, launch.path_display())
+            let label = project_entry(
+                &project.slug,
+                &path_display::shorten(&project.path, launch.path_display()),
+                slug_width,
+                inner_width,
             );
             let style = if index == highlight {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
             };
-            lines.push(Line::from(Span::styled(
-                truncate_title(&label, inner_width),
-                style,
-            )));
+            lines.push(Line::from(Span::styled(label, style)));
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
@@ -832,7 +996,7 @@ fn wrapped_rows(line: &str, width: usize) -> usize {
     if width == 0 {
         return 1;
     }
-    line.chars().count().div_ceil(width).max(1)
+    text_width(line).div_ceil(width).max(1)
 }
 
 /// Persistent preview of the selected task: a dim metadata line, the title in
@@ -1069,6 +1233,27 @@ fn render_issues_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .title(title)
         .border_style(Style::default().fg(Color::Yellow));
 
+    // Render the block and its content separately so text can never paint over
+    // the border at narrow widths. The path column is measured once across
+    // every issue and capped so the kind column still degrades cleanly.
+    let inner = block.inner(area);
+    let max_kind_width = app
+        .vault_issues
+        .iter()
+        .map(|issue| text_width(issue.kind.as_str()) + 2)
+        .max()
+        .unwrap_or_default();
+    let path_width = app
+        .vault_issues
+        .iter()
+        .map(|issue| text_width(&issue_path(app, issue)))
+        .max()
+        .unwrap_or_default()
+        .min(
+            (inner.width as usize)
+                .saturating_sub(2)
+                .saturating_sub(max_kind_width),
+        );
     let lines: Vec<Line<'static>> = if app.vault_issues.is_empty() {
         vec![Line::from("no vault issues")]
     } else {
@@ -1077,16 +1262,18 @@ fn render_issues_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
             if !lines.is_empty() {
                 lines.push(Line::from(""));
             }
-            lines.extend(issue_lines(app, issue, index == app.issues_cursor));
+            lines.extend(issue_lines(
+                app,
+                issue,
+                index == app.issues_cursor,
+                path_width,
+            ));
         }
         lines
     };
 
-    // Render the block and its content separately so text can never paint over
-    // the border at narrow widths.
-    let inner = block.inner(area);
     frame.render_widget(block, area);
-    let scroll = issues_scroll(app, inner.width as usize, inner.height as usize);
+    let scroll = issues_scroll(app, inner.width as usize, inner.height as usize, path_width);
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -1097,7 +1284,7 @@ fn render_issues_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 /// Scroll offset (in wrapped rows) that keeps the highlighted issue visible.
-fn issues_scroll(app: &App, width: usize, height: usize) -> u16 {
+fn issues_scroll(app: &App, width: usize, height: usize, path_width: usize) -> u16 {
     if app.vault_issues.is_empty() || width == 0 || height == 0 {
         return 0;
     }
@@ -1109,7 +1296,7 @@ fn issues_scroll(app: &App, width: usize, height: usize) -> u16 {
         if index == app.issues_cursor {
             break;
         }
-        for line in issue_lines(app, issue, false) {
+        for line in issue_lines(app, issue, false, path_width) {
             let text: String = line
                 .spans
                 .iter()
@@ -1125,11 +1312,21 @@ fn issues_scroll(app: &App, width: usize, height: usize) -> u16 {
 
 /// Two lines for one issue: file (with kind) and its wrapped detail. The
 /// highlighted issue is reversed.
-fn issue_lines(app: &App, issue: &VaultIssue, selected: bool) -> Vec<Line<'static>> {
-    let path = issue.path.strip_prefix(app.vault.root()).map_or_else(
+fn issue_path(app: &App, issue: &VaultIssue) -> String {
+    issue.path.strip_prefix(app.vault.root()).map_or_else(
         |_| issue.path.display().to_string(),
         |path| path.display().to_string(),
-    );
+    )
+}
+
+fn issue_lines(
+    app: &App,
+    issue: &VaultIssue,
+    selected: bool,
+    path_width: usize,
+) -> Vec<Line<'static>> {
+    let path = truncate_title(&issue_path(app, issue), path_width);
+    let path_padding = " ".repeat(path_width.saturating_sub(text_width(&path)));
     let path_style = if selected {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
@@ -1145,6 +1342,7 @@ fn issue_lines(app: &App, issue: &VaultIssue, selected: bool) -> Vec<Line<'stati
     vec![
         Line::from(vec![
             Span::styled(path, path_style),
+            Span::styled(path_padding, path_style),
             Span::styled(format!("  [{}]", issue.kind.as_str()), kind_style),
         ]),
         Line::from(issue.detail.clone()),
