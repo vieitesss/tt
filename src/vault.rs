@@ -526,9 +526,7 @@ impl Vault {
     /// Returns [`VaultError::NotFound`] for an unknown id or
     /// [`VaultError::Io`] when the file cannot be written.
     pub fn set_state(&mut self, id: &TaskId, state: TaskState) -> Result<Task, VaultError> {
-        let mut task = self.cloned(id)?;
-        task.state = state;
-        self.persist(task)
+        self.edit(id, |task| task.state = state)
     }
 
     /// Set or clear the priority of an existing task and persist it.
@@ -542,9 +540,7 @@ impl Vault {
         id: &TaskId,
         priority: Option<Priority>,
     ) -> Result<Task, VaultError> {
-        let mut task = self.cloned(id)?;
-        task.priority = priority;
-        self.persist(task)
+        self.edit(id, |task| task.priority = priority)
     }
 
     /// Replace an existing task's tags, normalizing them before persistence.
@@ -554,9 +550,8 @@ impl Vault {
     /// Returns [`VaultError::NotFound`] for an unknown id or
     /// [`VaultError::Io`] when the file cannot be written.
     pub fn set_tags(&mut self, id: &TaskId, tags: Vec<String>) -> Result<Task, VaultError> {
-        let mut task = self.cloned(id)?;
-        task.tags = normalize_tags(tags);
-        self.persist(task)
+        let tags = normalize_tags(tags);
+        self.edit(id, |task| task.tags = tags)
     }
 
     /// Set the title of an existing task and persist it.
@@ -573,9 +568,7 @@ impl Vault {
         if title.trim().is_empty() {
             return Err(VaultError::EmptyTitle);
         }
-        let mut task = self.cloned(id)?;
-        task.title = title.to_owned();
-        self.persist(task)
+        self.edit(id, |task| task.title = title.to_owned())
     }
 
     /// Rewrite mirror aliases after a reload observed title changes.
@@ -652,9 +645,7 @@ impl Vault {
     /// Returns [`VaultError::NotFound`] for an unknown id or
     /// [`VaultError::Io`] when the file cannot be written.
     pub fn set_body(&mut self, id: &TaskId, body: &str) -> Result<Task, VaultError> {
-        let mut task = self.cloned(id)?;
-        task.body = body.to_owned();
-        self.persist(task)
+        self.edit(id, |task| task.body = body.to_owned())
     }
 
     /// Move an existing task under `new_parent`, or to the vault root when
@@ -832,6 +823,17 @@ impl Vault {
 
     fn path_for(&self, id: &TaskId) -> PathBuf {
         self.root.join(id.file_name())
+    }
+
+    /// Apply `change` to a loaded task, persist it, and return the new value.
+    ///
+    /// The single write seam for field setters: load a clone, run the change,
+    /// then persist disk-first and rebuild the index. [`Vault::cloned`] guards
+    /// the id, so an unknown task never reaches `change`.
+    fn edit(&mut self, id: &TaskId, change: impl FnOnce(&mut Task)) -> Result<Task, VaultError> {
+        let mut task = self.cloned(id)?;
+        change(&mut task);
+        self.persist(task)
     }
 
     fn cloned(&self, id: &TaskId) -> Result<Task, VaultError> {
