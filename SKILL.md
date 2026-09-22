@@ -204,10 +204,10 @@ row per task in pre-order, with tree guides, a fold marker on parents, a state
 glyph, and quiet right-aligned metadata only when present (relative due,
 priority, and the `done/total` rollup). A session-only filter replaces that
 view with matching tasks as depth-zero rows. The header shows the project path
-(never the invisible store) and the issue badge. The footer is three rows: the
-first two show key hints for the current mode (or the live input prompt on the
-first), and the last the project slug and task count plus the active filter, if
-any. Short-lived confirmations and errors
+(never the invisible store) and the issue badge. The footer is three rows: a
+blank spacer, one hint row with styled key/label pairs for the current mode (or
+the live input prompt), and a context row with the project slug and task count
+plus the active filter, if any. Short-lived confirmations and errors
 appear as a toast popup above the footer that dismisses itself after about
 three seconds and never takes focus.
 The list is the smaller pane; the larger right-hand preview follows the
@@ -245,7 +245,8 @@ Link and backlink navigation stays on `o`.
 | `p` | Switch to another registered project |
 | `P` | Register a new project by path (expands `~`, creates the directory, and switches to it) |
 | `o` | Jump through the selection's links and backlinks; unresolvable outlinks are marked `(missing)` and `Enter` toasts `not found` instead of jumping |
-| `?` | Open the store-issues overlay |
+| `?` | Open the Keymap overlay |
+| `g?` | Open the store-issues overlay |
 | `q` | Quit |
 
 `Tab` builds a multi-selection; marked rows show a `▪` marker in the reserved
@@ -284,9 +285,9 @@ task can never become unreachable.
 
 While the issues overlay is open: `j`/`k` move between issues, `e`/`Enter`
 opens the highlighted file in `$EDITOR` (the vault reloads on return, and once
-the issues are fixed the overlay closes and confirms with a toast), `Esc`/`?`
+the issues are fixed the overlay closes and confirms with a toast), `Esc`
 closes it, and `q` quits. If an editor round-trip raises the issue count, the
-TUI immediately toasts `⚠ N issues — press ?` so a content edit that broke a
+TUI immediately toasts `⚠ N issues — press g?` so a content edit that broke a
 file cannot go unnoticed.
 
 On launch, an unregistered directory offers registration and a nested
@@ -372,8 +373,8 @@ was running leaves aliases stale until they are edited by hand.
   broken files are ignored or warned about instead.
 - `warning:` lines on stderr name skipped or repairable files (malformed,
   id mismatch, dangling parent, cycle); the command still exits `0`.
-- Hand-editing or an editor round-trip looks wrong? `?` in the TUI opens the
+- Hand-editing or an editor round-trip looks wrong? `g?` in the TUI opens the
   store-issue overlay: `j`/`k` move between issues, `e`/`Enter` opens the
   highlighted file, and the `⚠ N issues` header badge counts the same warnings.
   An edit from inside the TUI that raises the issue count toasts
-  `⚠ N issues — press ?` right away.
+  `⚠ N issues — press g?` right away.

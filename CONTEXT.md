@@ -56,6 +56,14 @@ legitimate (they may point at another project): they are not badge issues, and
 the `o` picker marks them `(missing)`.
 _Avoid_: broken, orphan (the file is intact; only the reference is unresolved)
 
+**Store issue**:
+A problem the most recent scan found in the Store: a file that will not parse
+or read, a declared `id` that disagrees with its filename, a parent reference
+that resolves to nothing, or a parent cycle. Issues are sticky state, never
+transient: they surface as a badge in the Header and as an overlay listing each
+issue's file, kind, and detail.
+_Avoid_: vault issue, error, warning, problem
+
 **Resolver**:
 The rule that turns a working directory into a Project: start from `--path`,
 then `$TT_PATH`, then the current directory; walk ancestors nearest-first; the
@@ -156,11 +164,19 @@ config chooses `home`, `short`, or `tail N`) on the left and the issue badge on
 the right.
 
 **Footer**:
-The three rows below the List and Preview: the first two show key hints for the
-current mode (or the live input prompt on the first), the third the current
-project slug and task count plus the sticky `[external change pending]` flag.
-Transient feedback never lives here; it is a Toast.
+The three rows below the List and Preview are a blank spacer, one hint row with
+styled key/label pairs for the current mode (or the live input prompt), and a
+context row with the current project slug and task count, active Filter, and
+sticky `[external change pending]` flag. Transient feedback never lives here;
+it is a Toast.
 _Avoid_: status line, status bar
+
+**Keymap**:
+The complete, on-demand list of every binding, opened with `?`; the store-issues
+overlay is opened with `g?`. It is the single reference for how the TUI is
+driven, grouped by area; the Footer only hints at the most-used keys, so a
+binding missing from the Footer is still findable here.
+_Avoid_: help, cheat sheet, shortcuts window
 
 **Toast**:
 A small non-modal popup above the Footer for transient action feedback (`added
