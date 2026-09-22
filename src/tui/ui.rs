@@ -217,18 +217,31 @@ fn priority_glyph(priority: Priority) -> (&'static str, Style) {
 }
 
 /// Widths shared by every row in one rendering of the List.
+///
+/// Tree indentation is per-row: deeper rows keep their full guide string, so
+/// the fold/state/title columns shift one indent step further right per depth
+/// level and titles get progressively narrower. Only the metadata columns
+/// (due/priority/rollup) and the guide clipping budget are shared, keeping
+/// right-aligned metadata stable across depths.
 struct ListColumns {
-    guides: usize,
-    title: usize,
+    width: usize,
+    /// Maximum guide cells a row may use while keeping the minimum title
+    /// and the admitted metadata columns. Rows truncate their guides to this
+    /// budget, so at sane widths every row keeps its full guides and only
+    /// extreme narrowness falls back to clipped (aligned) guides.
+    guides_budget: usize,
+    metadata_width: usize,
     due: usize,
     priority: usize,
     rollup: usize,
 }
 
 impl ListColumns {
-    /// Measure every variable column once so row content never chooses its own
-    /// horizontal offsets. Metadata columns reserve their width even when a
-    /// particular task has no value.
+    /// Measure the shared columns once so right-aligned metadata never shifts
+    /// between rows. Metadata columns reserve their width even when a
+    /// particular task has no value; admission is judged against the deepest
+    /// row so metadata still fits after indentation. The title width is
+    /// derived per row in [`row_line`], narrowing with depth.
     fn measure(rows: &[ListRow], metadata: &[RowMeta], width: u16) -> Self {
         let measured_guides = rows
             .iter()
@@ -256,12 +269,12 @@ impl ListColumns {
         // Gutter (2), fold marker (2), and state glyph plus space (2) are
         // fixed. At narrow widths, retain a small title before admitting
         // metadata columns; the columns that still fit remain shared by every
-        // row. Guide content clips to its shared slot rather than shifting the
-        // columns after it.
+        // row. Guides are per-row (deeper rows indent further); only when the
+        // deepest row would not fit do guides clip to a shared budget.
         let width = width as usize;
         let minimum_title = width.saturating_sub(6).min(4);
-        let guides = measured_guides.min(width.saturating_sub(6 + minimum_title));
-        let metadata_space = width.saturating_sub(6 + guides + minimum_title);
+        let max_guides = measured_guides.min(width.saturating_sub(6 + minimum_title));
+        let metadata_space = width.saturating_sub(6 + max_guides + minimum_title);
         let measured_metadata_width = [measured_due, measured_priority, measured_rollup]
             .into_iter()
             .filter(|column| *column > 0)
@@ -291,12 +304,13 @@ impl ListColumns {
             .filter(|column| *column > 0)
             .map(|column| column + 1)
             .sum::<usize>();
-        let title = width
-            .saturating_sub(guides + 6)
+        let guides_budget = width
+            .saturating_sub(6 + minimum_title)
             .saturating_sub(metadata_width);
         Self {
-            guides,
-            title,
+            width,
+            guides_budget,
+            metadata_width,
             due,
             priority,
             rollup,
@@ -311,13 +325,18 @@ struct RowMeta {
     rollup: Option<Span<'static>>,
 }
 
-/// One task row: fixed-width selection gutter, guide, fold, state, title,
-/// relative-due, priority, and rollup columns.
+/// One task row: fixed-width selection gutter, per-depth tree guides, fold,
+/// state, title, relative-due, priority, and rollup columns.
 ///
 /// Every row opens with a reserved two-column selection gutter: `▪ ` when the
-/// row is marked, two spaces otherwise. Marked rows get a Yellow background
-/// across the whole row; the cursor row is reversed on top of it, so the state
-/// glyph colors and fold column stay readable.
+/// row is marked, two spaces otherwise. Guides are not padded to a shared
+/// width: each row draws its own guide string, so a child's connector starts
+/// at its parent's content start and the child's content sits one indent step
+/// further right, with `│` continuation bars lining up in the ancestor
+/// columns. Titles narrow with depth; metadata stays right-aligned. Marked
+/// rows get a Yellow background across the whole row; the cursor row is
+/// reversed on top of it, so the state glyph colors and fold column stay
+/// readable.
 fn row_line(
     app: &App,
     row: &ListRow,
@@ -349,18 +368,19 @@ fn row_line(
         "  "
     };
     let gutter = if marked { "▪ " } else { "  " };
-    let guides = truncate_to_width(&row.guides(), columns.guides);
-    let prefix = format!(
-        "{gutter}{guides}{}{fold}{glyph} ",
-        " ".repeat(columns.guides.saturating_sub(text_width(&guides)))
-    );
-    let title = truncate_title(&title, columns.title);
+    let guides = truncate_to_width(&row.guides(), columns.guides_budget);
+    let prefix = format!("{gutter}{guides}{fold}{glyph} ");
+    let title_width = columns
+        .width
+        .saturating_sub(text_width(&prefix))
+        .saturating_sub(columns.metadata_width);
+    let title = truncate_title(&title, title_width);
 
     let mut spans = vec![
         Span::styled(prefix, glyph_style.patch(selection)),
         Span::styled(title.clone(), title_style.patch(selection)),
         Span::styled(
-            " ".repeat(columns.title.saturating_sub(text_width(&title))),
+            " ".repeat(title_width.saturating_sub(text_width(&title))),
             selection,
         ),
     ];

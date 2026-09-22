@@ -2053,7 +2053,7 @@ fn cancelled_rows_are_struck_through() {
 }
 
 #[test]
-fn list_rows_share_fixed_columns_across_depths_and_missing_metadata() {
+fn list_rows_indent_by_depth_and_share_metadata_columns() {
     let (_dir, mut app) = setup();
     let today = NaiveDate::from_ymd_opt(2026, 6, 15).expect("date");
     app.today = today;
@@ -2118,30 +2118,29 @@ fn list_rows_share_fixed_columns_across_depths_and_missing_metadata() {
     assert_eq!(
         column(row("Nested bare"), "└"),
         column(row("Priority child"), "└"),
-        "indent guides share one fixed column"
+        "same-depth connectors share one indent column"
     );
-    let state_columns = ["All fields", "Nested bare", "Due rollup", "Priority rollup"]
-        .map(|title| column(row(title), "○"));
-    assert!(
-        state_columns
-            .windows(2)
-            .all(|columns| columns[0] == columns[1]),
-        "state glyphs share one fixed column: {rows:?}"
+    // Tree-view indentation: a child's connector starts at its parent's
+    // content start, and the child's content sits one step further right.
+    assert_eq!(
+        column(row("Nested bare"), "└"),
+        column(row("All fields"), "▾"),
+        "a child's connector starts at its parent's content start: {rows:?}"
     );
-    let title_columns = [
-        "All fields",
-        "Nested bare",
-        "Wide 猫",
-        "Due rollup",
-        "Priority rollup",
-    ]
-    .map(|title| column(row(title), title));
-    assert!(
-        title_columns
-            .windows(2)
-            .all(|columns| columns[0] == columns[1]),
-        "titles share one fixed column: {rows:?}"
-    );
+    for (parent, child) in [
+        ("All fields", "Nested bare"),
+        ("Priority rollup", "Priority child"),
+        ("Due rollup", "Due child"),
+    ] {
+        assert!(
+            column(row(child), "○") > column(row(parent), "○"),
+            "the depth-1 state glyph indents past its parent: {rows:?}"
+        );
+        assert!(
+            column(row(child), child) > column(row(parent), parent),
+            "the depth-1 title indents past its parent: {rows:?}"
+        );
+    }
     assert_eq!(
         column(row("All fields"), "today"),
         column(row("Due rollup"), "overdue"),
@@ -2165,7 +2164,64 @@ fn list_rows_share_fixed_columns_across_depths_and_missing_metadata() {
 }
 
 #[test]
-fn narrow_list_keeps_a_fixed_visible_title_column() {
+fn deeper_rows_indent_further_right_and_continuation_bars_line_up() {
+    let (_dir, mut app) = setup();
+    let root = add_task(&mut app, "Root", None);
+    let first = add_task(&mut app, "First child", Some(&root));
+    let grandchild = add_task(&mut app, "Grandchild", Some(&first));
+    let last = add_task(&mut app, "Last child", Some(&root));
+    app.refresh();
+
+    let width = 100;
+    let areas = layout(Rect::new(0, 0, width, 20));
+    let rows = pane_rows(&render_lines(&mut app, width, 20), areas.list);
+    let row = |needle: &str| {
+        rows.iter()
+            .find(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("row containing {needle:?}: {rows:?}"))
+    };
+
+    // Content indents one step per depth level.
+    assert!(
+        column(row("First child"), "○") > column(row("Root"), "○"),
+        "depth-1 content starts further right than depth-0: {rows:?}"
+    );
+    assert!(
+        column(row("Grandchild"), "○") > column(row("First child"), "○"),
+        "depth-2 content starts further right than depth-1: {rows:?}"
+    );
+    assert!(
+        column(row("Grandchild"), "Grandchild") > column(row("First child"), "First child"),
+        "depth-2 titles start further right than depth-1: {rows:?}"
+    );
+    // A child's connector starts at its parent's content start.
+    assert_eq!(
+        column(row("First child"), "├"),
+        column(row("Root"), "▾"),
+        "the depth-1 connector starts at the root's content start: {rows:?}"
+    );
+    assert_eq!(
+        column(row("Grandchild"), "└"),
+        column(row("First child"), "▾"),
+        "the depth-2 connector starts at its parent's content start: {rows:?}"
+    );
+    // Continuation bars line up column-by-column for non-last ancestors.
+    assert_eq!(
+        column(row("Grandchild"), "│"),
+        column(row("First child"), "├"),
+        "the continuation bar lines up under the non-last parent: {rows:?}"
+    );
+    // Same-depth siblings share one indent column.
+    assert_eq!(
+        column(row("First child"), "First child"),
+        column(row("Last child"), "Last child"),
+        "sibling titles stay aligned: {rows:?}"
+    );
+    assert!(app.vault.get(&grandchild).is_some() && app.vault.get(&last).is_some());
+}
+
+#[test]
+fn narrow_list_indents_the_child_and_clips_predictably() {
     let (_dir, mut app) = setup();
     let today = NaiveDate::from_ymd_opt(2026, 6, 15).expect("date");
     app.today = today;
@@ -2186,11 +2242,21 @@ fn narrow_list_keeps_a_fixed_visible_title_column() {
     let rows = pane_rows(&render_lines(&mut app, width, 12), areas.list);
     let parent = rows.iter().find(|row| row.contains("All")).expect("parent");
     let child = rows.iter().find(|row| row.contains("Nes")).expect("child");
-    assert_eq!(
-        column(parent, "All"),
-        column(child, "Nes"),
-        "narrow rows keep the visible title column aligned: {rows:?}"
+    assert!(
+        column(child, "Nes") > column(parent, "All"),
+        "the nested title indents past its parent even at narrow widths: {rows:?}"
     );
+    assert_eq!(
+        column(child, "└"),
+        column(parent, "▾"),
+        "the child connector starts at the parent's content start: {rows:?}"
+    );
+    for row in [parent, child] {
+        assert!(
+            row.chars().count() <= areas.list.width as usize,
+            "rows clip to the list pane instead of overflowing: {rows:?}"
+        );
+    }
 }
 
 #[test]
