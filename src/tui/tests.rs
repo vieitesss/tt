@@ -17,7 +17,10 @@ use tt::{
     Vault,
 };
 
-use super::app::{ensure_selection_visible, expand_tilde_with_home, App, InputMode, TOAST_TICKS};
+use super::app::{
+    ensure_selection_visible, expand_tilde_with_home, App, FooterLine, InputMode, TOAST_TICKS,
+};
+use super::keymap::{keymap_columns, keymap_content_lines, keymap_content_width, keymap_geometry};
 use super::launch::Launch;
 use super::picker::{FilterCriterion, PickerKind};
 use super::ui::{layout, render, render_launch};
@@ -48,9 +51,21 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::from(code)
 }
 
+fn footer_text(line: &FooterLine) -> String {
+    match line {
+        FooterLine::Text(text) => text.clone(),
+        FooterLine::Hints(hints) => hints
+            .iter()
+            .map(|hint| format!("{} {}", hint.key, hint.label))
+            .collect::<Vec<_>>()
+            .join("   "),
+    }
+}
+
 fn parse_id(value: &str) -> TaskId {
     TaskId::parse(value).expect("valid id")
 }
+
 
 fn project(path: &str, slug: &str) -> Project {
     Project {
@@ -920,20 +935,21 @@ fn footer_is_three_rows_of_hints_and_context() {
     app.refresh();
 
     let lines = render_lines(&mut app, 100, 20);
-    let nav = &lines[lines.len() - 3];
-    let actions = &lines[lines.len() - 2];
+    let spacer = &lines[lines.len() - 3];
+    let hint = &lines[lines.len() - 2];
     let context = &lines[lines.len() - 1];
-    assert!(nav.contains("j/k move"), "navigation hint row: {nav:?}");
-    assert!(actions.contains("a/A add"), "action hint row: {actions:?}");
+    assert!(spacer.trim().is_empty(), "spacer row: {spacer:?}");
+    assert!(hint.contains("j/k move"), "navigation hint row: {hint:?}");
     assert!(context.contains("beta"), "context row: {context:?}");
     assert!(context.contains("1 task"), "context row: {context:?}");
     assert!(
-        !nav.contains("1 task") && !actions.contains("1 task"),
-        "hints and context are separate rows"
+        !hint.contains("1 task"),
+        "hint and context are separate rows"
     );
 
     let areas = layout(Rect::new(0, 0, 100, 20));
-    assert_eq!(areas.hint.height, 2);
+    assert_eq!(areas.spacer.height, 1);
+    assert_eq!(areas.hint.height, 1);
     assert_eq!(areas.context.height, 1);
     assert_eq!(areas.middle.height, 16, "header 1 + footer 3");
 }
@@ -1122,41 +1138,21 @@ fn selection_hints_replace_the_list_hints_while_marked() {
     add_task(&mut app, "Only", None);
     app.refresh();
 
-    let lines = render_lines(&mut app, 170, 20);
-    assert!(lines[lines.len() - 3].contains("j/k move"));
+    assert_eq!(
+        footer_text(&app.status_line()),
+        "j/k move   a add   x state   p projects   / find   ? keys"
+    );
 
     app.handle_key(key(KeyCode::Tab));
-    let lines = render_lines(&mut app, 170, 20);
-    let nav = &lines[lines.len() - 3];
-    let actions = &lines[lines.len() - 2];
-    for expected in ["tab un/select", "j/k move", "J/K rank", "esc clear"] {
-        assert!(
-            nav.contains(expected),
-            "selection hint {expected:?} missing: {nav:?}"
-        );
-    }
-    for expected in ["m move", "d delete", "x cycle state"] {
-        assert!(
-            actions.contains(expected),
-            "selection hint {expected:?} missing: {actions:?}"
-        );
-    }
-    for line in [nav, actions] {
-        assert!(
-            !line.contains("gg/G"),
-            "the list hints are replaced while marked: {line:?}"
-        );
-    }
+    assert_eq!(
+        footer_text(&app.status_line()),
+        "tab un/select   esc clear   m move   d delete   x state   ! priority   t tags"
+    );
 
     app.handle_key(key(KeyCode::Esc));
-    let lines = render_lines(&mut app, 170, 20);
-    assert!(
-        lines[lines.len() - 3].contains("j/k move"),
-        "the list hints come back when the marks are cleared"
-    );
-    assert!(
-        lines[lines.len() - 2].contains("a/A add"),
-        "both list hint rows come back when the marks are cleared"
+    assert_eq!(
+        footer_text(&app.status_line()),
+        "j/k move   a add   x state   p projects   / find   ? keys"
     );
 }
 
@@ -1275,9 +1271,9 @@ fn move_picker_offers_root_first_and_hides_the_moving_subtree() {
         "root entry first, then the one task outside the moving subtree"
     );
     assert!(
-        app.status_lines()[0].contains("move under: "),
+        footer_text(&app.status_line()).contains("move under: "),
         "the prompt names the picker: {}",
-        app.status_lines()[0]
+        footer_text(&app.status_line())
     );
 
     let lines = render_lines(&mut app, 100, 20);
@@ -1464,7 +1460,7 @@ fn delete_confirmation_defaults_to_cancel_and_enter_cancels() {
         text.contains("[ Delete ]") && text.contains("[ Cancel ]"),
         "both buttons render: {text}"
     );
-    let hint = &lines[lines.len() - 3];
+    let hint = &lines[lines.len() - 2];
     assert!(hint.contains("enter confirm"), "confirm hints: {hint:?}");
 
     app.handle_key(key(KeyCode::Enter));
@@ -1858,7 +1854,7 @@ fn r_opens_a_prefilled_rename_prompt_with_the_cursor_at_the_end() {
         "r opens the rename prompt on the cursor task"
     );
     assert_eq!(app.input, "Old title", "the buffer is prefilled");
-    assert_eq!(app.status_lines()[0], "rename to: Old title");
+    assert_eq!(footer_text(&app.status_line()), "rename to: Old title");
 
     // The rendered cursor sits after the prompt prefix and the prefilled
     // title, i.e. at the end of the buffer.
@@ -2632,7 +2628,7 @@ fn search_hint_mentions_arrow_selection() {
     app.refresh();
 
     app.handle_key(key(KeyCode::Char('/')));
-    let status = app.status_lines()[0].clone();
+    let status = footer_text(&app.status_line());
     assert!(
         status.contains("↓") && status.contains("select"),
         "search hint: {status}"
@@ -2677,9 +2673,9 @@ fn search_with_no_matches_stays_open_with_a_status() {
         "stays open"
     );
     assert!(
-        app.status_lines()[0].contains("no matches"),
+        footer_text(&app.status_line()).contains("no matches"),
         "{}",
-        app.status_lines()[0]
+        footer_text(&app.status_line())
     );
 }
 
@@ -2689,92 +2685,28 @@ fn hints_describe_the_list_keymap() {
     add_task(&mut app, "Only", None);
     app.refresh();
 
-    // Every Navigate key is advertised across the two hint rows.
-    let [nav, actions] = app.status_lines();
-    for expected in [
-        "j/k move", "J/K rank", "gg/G", "h/l fold", "tab sel", "/ find", "f filter", "o links",
-        "? issues", "q quit",
-    ] {
-        assert!(
-            nav.contains(expected),
-            "navigation hint missing {expected:?}: {nav}"
-        );
-    }
-    for expected in [
-        "a/A add", "N cap", "x state", "! pri", "t tags", "m mv", "d del", "L link", "r rename",
-        "e edit", "p/P proj",
-    ] {
-        assert!(
-            actions.contains(expected),
-            "action hint missing {expected:?}: {actions}"
-        );
-    }
-    // The bare key tokens all appear, so compression can never silently drop
-    // one of them.
-    let all_hints = format!("{nav} {actions}");
-    for key in [
-        "j/k", "J/K", "gg/G", "h/l", "tab", "/", "f", "o", "?", "q", "a/A", "N", "x", "!", "t",
-        "m", "d", "L", "r", "e", "p/P",
-    ] {
-        assert!(
-            all_hints.contains(key),
-            "keymap hint missing key {key:?}: {nav} / {actions}"
-        );
-    }
-    assert!(!nav.contains("a/A add"), "actions on the second hint row");
-    assert!(
-        !actions.contains("gg/G"),
-        "navigation on the first hint row"
+    let hints = footer_text(&app.status_line());
+    assert_eq!(
+        hints,
+        "j/k move   a add   x state   p projects   / find   ? keys"
     );
-    assert!(
-        nav.chars().count() <= 80 && actions.chars().count() <= 80,
-        "hint rows fit 80 columns: {nav:?} ({}), {actions:?} ({})",
-        nav.chars().count(),
-        actions.chars().count()
+    assert_eq!(
+        hints.matches("   ").count(),
+        5,
+        "three spaces separate hints"
     );
+    assert!(!hints.contains('·'), "hint rows have no separators");
 
-    // At 80 columns the whole footer still renders, including every action
-    // key the old single hint row clipped (`d del`, `L link`, `r rename`,
-    // `p/P proj`).
     let lines = render_lines(&mut app, 80, 20);
-    let nav_row = &lines[lines.len() - 3];
-    let action_row = &lines[lines.len() - 2];
+    let spacer = &lines[lines.len() - 3];
+    let hint = &lines[lines.len() - 2];
     let context = &lines[lines.len() - 1];
-    assert!(nav_row.contains("j/k move"), "hints on the first hint row");
     assert!(
-        nav_row.contains("? issues") && nav_row.contains("q quit"),
-        "the whole navigation row renders at 80 columns: {nav_row:?}"
+        spacer.trim().is_empty(),
+        "spacer row above hints: {spacer:?}"
     );
-    assert!(
-        action_row.contains("d del"),
-        "delete survives 80 columns: {action_row:?}"
-    );
-    assert!(
-        action_row.contains("L link"),
-        "link survives 80 columns: {action_row:?}"
-    );
-    assert!(
-        action_row.contains("r rename"),
-        "rename survives 80 columns: {action_row:?}"
-    );
-    assert!(
-        action_row.contains("p/P proj"),
-        "P survives 80 columns: {action_row:?}"
-    );
-    assert!(
-        context.contains("vault"),
-        "context on the third footer row: {context:?}"
-    );
-    assert!(
-        !context.contains("j/k move"),
-        "the footer has no message slot: {context:?}"
-    );
-    for gone in ["pan", "tab roots", "center", "enter body"] {
-        assert!(
-            !nav.contains(gone) && !actions.contains(gone) && !context.contains(gone),
-            "map hint {gone:?} must be gone"
-        );
-    }
+    assert!(hint.contains(&hints), "hint row: {hint:?}");
+    assert!(context.contains("vault"), "context row: {context:?}");
 }
 
 #[test]
@@ -2830,7 +2762,10 @@ fn a_opens_a_prompt_and_commits_a_child_on_disk() {
     for character in "New child".chars() {
         app.handle_key(key(KeyCode::Char(character)));
     }
-    assert_eq!(app.status_lines()[0], "new task under Parent: New child");
+    assert_eq!(
+        footer_text(&app.status_line()),
+        "new task under Parent: New child"
+    );
 
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.mode, InputMode::Navigate);
@@ -4387,7 +4322,10 @@ fn shift_p_opens_the_register_path_popup() {
 
     app.handle_key(key(KeyCode::Char('P')));
     assert!(matches!(app.mode, InputMode::RegisterPath));
-    assert_eq!(app.status_lines()[0], "enter register · esc cancel");
+    assert_eq!(
+        footer_text(&app.status_line()),
+        "enter register   esc cancel"
+    );
     let text = render_lines(&mut app, 100, 20).join("\n");
     assert!(text.contains("Register a project directory"), "{text}");
     assert!(text.contains("new project"), "popup title: {text}");

@@ -1,8 +1,8 @@
 //! Ratatui rendering for the list view and its persistent preview.
 //!
 //! The list is the only main view: one indented row per task in pre-order and
-//! a preview of the selected task on the right, with three footer rows (two
-//! key-hint rows, then project context), a one-row header (issue badge) on
+//! a preview of the selected task on the right, with three footer rows
+//! (spacer, one hint row, then project context), a one-row header (issue badge) on
 //! top, and a transient toast popup for action feedback.
 
 use chrono::NaiveDate;
@@ -14,7 +14,10 @@ use ratatui::Frame;
 use tt::{path_display, Priority, Task, TaskId, TaskState, VaultIssue};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::{App, InputMode};
+use super::app::{App, FooterLine, Hint, InputMode};
+    keymap_columns, keymap_content_lines, keymap_content_width, keymap_geometry,
+    packed_group_indices, KeymapGroup, KEYMAP_GROUPS,
+};
 use super::launch::Launch;
 use super::list::ListRow;
 use super::markdown;
@@ -23,16 +26,17 @@ use super::markdown;
 const SEARCH_POPUP_MATCHES: usize = 5;
 
 /// Areas of the main screen: the header row, the list and preview panes, the
-/// middle area (both panes; the issues overlay and the toast cover it), and
-/// the three footer rows (two hint rows, then project context).
+/// middle area (both panes; overlays and the toast cover it), and
+/// the three footer rows (spacer, hint row, then project context).
 #[derive(Debug)]
 pub(crate) struct LayoutAreas {
     pub(crate) header: Rect,
     pub(crate) list: Rect,
     pub(crate) preview: Rect,
     pub(crate) middle: Rect,
-    /// Two footer rows: per-mode key hints or the live input prompt on the
-    /// first row, the second hint row beneath it.
+    /// First footer row: intentionally blank spacer.
+    pub(crate) spacer: Rect,
+    /// Second footer row: per-mode key hints or the live input prompt.
     pub(crate) hint: Rect,
     /// Third footer row: project context and sticky status.
     pub(crate) context: Rect,
@@ -56,14 +60,20 @@ pub(crate) fn layout(area: Rect) -> LayoutAreas {
         Constraint::Min(1),
     ])
     .split(chunks[1]);
-    let footer = Layout::vertical([Constraint::Length(2), Constraint::Length(1)]).split(chunks[2]);
+    let footer = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(chunks[2]);
     LayoutAreas {
         header: chunks[0],
         list: panes[0],
         preview: panes[2],
         middle: chunks[1],
-        hint: footer[0],
-        context: footer[1],
+        spacer: footer[0],
+        hint: footer[1],
+        context: footer[2],
     }
 }
 
@@ -86,6 +96,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &App) {
     render_create_link_popup(frame, areas.list, app);
     render_preview(frame, areas.preview, app);
     render_register_popup(frame, areas.middle, app);
+    frame.render_widget(Paragraph::new(""), areas.spacer);
     render_hint(frame, areas.hint, app);
     render_context(frame, areas.context, app);
 
@@ -1141,26 +1152,39 @@ fn resolve_title(app: &App, id: &TaskId) -> String {
         .map_or_else(|| format!("{id} (missing)"), |task| task.title.clone())
 }
 
-/// First two footer rows: the live input prompt on the top row while typing,
-/// the per-mode key hints otherwise; the second hint row stays empty while a
-/// prompt owns the footer.
+/// One footer hint row: prompts and inline picker status remain plain text,
+/// while structured hints use cyan keys and dark-gray labels separated by
+/// exactly three spaces.
 fn render_hint(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let style = match app.mode {
-        InputMode::Navigate => Style::default().fg(Color::DarkGray),
-        InputMode::Add { .. }
-        | InputMode::Capture
-        | InputMode::Rename { .. }
-        | InputMode::Tag
-        | InputMode::Pick(_)
-        | InputMode::RegisterPath
-        | InputMode::ConfirmDelete { .. } => Style::default().fg(Color::Cyan),
-    };
-
-    let [first, second] = app.status_lines();
-    frame.render_widget(
-        Paragraph::new(vec![Line::from(first), Line::from(second)]).style(style),
-        area,
-    );
+    match app.status_line() {
+        FooterLine::Text(text) => {
+            let style = match app.mode {
+                InputMode::Navigate => Style::default().fg(Color::DarkGray),
+                InputMode::Add { .. }
+                | InputMode::Capture
+                | InputMode::Rename { .. }
+                | InputMode::Tag
+                | InputMode::Pick(_)
+                | InputMode::RegisterPath
+                | InputMode::ConfirmDelete { .. } => Style::default().fg(Color::Cyan),
+            };
+            frame.render_widget(Paragraph::new(text).style(style), area);
+        }
+        FooterLine::Hints(hints) => {
+            let mut spans = Vec::with_capacity(hints.len() * 3);
+            for (index, Hint { key, label }) in hints.iter().enumerate() {
+                if index > 0 {
+                    spans.push(Span::raw("   "));
+                }
+                spans.push(Span::styled(*key, Style::default().fg(Color::Cyan)));
+                spans.push(Span::styled(
+                    format!(" {label}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        }
+    }
 }
 
 /// `P` path prompt: a small centered box with the question and the typed path.

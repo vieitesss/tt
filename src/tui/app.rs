@@ -30,15 +30,119 @@ pub(crate) const TICK: Duration = Duration::from_millis(250);
 /// How many [`TICK`]s a toast stays on screen: 12 ticks is about 3 seconds.
 pub(crate) const TOAST_TICKS: u32 = 12;
 
-const LIST_NAV_HINTS: &str =
-    "j/k move·J/K rank·gg/G·h/l fold·tab sel·/ find·f filter·o links·? issues·q quit";
-const LIST_ACTION_HINTS: &str =
-    "a/A add·N cap·x state·! pri·t tags·m mv·d del·L link·r rename·e edit·p/P proj";
-const SELECTION_NAV_HINTS: &str = "tab un/select · j/k move · J/K rank · esc clear";
-const SELECTION_ACTION_HINTS: &str = "m move · d delete · x cycle state · ! priority · t tags";
-const CONFIRM_DELETE_HINTS: &str = "←/→ select · enter confirm · y confirm · esc cancel";
-const ISSUES_HINTS: &str = "? or esc close · q quit";
-const REGISTER_HINTS: &str = "enter register · esc cancel";
+/// A key/label pair shown in the single footer hint row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Hint {
+    pub(crate) key: &'static str,
+    pub(crate) label: &'static str,
+}
+
+/// The footer's hint row is either plain text (for prompts and inline picker
+/// status) or a styled list of key/label pairs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FooterLine {
+    Text(String),
+    Hints(&'static [Hint]),
+}
+
+const NAVIGATE_HINTS: &[Hint] = &[
+    Hint {
+        key: "j/k",
+        label: "move",
+    },
+    Hint {
+        key: "a",
+        label: "add",
+    },
+    Hint {
+        key: "x",
+        label: "state",
+    },
+    Hint {
+        key: "p",
+        label: "projects",
+    },
+    Hint {
+        key: "/",
+        label: "find",
+    },
+    Hint {
+        key: "?",
+        label: "keys",
+    },
+];
+const SELECTION_HINTS: &[Hint] = &[
+    Hint {
+        key: "tab",
+        label: "un/select",
+    },
+    Hint {
+        key: "esc",
+        label: "clear",
+    },
+    Hint {
+        key: "m",
+        label: "move",
+    },
+    Hint {
+        key: "d",
+        label: "delete",
+    },
+    Hint {
+        key: "x",
+        label: "state",
+    },
+    Hint {
+        key: "!",
+        label: "priority",
+    },
+    Hint {
+        key: "t",
+        label: "tags",
+    },
+];
+const CONFIRM_DELETE_HINTS: &[Hint] = &[
+    Hint {
+        key: "←/→",
+        label: "select",
+    },
+    Hint {
+        key: "enter",
+        label: "confirm",
+    },
+    Hint {
+        key: "y",
+        label: "confirm",
+    },
+    Hint {
+        key: "esc",
+        label: "cancel",
+    },
+];
+const ISSUES_HINTS: &[Hint] = &[
+    Hint {
+        key: "j/k",
+        label: "move",
+    },
+    Hint {
+        key: "e",
+        label: "edit",
+    },
+    Hint {
+        key: "esc",
+        label: "close",
+    },
+];
+const REGISTER_HINTS: &[Hint] = &[
+    Hint {
+        key: "enter",
+        label: "register",
+    },
+    Hint {
+        key: "esc",
+        label: "cancel",
+    },
+];
 
 /// A transient action message shown as a non-blocking toast popup.
 ///
@@ -370,17 +474,15 @@ impl App {
         }
     }
 
-    /// Two footer hint rows for the current mode. A live prompt or a
-    /// picker-inline status owns the first row while typing and the second
-    /// stays empty; navigation and selection modes fill both rows with their
-    /// keymap. The sticky external-change flag lives on
-    /// [`App::context_text`], not here.
-    pub(crate) fn status_lines(&self) -> [String; 2] {
+    /// The single footer hint row for the current mode. Prompts and inline
+    /// picker status remain plain text; navigation, selection, and modal
+    /// hints are structured so the renderer can style keys and labels.
+    pub(crate) fn status_line(&self) -> FooterLine {
         if let Some(prefix) = self.prompt_prefix() {
             let prompt = format!("{prefix}{}", self.input);
             // Search keeps a status line (for example `no matches`) and a
             // selection hint visible next to the live query.
-            let first = match (&self.mode, &self.status) {
+            let text = match (&self.mode, &self.status) {
                 (InputMode::Pick(picker), Some(status)) if picker.kind.shows_status() => {
                     format!("{prompt}  [{status}]")
                 }
@@ -389,27 +491,24 @@ impl App {
                 }
                 _ => prompt,
             };
-            return [first, String::new()];
+            return FooterLine::Text(text);
         }
         if matches!(self.mode, InputMode::RegisterPath) {
-            return [REGISTER_HINTS.to_owned(), String::new()];
+            return FooterLine::Hints(REGISTER_HINTS);
         }
         if matches!(self.mode, InputMode::ConfirmDelete { .. }) {
-            return [CONFIRM_DELETE_HINTS.to_owned(), String::new()];
+            return FooterLine::Hints(CONFIRM_DELETE_HINTS);
         }
         if let Some(status) = &self.status {
-            return [status.clone(), String::new()];
+            return FooterLine::Text(status.clone());
         }
         if self.issues_open {
-            return [ISSUES_HINTS.to_owned(), String::new()];
+            return FooterLine::Hints(ISSUES_HINTS);
         }
         if !self.marked.is_empty() {
-            return [
-                SELECTION_NAV_HINTS.to_owned(),
-                SELECTION_ACTION_HINTS.to_owned(),
-            ];
+            return FooterLine::Hints(SELECTION_HINTS);
         }
-        [LIST_NAV_HINTS.to_owned(), LIST_ACTION_HINTS.to_owned()]
+        FooterLine::Hints(NAVIGATE_HINTS)
     }
 
     /// Third footer row: project context and the sticky external-change
