@@ -96,9 +96,11 @@ _Avoid_: label, display name
 
 **Title sync**:
 The one-way propagation from a renamed Task to the mirror Aliases pointing at
-it. It fires when a reload observes a title change, rewrites only mirrors, never
-moves in the other direction (editing an Alias never renames), touches only the
-owning store, and is idempotent — it writes only on actual mismatch.
+it. It happens immediately for a rename made by tt, or when a running session
+observes an external title change; it rewrites only mirrors, never moves in the
+other direction (editing an Alias never renames), touches only the owning store,
+and is idempotent — it writes only on actual mismatch. A cold open cannot infer
+an external rename and leaves aliases unchanged.
 _Avoid_: bidirectional sync, rename propagation
 
 **Tag**:

@@ -36,7 +36,7 @@ fn watcher_signals_after_external_edits_and_reload_sees_them() {
         "the cache stays stale until the caller reloads"
     );
 
-    vault.reload();
+    vault.reload().expect("reload");
     assert_eq!(vault.get(&id).expect("loaded").title, "Created");
 
     fs::write(
@@ -50,7 +50,7 @@ fn watcher_signals_after_external_edits_and_reload_sees_them() {
             .expect("wait for signal"),
         "watcher should signal an external modify"
     );
-    vault.reload();
+    vault.reload().expect("reload");
     assert_eq!(vault.get(&id).expect("loaded").title, "Modified");
 }
 
@@ -80,7 +80,7 @@ fn watch_triggered_reload_never_rewrites_a_malformed_file() {
         "watcher should signal the new file"
     );
 
-    let issues = vault.reload();
+    let issues = vault.reload().expect("reload");
 
     assert_eq!(
         fs::read(&garbage_path).expect("read garbage"),
@@ -106,7 +106,7 @@ fn reload_reads_do_not_signal_but_writes_do() {
 
     // Reading the vault is what `Vault::reload` does on every scan; it must
     // not look like an external change, or the TUI reloads in a loop.
-    vault.reload();
+    vault.reload().expect("reload");
     assert!(
         !watcher
             .wait(Duration::from_millis(800))

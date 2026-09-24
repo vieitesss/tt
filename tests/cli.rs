@@ -340,26 +340,42 @@ fn show_normalizes_rich_link_forms_to_ids() {
 }
 
 #[test]
-fn cli_edit_title_never_rewrites_linking_files() {
+fn cli_edit_title_syncs_mirror_aliases_without_changing_json() {
     let dir = tempfile::tempdir().expect("temp dir");
     let target_id = id_of(&add_task(dir.path(), "Old title", &[]));
-    let source_id = id_of(&add_task(dir.path(), "Source", &[]));
+    let mirror_id = id_of(&add_task(dir.path(), "Mirror", &[]));
+    let contextual_id = id_of(&add_task(dir.path(), "Contextual", &[]));
     append_body(
         dir.path(),
-        &source_id,
+        &mirror_id,
         &format!("[[{target_id}.md|Old title]]"),
     );
-    let source_path = dir.path().join(format!("{source_id}.md"));
-    let before = fs::read_to_string(&source_path).expect("read");
+    append_body(
+        dir.path(),
+        &contextual_id,
+        &format!("[[{target_id}.md|my own words]]"),
+    );
+    let mirror_path = dir.path().join(format!("{mirror_id}.md"));
+    let contextual_path = dir.path().join(format!("{contextual_id}.md"));
+    let before_contextual = fs::read_to_string(&contextual_path).expect("read");
 
     let edited =
         run_json(base_command(dir.path()).args(["edit", &target_id, "--title", "New title"]));
     assert_eq!(edited["title"], "New title");
-
+    assert!(edited.get("mirror_files_updated").is_none());
+    let mirror = fs::read_to_string(&mirror_path).expect("read");
+    assert!(
+        mirror.contains(&format!("[[{target_id}.md|New title]]")),
+        "the CLI rewrites mirror aliases immediately: {mirror}"
+    );
+    assert!(
+        !mirror.contains("Old title"),
+        "stale mirror remains: {mirror}"
+    );
     assert_eq!(
-        fs::read_to_string(&source_path).expect("read"),
-        before,
-        "the CLI never title-syncs; only a live TUI reload does"
+        fs::read_to_string(&contextual_path).expect("read"),
+        before_contextual,
+        "contextual aliases stay unchanged"
     );
 }
 

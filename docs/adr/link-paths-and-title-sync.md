@@ -11,15 +11,15 @@ human-readable. The parser accepts and keeps accepting every older form
 `id.md` normalizes to `id`. The id remains the contract; the alias is
 display-only and the TUI always resolves the live title.
 
-Aliases sync one-way with titles: when a reload observes a title change (the TUI
-still holds the previous index, so it can diff), every alias that *equaled the
-old title* is a **mirror** and is rewritten to the new one; aliases that differ
-are **contextual** and are never rewritten. Editing an alias never renames a
-task. Sync is idempotent (writes only on actual mismatch, so the watcher cannot
-loop), touches only links whose target lives in the same store (cross-project
-dangling links are exempt), and has no cascade cap: renaming a task linked from
-N files rewrites those N files atomically. A cold scan never writes — with no
-prior index there is no diff and tt never guesses.
+Aliases sync one-way with titles: a title change made by tt immediately rewrites
+aliases that *equaled the old title* (these are **mirrors**); aliases that differ
+are **contextual** and are never rewritten. A running session also syncs when a
+reload observes an external title change, because it still knows the previous
+title. Editing an alias never renames a task. Sync is idempotent (writes only on
+actual mismatch, so the watcher cannot loop), touches only links whose target
+lives in the same store (cross-project dangling links are exempt), and has no
+cascade cap: renaming a task linked from N files rewrites those N files
+atomically. A cold open never writes — with no prior title tt does not guess.
 
 ## Considered Options
 
@@ -43,10 +43,11 @@ prior index there is no diff and tt never guesses.
 - Vaults full of bare `[[id]]` keep working unchanged; there is no migration —
   aliases appear as links are created or as renames cascade.
 - The alias shown in raw text can go stale when a title changes outside any
-  running tt session (cold scans never write), and a later cold session does
+  running tt session (cold opens never write), and a later cold session does
   not repair it either: only a running session that already held the old
-  title rewrites mirrors on its next reload. The TUI preview and `o` picker
-  are always truthful because they resolve live.
+  title rewrites mirrors on its next reload. Renames made through tt, including
+  CLI `edit --title`, synchronize mirrors immediately. The TUI preview and `o`
+  picker are always truthful because they resolve live.
 - Title renames become multi-file writes; each is atomic and idempotent, so a
   completed cascade leaves the next reload nothing to write. A write that
   fails leaves that alias stale until it is edited by hand.

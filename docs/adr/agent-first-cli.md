@@ -5,7 +5,7 @@ The app ships a headless CLI covering the full task lifecycle (add, list/query, 
 ## Consequences
 
 - CLI output stability matters as much as the TUI's UX — breaking `--json` shape breaks agents.
-- All mutation logic lives in the vault library; the TUI must not have privileged write paths the CLI lacks.
+- All mutation logic lives in the vault library; the TUI must not have privileged write paths the CLI lacks. CLI `edit --title` and the TUI use the same title-sync lifecycle, while `--json` continues to return only the stable task shape.
 - The skill file ships in the repo and documents the CLI as the agent interface; keeping it in sync is part of changing the CLI.
 
 ## Considered Options

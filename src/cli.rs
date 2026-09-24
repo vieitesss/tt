@@ -591,8 +591,8 @@ fn edit(vault: &mut Vault, args: &EditArgs, json: bool) -> Result<()> {
 
     // `--title` keeps the agent-first rename contract.
     if let Some(title) = &args.title {
-        let task = vault.set_title(&id, title)?;
-        return print_task(&task, json, "edited");
+        let outcome = vault.set_title(&id, title)?;
+        return print_task(&outcome.task, json, "edited");
     }
 
     let task_path = vault
@@ -602,7 +602,7 @@ fn edit(vault: &mut Vault, args: &EditArgs, json: bool) -> Result<()> {
     crate::editor::open(&task_path)?;
 
     // The editor may have changed anything; rescan before answering.
-    vault.reload();
+    vault.reload()?;
     let task = vault
         .get(&id)
         .with_context(|| format!("task not found after editing: {id}"))?;

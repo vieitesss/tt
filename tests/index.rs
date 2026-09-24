@@ -1,7 +1,7 @@
 //! Integration tests for the derived vault index (tree, tags, links,
 //! backlinks, rollup) through the public API.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 
 use chrono::NaiveDate;
@@ -109,7 +109,7 @@ fn unranked_roots_keep_title_then_id_display_order() {
         )
         .expect("write task");
     }
-    vault.reload();
+    vault.reload().expect("reload");
 
     assert_eq!(
         vault.roots(),
@@ -137,7 +137,7 @@ fn ranked_roots_precede_unranked_roots_in_display_order() {
         )
         .expect("write task");
     }
-    vault.reload();
+    vault.reload().expect("reload");
 
     let titles: Vec<&str> = vault
         .tree()
@@ -218,7 +218,7 @@ fn dangling_parent_makes_task_a_root_and_reattaches_when_it_appears() {
         Task::new(ghost.clone(), "Ghost").to_document(),
     )
     .expect("write ghost");
-    vault.reload();
+    vault.reload().expect("reload");
 
     assert_eq!(vault.parent(&orphan.id), Some(&ghost));
     assert!(vault.roots().contains(&ghost));
@@ -250,7 +250,7 @@ fn parent_cycles_are_broken_reported_and_traversal_terminates() {
     fs::write(dir.path().join("cycle00001.md"), a.to_document()).expect("write a");
     fs::write(dir.path().join("cycle00002.md"), b.to_document()).expect("write b");
 
-    vault.reload();
+    vault.reload().expect("reload");
 
     assert_eq!(vault.len(), 2);
     assert!(vault.get(&a_id).is_some());
@@ -285,7 +285,7 @@ fn self_parent_is_reported_and_treated_as_root() {
     task.parent = Some(id.clone());
     fs::write(dir.path().join("self000001.md"), task.to_document()).expect("write");
 
-    vault.reload();
+    vault.reload().expect("reload");
 
     assert_eq!(vault.parent(&id), None);
     assert!(vault.roots().contains(&id));
@@ -677,7 +677,7 @@ fn reload_rebuilds_links_and_parent_edges_after_external_edits() {
     )
     .expect("external edit");
 
-    vault.reload();
+    vault.reload().expect("reload");
 
     assert_eq!(vault.children(&first.id), &[second.id.clone()][..]);
     assert_eq!(vault.backlinks(&first.id), &[second.id.clone()][..]);
@@ -685,17 +685,9 @@ fn reload_rebuilds_links_and_parent_edges_after_external_edits() {
     assert!(vault.links(&second.id).contains(&first.id));
 }
 
-/// Snapshot the vault's id → title map, the shape title sync diffs against.
-fn titles(vault: &Vault) -> BTreeMap<TaskId, String> {
-    vault
-        .tasks()
-        .map(|task| (task.id.clone(), task.title.clone()))
-        .collect()
-}
-
 #[test]
-fn sync_mirror_aliases_rewrites_only_mirrors_and_counts_files() {
-    let (dir, mut vault) = open_vault();
+fn set_title_rewrites_only_mirrors_and_counts_files() {
+    let (_dir, mut vault) = open_vault();
     let target = add_task(&mut vault, "Old title", None, TaskState::Open, &[], "");
     let mirror = add_task(
         &mut vault,
@@ -724,20 +716,12 @@ fn sync_mirror_aliases_rewrites_only_mirrors_and_counts_files() {
             target.id, target.id
         ),
     );
-    let old = titles(&vault);
+    let outcome = vault.set_title(&target.id, "New title").expect("rename");
 
-    let mut renamed = target.clone();
-    renamed.title = "New title".to_owned();
-    fs::write(
-        dir.path().join(format!("{}.md", target.id)),
-        renamed.to_document(),
-    )
-    .expect("external rename");
-    vault.reload();
-
-    let written = vault.sync_mirror_aliases(&old).expect("sync");
-
-    assert_eq!(written, 2, "one write per mirror file, not per alias");
+    assert_eq!(
+        outcome.mirror_files_updated, 2,
+        "one write per mirror file, not per alias"
+    );
     assert_eq!(
         vault.get(&mirror.id).expect("mirror").body,
         format!("see [[{}.md|New title]]", target.id)
@@ -757,7 +741,7 @@ fn sync_mirror_aliases_rewrites_only_mirrors_and_counts_files() {
 }
 
 #[test]
-fn sync_mirror_aliases_cascades_all_renames_in_one_pass() {
+fn reload_cascades_all_observed_renames_in_one_pass() {
     let (dir, mut vault) = open_vault();
     let first = add_task(&mut vault, "First old", None, TaskState::Open, &[], "");
     let second = add_task(&mut vault, "Second old", None, TaskState::Open, &[], "");
@@ -772,8 +756,6 @@ fn sync_mirror_aliases_cascades_all_renames_in_one_pass() {
             first.id, second.id
         ),
     );
-    let old = titles(&vault);
-
     for (task, title) in [(&first, "First new"), (&second, "Second new")] {
         let mut renamed = task.clone();
         renamed.title = title.to_owned();
@@ -783,33 +765,28 @@ fn sync_mirror_aliases_cascades_all_renames_in_one_pass() {
         )
         .expect("external rename");
     }
-    vault.reload();
+    vault.reload().expect("reload");
 
-    let written = vault.sync_mirror_aliases(&old).expect("sync");
-
-    assert_eq!(written, 1, "both aliases live in one file");
     assert_eq!(
         vault.get(&source.id).expect("source").body,
         format!(
             "[[{}.md|First new]] and [[{}.md|Second new]]",
             first.id, second.id
-        )
+        ),
+        "both aliases in the same file are rewritten"
     );
 }
 
 #[test]
-fn sync_mirror_aliases_updates_self_links() {
+fn set_title_updates_self_link_aliases() {
     let (_dir, mut vault) = open_vault();
     let task = add_task(&mut vault, "Old self", None, TaskState::Open, &[], "");
     vault
         .set_body(&task.id, &format!("I am [[{}.md|Old self]]", task.id))
         .expect("set body");
-    let old = titles(&vault);
+    let outcome = vault.set_title(&task.id, "New self").expect("rename");
 
-    vault.set_title(&task.id, "New self").expect("rename");
-
-    let written = vault.sync_mirror_aliases(&old).expect("sync");
-    assert_eq!(written, 1);
+    assert_eq!(outcome.mirror_files_updated, 1);
     assert_eq!(
         vault.get(&task.id).expect("task").body,
         format!("I am [[{}.md|New self]]", task.id)
@@ -817,7 +794,7 @@ fn sync_mirror_aliases_updates_self_links() {
 }
 
 #[test]
-fn sync_mirror_aliases_leaves_dangling_and_cross_store_links_alone() {
+fn set_title_leaves_dangling_links_alone() {
     let (_dir, mut vault) = open_vault();
     let target = add_task(&mut vault, "Old title", None, TaskState::Open, &[], "");
     let ghost = parse_id("ghost00001");
@@ -832,12 +809,9 @@ fn sync_mirror_aliases_leaves_dangling_and_cross_store_links_alone() {
             target.id
         ),
     );
-    let old = titles(&vault);
-    vault.set_title(&target.id, "New title").expect("rename");
+    let outcome = vault.set_title(&target.id, "New title").expect("rename");
 
-    let written = vault.sync_mirror_aliases(&old).expect("sync");
-
-    assert_eq!(written, 1);
+    assert_eq!(outcome.mirror_files_updated, 1);
     assert_eq!(
         vault.get(&source.id).expect("source").body,
         format!(
@@ -849,7 +823,7 @@ fn sync_mirror_aliases_leaves_dangling_and_cross_store_links_alone() {
 }
 
 #[test]
-fn sync_mirror_aliases_never_chases_a_renamed_target_transitively() {
+fn reload_never_chases_renamed_targets_transitively() {
     let (dir, mut vault) = open_vault();
     let first = add_task(&mut vault, "A", None, TaskState::Open, &[], "");
     let second = add_task(&mut vault, "B", None, TaskState::Open, &[], "");
@@ -861,8 +835,6 @@ fn sync_mirror_aliases_never_chases_a_renamed_target_transitively() {
         &[],
         &format!("[[{}.md|A]] [[{}.md|B]]", first.id, second.id),
     );
-    let old = titles(&vault);
-
     for (task, title) in [(&first, "B"), (&second, "C")] {
         let mut renamed = task.clone();
         renamed.title = title.to_owned();
@@ -872,9 +844,7 @@ fn sync_mirror_aliases_never_chases_a_renamed_target_transitively() {
         )
         .expect("external rename");
     }
-    vault.reload();
-
-    assert_eq!(vault.sync_mirror_aliases(&old).expect("sync"), 1);
+    vault.reload().expect("reload");
     assert_eq!(
         vault.get(&source.id).expect("source").body,
         format!("[[{}.md|B]] [[{}.md|C]]", first.id, second.id),
@@ -883,7 +853,7 @@ fn sync_mirror_aliases_never_chases_a_renamed_target_transitively() {
 }
 
 #[test]
-fn sync_mirror_aliases_is_idempotent() {
+fn set_title_sync_is_idempotent_across_reload() {
     let (dir, mut vault) = open_vault();
     let target = add_task(&mut vault, "Old title", None, TaskState::Open, &[], "");
     let mirror = add_task(
@@ -894,20 +864,13 @@ fn sync_mirror_aliases_is_idempotent() {
         &[],
         &format!("[[{}.md|Old title]]", target.id),
     );
-    let old = titles(&vault);
-    vault.set_title(&target.id, "New title").expect("rename");
+    let outcome = vault.set_title(&target.id, "New title").expect("rename");
 
-    assert_eq!(vault.sync_mirror_aliases(&old).expect("sync"), 1);
+    assert_eq!(outcome.mirror_files_updated, 1);
     let mirror_path = dir.path().join(format!("{}.md", mirror.id));
     let after_first = fs::read_to_string(&mirror_path).expect("read");
 
-    let clean = titles(&vault);
-    vault.reload();
-    assert_eq!(
-        vault.sync_mirror_aliases(&clean).expect("second sync"),
-        0,
-        "a post-cascade reload diffs clean"
-    );
+    vault.reload().expect("second reload");
     assert_eq!(
         fs::read_to_string(&mirror_path).expect("read"),
         after_first,
@@ -916,7 +879,7 @@ fn sync_mirror_aliases_is_idempotent() {
 }
 
 #[test]
-fn sync_mirror_aliases_preserves_unknown_frontmatter_and_bytes() {
+fn reload_sync_preserves_unknown_frontmatter_and_non_alias_bytes() {
     let dir = tempfile::tempdir().expect("temp dir");
     fs::write(
         dir.path().join("target0001.md"),
@@ -931,17 +894,13 @@ fn sync_mirror_aliases_preserves_unknown_frontmatter_and_bytes() {
     .expect("write source");
 
     let mut vault = Vault::open(dir.path()).expect("open");
-    let old = titles(&vault);
 
     fs::write(
         dir.path().join("target0001.md"),
         "---\nid: target0001\ntitle: New title\nstate: open\n---\n",
     )
     .expect("external rename");
-    vault.reload();
-
-    let written = vault.sync_mirror_aliases(&old).expect("sync");
-    assert_eq!(written, 1);
+    vault.reload().expect("reload");
 
     let contents = fs::read_to_string(dir.path().join("source0001.md")).expect("read");
     assert!(contents.contains("custom: keep-me"), "{contents}");
@@ -970,7 +929,7 @@ fn cold_open_and_reload_never_write() {
         "a cold open has no prior index and never rewrites"
     );
 
-    vault.reload();
+    vault.reload().expect("reload");
     assert_eq!(
         fs::read_to_string(dir.path().join("source0001.md")).expect("read"),
         source,

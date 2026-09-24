@@ -53,6 +53,24 @@ pub enum VaultError {
         #[source]
         source: std::io::Error,
     },
+    /// Mirror synchronization failed after the title or reloaded cache was
+    /// already committed. Earlier mirror writes remain committed.
+    #[error(
+        "partial commit (title_committed={title_committed}, reload_committed={reload_committed}); {mirror_files_updated} mirror file(s) updated before failure at {path}: {source}"
+    )]
+    PartialCommit {
+        /// Whether a title update was persisted by `set_title`.
+        title_committed: bool,
+        /// Whether a reload scan was applied to the in-memory cache.
+        reload_committed: bool,
+        /// Number of mirror files successfully updated before the failure.
+        mirror_files_updated: usize,
+        /// Mirror file whose rewrite failed.
+        path: PathBuf,
+        /// Underlying error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Category of a [`VaultIssue`].
@@ -184,6 +202,15 @@ pub struct DeleteOutcome {
     pub deleted: usize,
 }
 
+/// Result of changing a task title.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenameOutcome {
+    /// The renamed task after any self-link aliases were synchronized.
+    pub task: Task,
+    /// Number of files whose mirror aliases were rewritten.
+    pub mirror_files_updated: usize,
+}
+
 /// A folder of one-file-per-task markdown documents.
 #[derive(Debug)]
 pub struct Vault {
@@ -192,6 +219,12 @@ pub struct Vault {
     index: Index,
     scan_issues: Vec<VaultIssue>,
     issues: Vec<VaultIssue>,
+}
+
+struct MirrorSyncError {
+    path: PathBuf,
+    source: std::io::Error,
+    mirror_files_updated: usize,
 }
 
 impl Vault {
@@ -215,21 +248,50 @@ impl Vault {
             scan_issues: Vec::new(),
             issues: Vec::new(),
         };
-        vault.reload();
+        vault.reload()?;
         Ok(vault)
     }
 
     /// Rescan the vault folder, replacing the in-memory cache and index, and
-    /// return the issues found.
+    /// return the issues found. Existing tasks whose title changed since the
+    /// previous scan have their mirror aliases synchronized before this
+    /// returns.
     ///
-    /// This is the only way to pick up external edits; the cache and the index
-    /// are fully disposable.
-    pub fn reload(&mut self) -> Vec<VaultIssue> {
+    /// A cold open has no previous titles to compare and never writes. This is
+    /// the only way to pick up external edits; the cache and the index are
+    /// fully disposable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::PartialCommit`] when a mirror alias rewrite
+    /// cannot be persisted. The error reports that the reload cache was
+    /// committed, the number of earlier rewrites, and the failing path.
+    pub fn reload(&mut self) -> Result<Vec<VaultIssue>, VaultError> {
+        self.reload_with_writer(|vault, id, body| vault.set_body(id, body).map(|_| ()))
+    }
+
+    fn reload_with_writer(
+        &mut self,
+        mut write_body: impl FnMut(&mut Self, &TaskId, &str) -> Result<(), VaultError>,
+    ) -> Result<Vec<VaultIssue>, VaultError> {
+        let old_titles: BTreeMap<TaskId, String> = self
+            .tasks
+            .values()
+            .map(|task| (task.id.clone(), task.title.clone()))
+            .collect();
         let (tasks, scan_issues) = scan(&self.root);
         self.tasks = tasks;
         self.scan_issues = scan_issues;
         self.rebuild_index();
-        self.issues.clone()
+        self.sync_mirror_aliases(&old_titles, &mut write_body)
+            .map_err(|error| VaultError::PartialCommit {
+                title_committed: false,
+                reload_committed: true,
+                mirror_files_updated: error.mirror_files_updated,
+                path: error.path,
+                source: error.source,
+            })?;
+        Ok(self.issues.clone())
     }
 
     /// Rebuild the derived graph structures and refresh index issues, keeping
@@ -554,53 +616,63 @@ impl Vault {
         self.edit(id, |task| task.tags = tags)
     }
 
-    /// Set the title of an existing task and persist it.
+    /// Set the title of an existing task and synchronize mirror aliases that
+    /// pointed to its previous title.
     ///
-    /// This is a direct rename: unlike [`Vault::sync_mirror_aliases`] it does
-    /// not touch links that alias this task.
+    /// Contextual aliases, bare links, and links in code remain untouched. The
+    /// returned count is the number of files whose mirror aliases were
+    /// rewritten. The title and any earlier alias writes remain applied if a
+    /// later alias rewrite fails.
     ///
     /// # Errors
     ///
     /// Returns [`VaultError::EmptyTitle`] for a blank title,
-    /// [`VaultError::NotFound`] for an unknown id, or [`VaultError::Io`] when
-    /// the file cannot be written.
-    pub fn set_title(&mut self, id: &TaskId, title: &str) -> Result<Task, VaultError> {
+    /// [`VaultError::NotFound`] for an unknown id, [`VaultError::Io`] when
+    /// the task file cannot be written, or [`VaultError::PartialCommit`] when
+    /// the title was persisted but a mirror file could not be written. The
+    /// latter reports prior mirror successes and the failing path.
+    pub fn set_title(&mut self, id: &TaskId, title: &str) -> Result<RenameOutcome, VaultError> {
         if title.trim().is_empty() {
             return Err(VaultError::EmptyTitle);
         }
-        self.edit(id, |task| task.title = title.to_owned())
+        let old_title = self.cloned(id)?.title;
+        self.edit(id, |task| task.title = title.to_owned())?;
+        let old_titles = BTreeMap::from([(id.clone(), old_title)]);
+        let mirror_files_updated = self
+            .sync_mirror_aliases(&old_titles, &mut |vault, source, body| {
+                vault.set_body(source, body).map(|_| ())
+            })
+            .map_err(|error| VaultError::PartialCommit {
+                title_committed: true,
+                reload_committed: false,
+                mirror_files_updated: error.mirror_files_updated,
+                path: error.path,
+                source: error.source,
+            })?;
+        Ok(RenameOutcome {
+            task: self.cloned(id)?,
+            mirror_files_updated,
+        })
     }
 
-    /// Rewrite mirror aliases after a reload observed title changes.
+    /// Rewrite mirror aliases for title changes in `old_titles`, whose values
+    /// are the titles before those changes. A link is a mirror only when its
+    /// alias equals the target's previous title (after trimming); contextual
+    /// aliases, bare links, links in code, and dangling or cross-store targets
+    /// are never touched. Alias spans are rewritten in place, preserving
+    /// unknown frontmatter and every non-alias byte.
     ///
-    /// `old_titles` is the id → title map from before the reload. Ids present
-    /// in both that map and the vault whose title changed form the diff; a
-    /// link whose alias equals a changed target's old title (after trimming
-    /// the alias) is a **mirror** and is rewritten to the new title. The
-    /// qualifier matters: contextual aliases, bare links, links in code, and
-    /// dangling or cross-store targets (which have no old title here) are
-    /// never touched. Each affected body is persisted atomically through
-    /// [`Vault::set_body`], so unknown frontmatter and every non-alias byte
-    /// survive.
+    /// Each title diff is applied once, so a chain `A → B, B → C` never
+    /// chases transitively. Returns the number of files written, and writes
+    /// nothing when there is no title diff or no stale mirror.
     ///
-    /// The diff is applied once per id against the old titles, so a rename
-    /// chain `A → B, B → C` in one snapshot rewrites each alias to its own
-    /// target's new title and never chases transitively. Returns the number
-    /// of files written — 0 when nothing changed, which is what makes a
-    /// cascade reload diff clean and keeps the watcher from looping.
-    ///
-    /// This method never snapshots titles itself: a cold scan (CLI, fresh
-    /// TUI start) has no previous index and therefore never writes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError::Io`] when a rewrite cannot be persisted. Files
-    /// written before the failure stay written; the in-memory cache matches
-    /// disk.
-    pub fn sync_mirror_aliases(
+    /// Files written before a failure stay written; the in-memory cache
+    /// matches disk.
+    fn sync_mirror_aliases(
         &mut self,
         old_titles: &BTreeMap<TaskId, String>,
-    ) -> Result<usize, VaultError> {
+        write_body: &mut impl FnMut(&mut Self, &TaskId, &str) -> Result<(), VaultError>,
+    ) -> Result<usize, MirrorSyncError> {
         let mut diffs: BTreeMap<TaskId, (String, String)> = BTreeMap::new();
         for (id, task) in &self.tasks {
             let Some(old) = old_titles.get(id) else {
@@ -628,7 +700,17 @@ impl Vault {
             let Some(rewritten) = rewrite_mirror_aliases(&body, &diffs) else {
                 continue;
             };
-            self.set_body(&source, &rewritten)?;
+            if let Err(error) = write_body(self, &source, &rewritten) {
+                let (path, source) = match error {
+                    VaultError::Io { path, source } => (path, source),
+                    _ => unreachable!("source task exists in cache"),
+                };
+                return Err(MirrorSyncError {
+                    path,
+                    source,
+                    mirror_files_updated: written,
+                });
+            }
             written += 1;
         }
         Ok(written)
@@ -1094,7 +1176,7 @@ mod tests {
             )
             .expect("write task");
         }
-        vault.reload();
+        vault.reload().expect("reload");
         let before_alpha = read_task_file(&vault, &alpha.id);
         let before_child = read_task_file(&vault, &only_child.id);
 
@@ -1194,15 +1276,144 @@ mod tests {
             })
             .expect("add");
 
-        let updated = vault.set_title(&task.id, "New title").expect("set title");
-        assert_eq!(updated.title, "New title");
-        assert_eq!(updated.body, "keep this body\n");
-        assert_eq!(updated.state, TaskState::Open);
+        let outcome = vault.set_title(&task.id, "New title").expect("set title");
+        assert_eq!(outcome.task.title, "New title");
+        assert_eq!(outcome.task.body, "keep this body\n");
+        assert_eq!(outcome.task.state, TaskState::Open);
+        assert_eq!(outcome.mirror_files_updated, 0);
 
         let stored = Task::from_document(&read_task_file(&vault, &task.id)).expect("parse");
         assert_eq!(stored.title, "New title");
         assert_eq!(stored.body, "keep this body\n");
         assert_eq!(stored.state, TaskState::Open);
+    }
+
+    #[test]
+    fn set_title_keeps_the_rename_when_a_mirror_write_fails() {
+        let (dir, mut vault) = open_vault();
+        let target = vault.add(NewTask::new("Old title")).expect("add target");
+        let first_mirror = vault
+            .add(NewTask {
+                body: format!("[[{}.md|Old title]]", target.id),
+                ..NewTask::new("First mirror")
+            })
+            .expect("add first mirror");
+        let later_mirror = vault
+            .add(NewTask {
+                body: format!("[[{}.md|Old title]]", target.id),
+                ..NewTask::new("Later mirror")
+            })
+            .expect("add later mirror");
+        let (successful, failing) = if first_mirror.id < later_mirror.id {
+            (first_mirror, later_mirror)
+        } else {
+            (later_mirror, first_mirror)
+        };
+        let failing_path = dir.path().join(format!("{}.md", failing.id));
+        fs::remove_file(&failing_path).expect("remove mirror file");
+        fs::create_dir(&failing_path).expect("block mirror file");
+
+        let error = vault
+            .set_title(&target.id, "New title")
+            .expect_err("mirror write should fail");
+
+        assert!(matches!(
+            error,
+            VaultError::PartialCommit {
+                title_committed: true,
+                reload_committed: false,
+                mirror_files_updated: 1,
+                path,
+                ..
+            } if path == failing_path
+        ));
+        assert_eq!(vault.get(&target.id).expect("target").title, "New title");
+        assert_eq!(
+            vault.get(&successful.id).expect("successful mirror").body,
+            format!("[[{}.md|New title]]", target.id),
+            "earlier mirror writes remain committed"
+        );
+        assert_eq!(
+            vault.get(&failing.id).expect("failing mirror").body,
+            format!("[[{}.md|Old title]]", target.id),
+            "failed mirror writes leave its cached content unchanged"
+        );
+        assert_eq!(
+            Task::from_document(&read_task_file(&vault, &target.id))
+                .expect("stored target")
+                .title,
+            "New title",
+            "the title remains persisted before the mirror failure"
+        );
+    }
+
+    #[test]
+    fn reload_reports_committed_cache_and_prior_alias_writes_on_failure() {
+        let (dir, mut vault) = open_vault();
+        let target = vault.add(NewTask::new("Old title")).expect("add target");
+        let first_mirror = vault
+            .add(NewTask {
+                body: format!("[[{}.md|Old title]]", target.id),
+                ..NewTask::new("First mirror")
+            })
+            .expect("add first mirror");
+        let later_mirror = vault
+            .add(NewTask {
+                body: format!("[[{}.md|Old title]]", target.id),
+                ..NewTask::new("Later mirror")
+            })
+            .expect("add later mirror");
+        let (successful, failing) = if first_mirror.id < later_mirror.id {
+            (first_mirror, later_mirror)
+        } else {
+            (later_mirror, first_mirror)
+        };
+        let target_path = dir.path().join(format!("{}.md", target.id));
+        let contents = fs::read_to_string(&target_path).expect("read target");
+        assert!(
+            contents.contains("Old title"),
+            "target document: {contents:?}"
+        );
+        fs::write(
+            &target_path,
+            contents.replace("Old title", "External title"),
+        )
+        .expect("edit title externally");
+        let failing_path = dir.path().join(format!("{}.md", failing.id));
+
+        let error = vault
+            .reload_with_writer(|vault, id, body| {
+                if id == &failing.id {
+                    return Err(VaultError::Io {
+                        path: failing_path.clone(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "injected write failure",
+                        ),
+                    });
+                }
+                vault.set_body(id, body).map(|_| ())
+            })
+            .expect_err("mirror write should fail");
+
+        assert!(matches!(
+            error,
+            VaultError::PartialCommit {
+                title_committed: false,
+                reload_committed: true,
+                mirror_files_updated: 1,
+                path,
+                ..
+            } if path == failing_path
+        ));
+        assert_eq!(
+            vault.get(&target.id).expect("reloaded target").title,
+            "External title"
+        );
+        assert_eq!(
+            vault.get(&successful.id).expect("successful mirror").body,
+            format!("[[{}.md|External title]]", target.id)
+        );
     }
 
     #[test]
@@ -1274,7 +1485,7 @@ mod tests {
         .expect("write garbage");
         let garbage_before = fs::read(&garbage_path).expect("read garbage");
 
-        let issues = vault.reload();
+        let issues = vault.reload().expect("reload");
 
         assert_eq!(vault.len(), 1);
         assert!(vault.get(&good.id).is_some());
@@ -1305,7 +1516,7 @@ mod tests {
         .expect("write note");
         fs::write(dir.path().join("SKILL.md"), "plain text, no frontmatter\n").expect("write note");
 
-        let issues = vault.reload();
+        let issues = vault.reload().expect("reload");
 
         assert!(issues.is_empty(), "notes must not be issues: {issues:?}");
         assert_eq!(vault.len(), 1);
@@ -1326,7 +1537,7 @@ mod tests {
         )
         .expect("write note");
 
-        let issues = vault.reload();
+        let issues = vault.reload().expect("reload");
 
         assert!(
             issues.is_empty(),
@@ -1344,7 +1555,7 @@ mod tests {
         )
         .expect("write broken");
 
-        let issues = vault.reload();
+        let issues = vault.reload().expect("reload");
 
         assert!(vault.is_empty());
         let malformed: Vec<_> = issues
@@ -1385,7 +1596,7 @@ mod tests {
         fs::write(dir.path().join("aaa.md"), document).expect("write aaa");
         fs::write(dir.path().join("bbb.md"), document).expect("write bbb");
 
-        vault.reload();
+        vault.reload().expect("reload");
 
         assert_eq!(vault.len(), 2, "each file is a task keyed by its stem");
         assert_eq!(vault.get(&parse_id("aaa")).unwrap().title, "Original");
@@ -1413,7 +1624,7 @@ mod tests {
         )
         .expect("write");
 
-        vault.reload();
+        vault.reload().expect("reload");
 
         let stem = parse_id("wrongname");
         assert_eq!(vault.len(), 1);
@@ -1443,7 +1654,7 @@ mod tests {
         )
         .expect("write");
 
-        vault.reload();
+        vault.reload().expect("reload");
 
         assert!(vault.is_empty(), "an invalid stem must not become a task");
         let malformed: Vec<_> = vault
@@ -1473,7 +1684,7 @@ mod tests {
         fs::write(dir.path().join("notes.txt"), "not a task").expect("write txt");
         fs::write(dir.path().join("readme"), "not a task either").expect("write readme");
 
-        vault.reload();
+        vault.reload().expect("reload");
 
         assert!(vault.is_empty());
         assert!(vault.issues().is_empty());
@@ -1493,7 +1704,7 @@ mod tests {
         )
         .expect("external write");
 
-        vault.reload();
+        vault.reload().expect("reload");
 
         assert_eq!(
             vault.get(&task.id).expect("still loaded").title,
@@ -1509,7 +1720,7 @@ mod tests {
             "---\nid: abc1234567\ntitle: T\nstate: open\ncustom: keep-me\n---\n",
         )
         .expect("write");
-        vault.reload();
+        vault.reload().expect("reload");
 
         let id = parse_id("aaa");
         vault.set_title(&id, "T2").expect("set title");
@@ -1685,7 +1896,7 @@ mod tests {
             "---\nid: abc1234567\ntitle: T\nstate: open\ncustom: keep-me\n---\n",
         )
         .expect("write");
-        vault.reload();
+        vault.reload().expect("reload");
         let id = parse_id("aaa");
         let root = vault.add(NewTask::new("Root")).expect("add root");
 
@@ -1907,7 +2118,7 @@ mod tests {
             contents.replace("state: open", "state: open\nparent: missing0001"),
         )
         .expect("write");
-        vault.reload();
+        vault.reload().expect("reload");
 
         let outcome = vault.delete(std::slice::from_ref(&doomed)).expect("delete");
 
@@ -1939,7 +2150,7 @@ mod tests {
             "---\nid: cccc\ntitle: C\nstate: open\nparent: aaaa\n---\n",
         )
         .expect("write cccc");
-        vault.reload();
+        vault.reload().expect("reload");
         assert!(!vault.issues().is_empty(), "the cycle is reported");
 
         // The index breaks the cycle at aaaa, which still roots the subtree
@@ -1975,7 +2186,7 @@ mod tests {
             "---\nid: cccc\ntitle: C\nstate: open\nparent: dddd\n---\n",
         )
         .expect("write cccc");
-        vault.reload();
+        vault.reload().expect("reload");
 
         let outcome = vault
             .delete(&[parse_id("dddd"), parse_id("eeee")])
@@ -2031,7 +2242,7 @@ mod tests {
         let path = vault.root().join(format!("{keep}.md"));
         let before = format!("---\nid: {keep}\ntitle: Keep\nstate: open\ncustom: keep-me\n---\n");
         fs::write(&path, &before).expect("write keep");
-        vault.reload();
+        vault.reload().expect("reload");
 
         vault.delete(&[doomed]).expect("delete");
 

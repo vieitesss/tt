@@ -8,7 +8,7 @@
 //! The list view is the only main view. It owns a single selection over the
 //! flattened task tree, and a persistent preview pane follows that selection.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1382,11 +1382,9 @@ impl App {
         self.status = None;
     }
 
-    /// Commit the `r` prompt: persist the new title through the same path as
-    /// the CLI (`Vault::set_title`), then cascade mirror aliases in the same
-    /// action with the id's old title — tt knows old → new, so no reload diff
-    /// is needed. An unchanged title writes nothing; the toast appends the
-    /// number of mirror files the cascade rewrote.
+    /// Commit the `r` prompt through the vault title-sync lifecycle. An
+    /// unchanged title writes nothing; the toast appends the number of mirror
+    /// files the vault rewrote.
     fn commit_rename(&mut self, id: TaskId, title: String) {
         self.settle_pending_reload();
         let Some(old_title) = self.vault.get(&id).map(|task| task.title.clone()) else {
@@ -1399,26 +1397,25 @@ impl App {
             self.finish_input();
             return;
         }
-        if let Err(error) = self.vault.set_title(&id, &title) {
-            self.mode = InputMode::Navigate;
-            self.input.clear();
-            self.refresh();
-            self.set_toast(format!("error: {error}"));
-            return;
-        }
-        let mut old_titles = BTreeMap::new();
-        old_titles.insert(id, old_title);
-        let sync = self.vault.sync_mirror_aliases(&old_titles);
+        let outcome = match self.vault.set_title(&id, &title) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.mode = InputMode::Navigate;
+                self.input.clear();
+                self.refresh();
+                self.set_toast(format!("error: {error}"));
+                return;
+            }
+        };
         self.mode = InputMode::Navigate;
         self.input.clear();
         self.refresh();
-        match sync {
-            Ok(0) => self.set_toast(format!("renamed to {title}")),
-            Ok(written) => self.set_toast(format!(
+        match outcome.mirror_files_updated {
+            0 => self.set_toast(format!("renamed to {title}")),
+            written => self.set_toast(format!(
                 "renamed to {title} · {written} {} updated",
                 if written == 1 { "link" } else { "links" }
             )),
-            Err(error) => self.set_toast(format!("error: {error}")),
         }
     }
 
@@ -1978,21 +1975,14 @@ impl App {
     /// the selected task and the scroll position survive: a reload must not
     /// steal the user's place.
     ///
-    /// The live title map is snapshotted before the rescan, so a rename this
-    /// reload observes cascades to mirror aliases through
-    /// [`Vault::sync_mirror_aliases`]. A sync failure is toasted but never
-    /// stops the reload; a reload with no title change writes nothing.
+    /// The vault compares titles across the rescan and synchronizes mirror
+    /// aliases. A sync failure is toasted but never stops the reload; a reload
+    /// with no title change writes nothing.
     pub(crate) fn reload_now(&mut self) {
-        let old_titles: BTreeMap<TaskId, String> = self
-            .vault
-            .tasks()
-            .map(|task| (task.id.clone(), task.title.clone()))
-            .collect();
-        self.vault.reload();
-        let sync = self.vault.sync_mirror_aliases(&old_titles);
+        let reload = self.vault.reload();
         self.external_change_pending = false;
         self.refresh();
-        if let Err(error) = sync {
+        if let Err(error) = reload {
             self.set_toast(format!("error: {error}"));
         }
     }
