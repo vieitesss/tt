@@ -1,3 +1,5 @@
+alias skill := install_skill
+
 # List the available recipes.
 default:
     @just --list
@@ -40,3 +42,8 @@ install: build-release
 # Run the throwaway footer-design prototypes.
 proto:
     cargo run --manifest-path prototypes/footer/Cargo.toml
+
+install_skill:
+    rm -rf ~/.agents/skills/tt | true
+    mkdir -p ~/.agents/skills/tt
+    ln -sf ~/personal/tt/SKILL.md ~/.agents/skills/tt/SKILL.md
