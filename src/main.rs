@@ -29,7 +29,7 @@ struct Cli {
     json: bool,
 
     /// Open the project picker without registering the current directory.
-    #[arg(short = 'p', long, global = true)]
+    #[arg(short = 'p', long)]
     projects: bool,
 
     #[command(subcommand)]
@@ -39,4 +39,22 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     cli::run(&cli)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn projects_flag_parses_without_a_subcommand() {
+        let cli = Cli::try_parse_from(["tt", "-p"]).expect("parse bare project picker");
+        assert!(cli.projects);
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn projects_flag_does_not_parse_after_a_subcommand() {
+        assert!(Cli::try_parse_from(["tt", "list", "-p"]).is_err());
+    }
 }

@@ -123,6 +123,48 @@ fn collect_ids(value: &Value) -> Vec<String> {
 }
 
 #[test]
+fn projects_option_is_only_advertised_for_bare_tt() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tt"))
+        .args(["-p", "--help"])
+        .output()
+        .expect("run tt");
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("utf-8 help");
+    assert!(help.contains("-p, --projects"), "{help}");
+
+    for args in [
+        &["list", "--help"][..],
+        &["add", "--help"],
+        &["show", "--help"],
+        &["done", "--help"],
+        &["cancel", "--help"],
+        &["reopen", "--help"],
+        &["edit", "--help"],
+        &["project", "--help"],
+        &["project", "add", "--help"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_tt"))
+            .args(args)
+            .output()
+            .expect("run tt help");
+        assert!(output.status.success(), "{args:?}");
+        let help = String::from_utf8(output.stdout).expect("utf-8 help");
+        assert!(!help.contains("--projects"), "{args:?}: {help}");
+    }
+}
+
+#[test]
+fn projects_option_is_rejected_after_subcommand() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tt"))
+        .args(["list", "-p"])
+        .output()
+        .expect("run tt");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
+    assert!(stderr.contains("unexpected argument '-p'"), "{stderr}");
+}
+
+#[test]
 fn add_prints_task_json_and_writes_file() {
     let dir = tempfile::tempdir().expect("temp dir");
     let value = add_task(dir.path(), "A", &[]);
