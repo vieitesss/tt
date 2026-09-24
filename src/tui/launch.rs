@@ -331,29 +331,21 @@ impl Launch {
     }
 
     fn handle_launch_pick(&mut self, key: KeyEvent) {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Esc => self.leave_overlay(),
-            KeyCode::Enter => self.commit_pick(),
-            KeyCode::Down => self.move_pick(1),
-            KeyCode::Up => self.move_pick(-1),
-            KeyCode::Char('n') if control => self.move_pick(1),
-            KeyCode::Char('p') if control => self.move_pick(-1),
-            KeyCode::Backspace => {
-                if let LaunchState::Pick { query, picker, .. } = &mut self.state {
-                    query.pop();
-                    picker.highlight = 0;
-                }
-                self.error = None;
+        let count = match &self.state {
+            LaunchState::Pick { query, .. } => {
+                picker::project_matches(query, &self.config.projects).len()
             }
-            KeyCode::Char(character) if !control => {
-                if let LaunchState::Pick { query, picker, .. } = &mut self.state {
-                    query.push(character);
-                    picker.highlight = 0;
-                }
-                self.error = None;
-            }
-            _ => {}
+            _ => return,
+        };
+        let action = match &mut self.state {
+            LaunchState::Pick { query, picker, .. } => picker.handle_input(query, key, count),
+            _ => return,
+        };
+        match action {
+            picker::PickerInput::Cancel => self.leave_overlay(),
+            picker::PickerInput::Commit => self.commit_pick(),
+            picker::PickerInput::QueryChanged => self.error = None,
+            picker::PickerInput::Continue => {}
         }
     }
 
@@ -374,20 +366,6 @@ impl Launch {
                 self.error = None;
             }
             _ => {}
-        }
-    }
-
-    fn move_pick(&mut self, delta: isize) {
-        let LaunchState::Pick { query, .. } = &self.state else {
-            return;
-        };
-        let count = picker::project_matches(query, &self.config.projects).len();
-        if count == 0 {
-            return;
-        }
-        let last = count as isize - 1;
-        if let LaunchState::Pick { picker, .. } = &mut self.state {
-            picker.highlight = (picker.highlight as isize + delta).clamp(0, last) as usize;
         }
     }
 

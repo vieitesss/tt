@@ -2587,42 +2587,6 @@ fn search_arrows_move_the_highlight_before_enter() {
 }
 
 #[test]
-fn search_highlight_uses_arrows_and_ctrl_aliases() {
-    let (_dir, mut app) = setup();
-    let first = add_task(&mut app, "Foo one", None);
-    let second = add_task(&mut app, "Foo two", None);
-    app.refresh();
-
-    // Up and down arrows move the highlight.
-    app.handle_key(key(KeyCode::Char('/')));
-    for character in "foo".chars() {
-        app.handle_key(key(KeyCode::Char(character)));
-    }
-    app.handle_key(key(KeyCode::Down));
-    app.handle_key(key(KeyCode::Up));
-    assert_eq!(app.picker_highlight(), Some(0));
-
-    // ctrl-n is a down alias: it highlights the second match.
-    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
-    assert_eq!(app.picker_highlight(), Some(1));
-    app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.selected_id(), Some(second.clone()));
-
-    // ctrl-p is an up alias: down to the second match, ctrl-p back to the
-    // first, Enter selects the first.
-    app.selected = Some(second);
-    app.handle_key(key(KeyCode::Char('/')));
-    for character in "foo".chars() {
-        app.handle_key(key(KeyCode::Char(character)));
-    }
-    app.handle_key(key(KeyCode::Down));
-    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-    assert_eq!(app.picker_highlight(), Some(0));
-    app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.selected_id(), Some(first));
-}
-
-#[test]
 fn search_types_j_and_k_into_the_query() {
     let (_dir, mut app) = setup();
     let target = add_task(&mut app, "JK notes", None);
@@ -2691,6 +2655,46 @@ fn search_with_no_matches_stays_open_with_a_status() {
     assert!(
         footer_text(&app.status_line()).contains("no matches"),
         "{}",
+        footer_text(&app.status_line())
+    );
+}
+
+#[test]
+fn search_query_edit_clears_the_no_matches_status() {
+    let (_dir, mut app) = setup();
+    add_task(&mut app, "Foo", None);
+    app.refresh();
+
+    app.handle_key(key(KeyCode::Char('/')));
+    for character in "zzz".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    assert!(
+        footer_text(&app.status_line()).contains("no matches"),
+        "{}",
+        footer_text(&app.status_line())
+    );
+
+    // A further query edit clears the stale status rather than leaving it next
+    // to a changed query.
+    app.handle_key(key(KeyCode::Char('z')));
+    assert!(
+        !footer_text(&app.status_line()).contains("no matches"),
+        "typing clears the status: {}",
+        footer_text(&app.status_line())
+    );
+
+    app.handle_key(key(KeyCode::Enter));
+    assert!(
+        footer_text(&app.status_line()).contains("no matches"),
+        "{}",
+        footer_text(&app.status_line())
+    );
+    app.handle_key(key(KeyCode::Backspace));
+    assert!(
+        !footer_text(&app.status_line()).contains("no matches"),
+        "backspace clears the status: {}",
         footer_text(&app.status_line())
     );
 }
@@ -4645,6 +4649,22 @@ fn unregistered_launch_with_other() -> (tempfile::TempDir, Launch) {
     (dir, launch)
 }
 
+/// An unregistered launch question backed by a config with the given
+/// registered projects, so the project picker has candidates to navigate.
+fn launch_with_projects(projects: Vec<Project>) -> (tempfile::TempDir, Launch) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fresh = dir.path().join("fresh");
+    fs::create_dir_all(&fresh).expect("fresh");
+    let mut config = Config::default();
+    config.projects = projects;
+    let launch = Launch::new(
+        config,
+        Resolution::Unregistered { path: fresh },
+        dir.path().join("data"),
+    );
+    (dir, launch)
+}
+
 /// A nested-directory launch question backed by a real config in a temp dir.
 fn nested_launch() -> (tempfile::TempDir, Launch, PathBuf) {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -5397,6 +5417,107 @@ fn unregistered_p_binds_without_registering_cwd() {
         !config.projects.iter().any(|project| project.path == fresh),
         "cwd stayed unregistered"
     );
+}
+
+#[test]
+fn launch_project_picker_query_edits_filter_and_reset_the_highlight() {
+    let (_dir, mut launch) = launch_with_projects(vec![
+        project("/one", "alpha"),
+        project("/two", "beta"),
+        project("/three", "gamma"),
+    ]);
+    launch.handle_key(key(KeyCode::Char('p')));
+    let (query, highlight, matches) = launch.project_pick().expect("picker");
+    assert_eq!(query, "");
+    assert_eq!(highlight, 0);
+    assert_eq!(matches.len(), 3);
+
+    // Navigating away and then typing snaps the highlight back to the top of
+    // the narrowed list.
+    launch.handle_key(key(KeyCode::Down));
+    assert_eq!(launch.project_pick().expect("picker").1, 1);
+    launch.handle_key(key(KeyCode::Char('g')));
+    let (query, highlight, matches) = launch.project_pick().expect("picker");
+    assert_eq!(query, "g");
+    assert_eq!(highlight, 0, "a query edit resets the highlight");
+    assert_eq!(
+        matches.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(),
+        ["gamma"]
+    );
+
+    // Backspace widens the filter again and still keeps the highlight at the top.
+    launch.handle_key(key(KeyCode::Backspace));
+    let (query, highlight, matches) = launch.project_pick().expect("picker");
+    assert_eq!(query, "");
+    assert_eq!(highlight, 0);
+    assert_eq!(matches.len(), 3);
+
+    // Every printable character, including `j`/`k`, is query text rather than
+    // movement.
+    launch.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(launch.project_pick().expect("picker").0, "j");
+}
+
+#[test]
+fn launch_project_picker_arrows_and_ctrl_aliases_move_and_clamp_the_highlight() {
+    let (_dir, mut launch) = launch_with_projects(vec![
+        project("/one", "alpha"),
+        project("/two", "beta"),
+        project("/three", "gamma"),
+    ]);
+    launch.handle_key(key(KeyCode::Char('p')));
+
+    for (event, expected) in [
+        (key(KeyCode::Down), 1),
+        (key(KeyCode::Down), 2),
+        (key(KeyCode::Down), 2),
+        (key(KeyCode::Up), 1),
+        (KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL), 2),
+        (KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), 1),
+        (key(KeyCode::Up), 0),
+        (key(KeyCode::Up), 0),
+    ] {
+        launch.handle_key(event);
+        assert_eq!(launch.project_pick().expect("picker").1, expected);
+    }
+
+    // The clamp follows the live match count, not the full project list.
+    launch.handle_key(key(KeyCode::Char('g')));
+    launch.handle_key(key(KeyCode::Down));
+    assert_eq!(
+        launch.project_pick().expect("picker").1,
+        0,
+        "a single match cannot move the highlight"
+    );
+}
+
+#[test]
+fn launch_project_picker_no_match_enter_sets_error_and_a_query_edit_clears_it() {
+    let (_dir, mut launch) =
+        launch_with_projects(vec![project("/one", "alpha"), project("/two", "beta")]);
+    launch.handle_key(key(KeyCode::Char('p')));
+    for character in "zzz".chars() {
+        launch.handle_key(key(KeyCode::Char(character)));
+    }
+    assert!(launch.project_pick().expect("picker").2.is_empty());
+    launch.handle_key(key(KeyCode::Enter));
+    assert!(
+        launch.project_pick().is_some(),
+        "no match keeps the picker open"
+    );
+    assert_eq!(launch.overlay_error(), Some("no matching projects"));
+
+    // Typing clears the error even though the query still matches nothing.
+    launch.handle_key(key(KeyCode::Char('z')));
+    assert_eq!(launch.project_pick().expect("picker").0, "zzzz");
+    assert_eq!(launch.overlay_error(), None);
+
+    // Backspace is a query edit too.
+    launch.handle_key(key(KeyCode::Enter));
+    assert_eq!(launch.overlay_error(), Some("no matching projects"));
+    launch.handle_key(key(KeyCode::Backspace));
+    assert_eq!(launch.project_pick().expect("picker").0, "zzz");
+    assert_eq!(launch.overlay_error(), None);
 }
 
 #[test]

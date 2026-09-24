@@ -1123,51 +1123,24 @@ impl App {
         self.picker_popup(0).map_or(0, |popup| popup.entries.len())
     }
 
-    fn move_pick_highlight(&mut self, delta: isize) {
-        let count = self.pick_match_count();
-        if count == 0 {
-            return;
-        }
-        if let InputMode::Pick(picker) = &mut self.mode {
-            let last = count as isize - 1;
-            picker.highlight = (picker.highlight as isize + delta).clamp(0, last) as usize;
-        }
-    }
-
-    fn reset_pick_highlight(&mut self) {
-        if let InputMode::Pick(picker) = &mut self.mode {
-            picker.highlight = 0;
-        }
-    }
-
-    /// Route one key press to the open picker. The interaction is shared;
-    /// only Enter and Esc differ per kind, via [`App::commit_pick`] and
-    /// [`App::cancel_pick`].
+    /// Route shared picker transitions, then apply this client's Enter/Esc and
+    /// query-feedback policies.
     fn handle_pick(&mut self, key: KeyEvent) {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Esc => self.cancel_pick(),
-            KeyCode::Enter => self.commit_pick(),
-            KeyCode::Down => self.move_pick_highlight(1),
-            KeyCode::Up => self.move_pick_highlight(-1),
-            KeyCode::Char('n') if control => self.move_pick_highlight(1),
-            KeyCode::Char('p') if control => self.move_pick_highlight(-1),
-            KeyCode::Backspace => {
-                self.input.pop();
-                self.query_changed();
-            }
-            // Every printable character — including `j`/`k` — is part of the
-            // query; only the arrows and ctrl-n/ctrl-p move the highlight.
-            KeyCode::Char(character) if !control => {
-                self.input.push(character);
-                self.query_changed();
-            }
-            _ => {}
+        let count = self.pick_match_count();
+        let action = match &mut self.mode {
+            InputMode::Pick(picker) => picker.handle_input(&mut self.input, key, count),
+            _ => return,
+        };
+        match action {
+            picker::PickerInput::Cancel => self.cancel_pick(),
+            picker::PickerInput::Commit => self.commit_pick(),
+            picker::PickerInput::QueryChanged => self.query_changed(),
+            picker::PickerInput::Continue => {}
         }
     }
 
-    /// A query edit resets the highlight; search also clears any status
-    /// message so stale feedback never sits next to a changed query.
+    /// Search clears stale status feedback after a query edit; other picker
+    /// kinds leave client status policy unchanged.
     fn query_changed(&mut self) {
         if self
             .picker_kind()
@@ -1175,7 +1148,6 @@ impl App {
         {
             self.status = None;
         }
-        self.reset_pick_highlight();
     }
 
     /// Commit the open picker using its kind-specific action.

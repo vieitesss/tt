@@ -1,13 +1,13 @@
 //! One picker state machine for every type-to-filter TUI choice.
 //!
-//! All interactions are the same: type to filter, arrows (or
-//! `ctrl-n`/`ctrl-p`) to move a highlight, Enter to commit, Esc to cancel. The
-//! per-kind differences — the item source, what Enter does, and what Esc
-//! restores — live on [`PickerKind`] and in the commit/cancel handlers in
-//! [`super::app`].
+//! Query editing and highlight navigation are shared by every picker through
+//! [`Picker::handle_input`]. The per-kind differences — the item source, what
+//! Enter does, and what Esc restores — live on [`PickerKind`] and in the
+//! clients' commit/cancel handlers.
 
 use std::collections::BTreeSet;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tt::{
     path_display, PathDisplay, Priority, Project, TaskFilter, TaskId, TaskState, TreeNode, Vault,
 };
@@ -114,6 +114,19 @@ impl PickerKind {
     }
 }
 
+/// Result of reducing a key against the shared picker interaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PickerInput {
+    /// The owning client should apply its cancel policy.
+    Cancel,
+    /// The owning client should apply its commit policy.
+    Commit,
+    /// The query changed and client-specific feedback may need clearing.
+    QueryChanged,
+    /// Keep the picker open without changing its query.
+    Continue,
+}
+
 /// Highlight state for one open picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Picker {
@@ -127,6 +140,60 @@ impl Picker {
     /// Open a picker at the first match.
     pub(crate) fn new(kind: PickerKind) -> Self {
         Self { kind, highlight: 0 }
+    }
+
+    /// Apply the shared query-editing and highlight-navigation transitions.
+    /// `match_count` is the number of candidates for the current query, used
+    /// only to clamp navigation. Enter and Esc are returned to the client so
+    /// App and Launch can retain their own commit/cancel policy.
+    pub(crate) fn handle_input(
+        &mut self,
+        query: &mut String,
+        key: KeyEvent,
+        match_count: usize,
+    ) -> PickerInput {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => PickerInput::Cancel,
+            KeyCode::Enter => PickerInput::Commit,
+            KeyCode::Down => {
+                self.move_highlight(1, match_count);
+                PickerInput::Continue
+            }
+            KeyCode::Up => {
+                self.move_highlight(-1, match_count);
+                PickerInput::Continue
+            }
+            KeyCode::Char('n') if control => {
+                self.move_highlight(1, match_count);
+                PickerInput::Continue
+            }
+            KeyCode::Char('p') if control => {
+                self.move_highlight(-1, match_count);
+                PickerInput::Continue
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                self.highlight = 0;
+                PickerInput::QueryChanged
+            }
+            // Every printable character, including `j`/`k`, is query text;
+            // only arrows and ctrl-n/ctrl-p move the highlight.
+            KeyCode::Char(character) if !control => {
+                query.push(character);
+                self.highlight = 0;
+                PickerInput::QueryChanged
+            }
+            _ => PickerInput::Continue,
+        }
+    }
+
+    fn move_highlight(&mut self, delta: isize, match_count: usize) {
+        if match_count == 0 {
+            return;
+        }
+        let last = match_count as isize - 1;
+        self.highlight = (self.highlight as isize + delta).clamp(0, last) as usize;
     }
 }
 
@@ -409,5 +476,87 @@ fn collect_task_matches(
             }
         }
         collect_task_matches(&node.children, query, excluded, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Picker, PickerInput, PickerKind};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn input_edits_query_and_resets_highlight() {
+        let mut picker = Picker::new(PickerKind::Project);
+        let mut query = String::new();
+
+        assert_eq!(
+            picker.handle_input(&mut query, key(KeyCode::Char('j')), 3),
+            PickerInput::QueryChanged
+        );
+        assert_eq!(query, "j");
+        picker.highlight = 2;
+        assert_eq!(
+            picker.handle_input(&mut query, key(KeyCode::Backspace), 3),
+            PickerInput::QueryChanged
+        );
+        assert!(query.is_empty());
+        assert_eq!(picker.highlight, 0);
+
+        picker.highlight = 2;
+        assert_eq!(
+            picker.handle_input(&mut query, key(KeyCode::Char('k')), 3),
+            PickerInput::QueryChanged
+        );
+        assert_eq!(query, "k");
+        assert_eq!(picker.highlight, 0);
+    }
+
+    #[test]
+    fn input_moves_highlight_with_clamped_arrows_and_control_aliases() {
+        let mut picker = Picker::new(PickerKind::Project);
+        let mut query = String::new();
+
+        for (event, expected) in [
+            (key(KeyCode::Up), 0),
+            (key(KeyCode::Down), 1),
+            (KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL), 2),
+            (key(KeyCode::Down), 2),
+            (KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), 1),
+            (key(KeyCode::Up), 0),
+            (key(KeyCode::Up), 0),
+        ] {
+            assert_eq!(
+                picker.handle_input(&mut query, event, 3),
+                PickerInput::Continue
+            );
+            assert_eq!(picker.highlight, expected);
+        }
+
+        picker.highlight = 1;
+        picker.handle_input(&mut query, key(KeyCode::Down), 0);
+        assert_eq!(
+            picker.highlight, 1,
+            "empty results cannot move the highlight"
+        );
+    }
+
+    #[test]
+    fn input_returns_commit_and_cancel_for_client_policy() {
+        let mut picker = Picker::new(PickerKind::Project);
+        let mut query = "projects".to_owned();
+
+        assert_eq!(
+            picker.handle_input(&mut query, key(KeyCode::Enter), 1),
+            PickerInput::Commit
+        );
+        assert_eq!(
+            picker.handle_input(&mut query, key(KeyCode::Esc), 1),
+            PickerInput::Cancel
+        );
+        assert_eq!(query, "projects");
     }
 }
