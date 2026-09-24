@@ -37,8 +37,10 @@ registered project wins. Consequences:
 
 Paths:
 
-- Config/registry: `$TT_CONFIG`, else `$XDG_CONFIG_HOME/tt/config.toml`, else
-  `~/.config/tt/config.toml`. A missing config is fine; an invalid one is an error.
+- Config/registry: `$TT_CONFIG`, else `$XDG_DATA_HOME/tt/config.toml`
+  or `~/.local/share/tt/config.toml`. On first use, an existing legacy config at
+  `$XDG_CONFIG_HOME/tt/config.toml` (or `~/.config/tt/config.toml`) is migrated
+  if the shared registry is missing. `TT_CONFIG` disables implicit migration.
 - Store: `$XDG_DATA_HOME/tt/<slug>/`, else `~/.local/share/tt/<slug>/`.
 
 ```toml
@@ -49,7 +51,7 @@ style = "short"               # "home" | "short" | "tail"
 tail = 1
 
 [[project]]
-path = "/home/me/work/app"
+path = "~/work/app"
 slug = "app"
 never_ask_nested = false
 ```

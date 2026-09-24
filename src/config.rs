@@ -1,9 +1,8 @@
 //! Configuration file loading and atomic saving.
 //!
 //! The config file is TOML. Its location is `$TT_CONFIG` when set, otherwise
-//! `$XDG_CONFIG_HOME/tt/config.toml`, otherwise
-//! `$HOME/.config/tt/config.toml`. A missing file is fine; an unreadable or
-//! invalid file is an error.
+//! `config.toml` in the tt data directory. A missing file is fine; an unreadable
+//! or invalid file is an error.
 //!
 //! ```toml
 //! capture_target = "abc1234567" # optional default parent for quick capture
@@ -13,7 +12,7 @@
 //! tail = 1                      # segments kept when style = "tail"
 //!
 //! [[project]]
-//! path = "/home/me/work/app"
+//! path = "~/work/app"
 //! slug = "app"
 //! never_ask_nested = false
 //! ```
@@ -219,7 +218,46 @@ impl Config {
     /// Returns [`ConfigError`] when a config file exists but cannot be read,
     /// is not valid TOML, or has an invalid known key.
     pub fn load() -> Result<Self, ConfigError> {
-        Self::load_from(config_path())
+        let override_path = non_empty_env(CONFIG_ENV).map(PathBuf::from);
+        let path = crate::registry::data_dir().map(|dir| dir.join("config.toml"));
+        Self::load_selected(override_path, path, legacy_config_path())
+    }
+
+    fn load_selected(
+        override_path: Option<PathBuf>,
+        default_path: Option<PathBuf>,
+        legacy: Option<PathBuf>,
+    ) -> Result<Self, ConfigError> {
+        if let Some(path) = override_path {
+            return Self::load_from(Some(path));
+        }
+        let Some(path) = default_path else {
+            return Self::load_from(None);
+        };
+        Self::load_or_migrate(path, legacy)
+    }
+
+    fn load_or_migrate(path: PathBuf, legacy: Option<PathBuf>) -> Result<Self, ConfigError> {
+        if path.exists() {
+            return Self::load_from(Some(path));
+        }
+        let Some(legacy) = legacy.filter(|legacy| legacy.is_file()) else {
+            return Self::load_from(Some(path));
+        };
+        let config = Self::load_from(Some(legacy))?;
+        Self::finish_migration(config, path)
+    }
+
+    fn finish_migration(mut config: Self, path: PathBuf) -> Result<Self, ConfigError> {
+        config.path = Some(path.clone());
+        if config.save_new()? {
+            crate::registry::warn_nonportable_projects(&config.projects);
+            Ok(config)
+        } else {
+            // Another process created the shared config after our initial
+            // check. Its config is authoritative; never replace it with legacy.
+            Self::load_from(Some(path))
+        }
     }
 
     /// Load from an explicit location, or with no location at all.
@@ -284,6 +322,18 @@ impl Config {
     /// Returns [`ConfigError::NoConfigPath`] when the config has no location,
     /// or [`ConfigError::Io`] / [`ConfigError::Serialize`] on failure.
     pub fn save(&self) -> Result<(), ConfigError> {
+        let (path, text) = self.serialized()?;
+        crate::fsutil::write_atomic(&path, &text, true)
+            .map_err(|source| ConfigError::Io { path, source })
+    }
+
+    fn save_new(&self) -> Result<bool, ConfigError> {
+        let (path, text) = self.serialized()?;
+        crate::fsutil::write_atomic_new(&path, &text, true)
+            .map_err(|source| ConfigError::Io { path, source })
+    }
+
+    fn serialized(&self) -> Result<(PathBuf, String), ConfigError> {
         let Some(path) = &self.path else {
             return Err(ConfigError::NoConfigPath);
         };
@@ -297,17 +347,11 @@ impl Config {
             path: path.clone(),
             source,
         })?;
-        crate::fsutil::write_atomic(path, &text, true).map_err(|source| ConfigError::Io {
-            path: path.clone(),
-            source,
-        })
+        Ok((path.clone(), text))
     }
 }
 
-fn config_path() -> Option<PathBuf> {
-    if let Some(path) = non_empty_env(CONFIG_ENV) {
-        return Some(PathBuf::from(path));
-    }
+fn legacy_config_path() -> Option<PathBuf> {
     if let Some(xdg) = non_empty_env("XDG_CONFIG_HOME") {
         return Some(PathBuf::from(xdg).join("tt").join("config.toml"));
     }
@@ -317,6 +361,60 @@ fn config_path() -> Option<PathBuf> {
             .join("tt")
             .join("config.toml")
     })
+}
+
+fn encode_project_path(path: &Path) -> String {
+    encode_project_path_with_home(path, non_empty_env("HOME").map(PathBuf::from).as_deref())
+}
+
+fn encode_project_path_with_home(path: &Path, home: Option<&Path>) -> String {
+    if let Some(relative) = home.and_then(|home| path_relative_to_home(path, home)) {
+        return if relative.as_os_str().is_empty() {
+            "~".to_owned()
+        } else {
+            format!("~/{}", relative.to_string_lossy())
+        };
+    }
+    path.to_string_lossy().into_owned()
+}
+
+fn expand_project_path(path: &str) -> PathBuf {
+    expand_project_path_with_home(path, non_empty_env("HOME").map(PathBuf::from).as_deref())
+}
+
+pub(crate) fn canonicalize_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+pub(crate) fn path_is_under_home(path: &Path, home: &Path) -> bool {
+    path_relative_to_home(path, home).is_some()
+}
+
+fn path_relative_to_home(path: &Path, home: &Path) -> Option<PathBuf> {
+    let canonical_home = canonicalize_path(home);
+    if let Ok(canonical_path) = path.canonicalize() {
+        return canonical_path
+            .strip_prefix(canonical_home)
+            .ok()
+            .map(Path::to_path_buf);
+    }
+    path.strip_prefix(home)
+        .or_else(|_| path.strip_prefix(canonical_home))
+        .ok()
+        .map(Path::to_path_buf)
+}
+
+fn expand_project_path_with_home(path: &str, home: Option<&Path>) -> PathBuf {
+    if path == "~" || path.starts_with("~/") {
+        if let Some(home) = home {
+            return if path == "~" {
+                home.to_path_buf()
+            } else {
+                home.join(&path[2..])
+            };
+        }
+    }
+    PathBuf::from(path)
 }
 
 /// The legacy `vault` folder from `$TT_VAULT`, if set (empty counts as
@@ -443,7 +541,7 @@ fn parse_project(value: &toml::Value, path: &Path) -> Result<Project, ConfigErro
         return Err(invalid(path, "project", "expected a table"));
     };
     let project_path = match table.get("path") {
-        Some(toml::Value::String(text)) => PathBuf::from(text),
+        Some(toml::Value::String(text)) => expand_project_path(text),
         Some(_) => return Err(invalid(path, "project.path", "expected a string")),
         None => return Err(invalid(path, "project.path", "missing")),
     };
@@ -477,7 +575,7 @@ fn project_value(project: &Project) -> toml::Value {
     let mut table = toml::Table::new();
     table.insert(
         "path".to_owned(),
-        toml::Value::String(project.path.to_string_lossy().into_owned()),
+        toml::Value::String(encode_project_path(&project.path)),
     );
     table.insert("slug".to_owned(), toml::Value::String(project.slug.clone()));
     table.insert(
@@ -508,6 +606,27 @@ mod tests {
     }
 
     #[test]
+    fn home_project_paths_encode_and_expand_per_host() {
+        let old_home = Path::new("/old/home");
+        let new_home = Path::new("/new/home");
+        let encoded =
+            encode_project_path_with_home(Path::new("/old/home/work/app"), Some(old_home));
+        assert_eq!(encoded, "~/work/app");
+        assert_eq!(
+            expand_project_path_with_home(&encoded, Some(new_home)),
+            PathBuf::from("/new/home/work/app")
+        );
+        assert_eq!(
+            encode_project_path_with_home(Path::new("/outside/project"), Some(old_home)),
+            "/outside/project"
+        );
+        assert_eq!(
+            expand_project_path_with_home("/outside/project", Some(new_home)),
+            PathBuf::from("/outside/project")
+        );
+    }
+
+    #[test]
     fn missing_config_loads_defaults_and_remembers_its_path() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = temp_config(&dir);
@@ -519,6 +638,110 @@ mod tests {
         assert!(config.projects.is_empty());
         assert_eq!(config.path(), Some(path.as_path()));
         assert_eq!(Config::load_from(None).expect("no path").path(), None);
+    }
+
+    #[test]
+    fn explicit_config_override_skips_legacy_migration() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let override_path = dir.path().join("custom.toml");
+        let default_path = dir.path().join("shared").join("config.toml");
+        let legacy = dir.path().join("legacy").join("config.toml");
+        fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("mkdir");
+        fs::write(&legacy, r#"capture_target = "abc1234567""#).expect("legacy config");
+
+        let loaded = Config::load_selected(
+            Some(override_path.clone()),
+            Some(default_path.clone()),
+            Some(legacy),
+        )
+        .expect("load override");
+
+        assert_eq!(loaded.path(), Some(override_path.as_path()));
+        assert!(!default_path.exists());
+        assert!(loaded.capture_target.is_none());
+    }
+
+    #[test]
+    fn first_shared_load_migrates_legacy_preferences_and_never_overwrites_shared() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let legacy = dir.path().join("old").join("config.toml");
+        let shared = dir.path().join("data").join("tt").join("config.toml");
+        fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("mkdir");
+        fs::write(
+            &legacy,
+            r#"capture_target = "abc1234567"
+[[project]]
+path = "~/work/app"
+slug = "stable-slug"
+never_ask_nested = true
+"#,
+        )
+        .expect("write legacy config");
+
+        let migrated =
+            Config::load_or_migrate(shared.clone(), Some(legacy.clone())).expect("migrate");
+        assert_eq!(migrated.projects[0].slug, "stable-slug");
+        assert!(migrated.projects[0].never_ask_nested);
+        assert_eq!(
+            migrated.capture_target,
+            Some(TaskId::parse("abc1234567").expect("id"))
+        );
+        let migrated_text = fs::read_to_string(&shared).expect("shared config");
+        assert!(migrated_text.contains("~/work/app"));
+
+        fs::write(&shared, r#"capture_target = "def1234567""#).expect("replace shared");
+        let existing = Config::load_or_migrate(shared.clone(), Some(legacy)).expect("load shared");
+        assert_eq!(
+            existing.capture_target,
+            Some(TaskId::parse("def1234567").expect("id"))
+        );
+    }
+
+    #[test]
+    fn migration_collision_loads_the_config_created_by_the_racing_writer() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let legacy = dir.path().join("old.toml");
+        let shared = dir.path().join("data").join("config.toml");
+        fs::write(&legacy, r#"capture_target = "abc1234567""#).expect("legacy config");
+        let migrated = Config::load_from(Some(legacy)).expect("load legacy");
+
+        // Simulate the winner creating the shared config after the initial
+        // missing-file check, but before migration's atomic no-replace create.
+        fs::create_dir_all(shared.parent().expect("shared parent")).expect("mkdir");
+        fs::write(&shared, r#"capture_target = "def1234567""#).expect("winner config");
+
+        let loaded = Config::finish_migration(migrated, shared.clone()).expect("load winner");
+        assert_eq!(
+            loaded.capture_target,
+            Some(TaskId::parse("def1234567").expect("id"))
+        );
+        assert_eq!(loaded.path(), Some(shared.as_path()));
+        assert_eq!(
+            fs::read_to_string(shared).expect("read winner"),
+            r#"capture_target = "def1234567""#
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_path_under_symlinked_home_serializes_as_relative() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let actual_home = dir.path().join("real-home");
+        let home_alias = dir.path().join("home-alias");
+        let project_path = actual_home.join("work").join("app");
+        fs::create_dir_all(&project_path).expect("project dir");
+        symlink(&actual_home, &home_alias).expect("home symlink");
+
+        assert_eq!(
+            encode_project_path_with_home(&project_path, Some(&home_alias)),
+            "~/work/app"
+        );
+        assert_eq!(
+            encode_project_path_with_home(&home_alias.join("not-created"), Some(&home_alias)),
+            "~/not-created"
+        );
     }
 
     #[test]

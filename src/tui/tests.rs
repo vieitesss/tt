@@ -4726,6 +4726,8 @@ fn project_picker_lists_slugs_and_enter_switches_the_store() {
     // A second project with its own store.
     let store_root = tempfile::tempdir().expect("store root");
     let second_store = store_root.path().join("second");
+    let second_project = store_root.path().join("project");
+    fs::create_dir_all(&second_project).expect("create second project");
     let mut second_vault = Vault::open(&second_store).expect("open second vault");
     let second_task = second_vault
         .add(NewTask::new("Second project task"))
@@ -4741,7 +4743,7 @@ fn project_picker_lists_slugs_and_enter_switches_the_store() {
             never_ask_nested: false,
         },
         Project {
-            path: PathBuf::from("/elsewhere/second"),
+            path: second_project,
             slug: "second".to_owned(),
             never_ask_nested: false,
         },

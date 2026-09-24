@@ -15,10 +15,11 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-
 use thiserror::Error;
 
-use crate::config::{non_empty_env, Config, ConfigError, Project};
+use crate::config::{
+    canonicalize_path, non_empty_env, path_is_under_home, Config, ConfigError, Project,
+};
 use crate::vault::{Vault, VaultError};
 
 /// Environment variable naming the XDG data directory.
@@ -79,8 +80,18 @@ pub fn store_path(data_dir: &Path, slug: &str) -> PathBuf {
 ///
 /// # Errors
 ///
-/// Returns [`VaultError::Io`] when the store folder cannot be created or read.
+/// Returns [`VaultError::Io`] when the registered project directory is
+/// missing or the store folder cannot be created or read.
 pub fn open_store(data_dir: &Path, project: &Project) -> Result<Vault, VaultError> {
+    if !project.path.is_dir() {
+        return Err(VaultError::Io {
+            path: project.path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "registered project directory is missing",
+            ),
+        });
+    }
     Vault::open(store_path(data_dir, &project.slug))
 }
 
@@ -121,7 +132,13 @@ pub fn register_in(
     data_dir: &Path,
 ) -> Result<Project, RegistryError> {
     let path = normalize(path);
-    if let Some(existing) = config.projects.iter().find(|project| project.path == path) {
+    // Existing entries may predate canonicalization (for example a `~/` path
+    // expanded against a symlinked `$HOME`), so compare canonical forms.
+    if let Some(existing) = config
+        .projects
+        .iter()
+        .find(|project| normalize(&project.path) == path)
+    {
         return Ok(existing.clone());
     }
 
@@ -142,6 +159,7 @@ pub fn register_in(
         slug,
         never_ask_nested: false,
     };
+    warn_nonportable_projects(std::slice::from_ref(&project));
     config.projects.push(project.clone());
     Ok(project)
 }
@@ -182,10 +200,11 @@ pub fn register_and_save_in(
 ///
 /// Returns [`ConfigError`] when the config cannot be written.
 pub fn set_never_ask(config: &mut Config, project: &Project) -> Result<(), ConfigError> {
+    let path = normalize(&project.path);
     if let Some(entry) = config
         .projects
         .iter_mut()
-        .find(|entry| entry.path == project.path)
+        .find(|entry| normalize(&entry.path) == path)
     {
         entry.never_ask_nested = true;
         config.save()?;
@@ -199,7 +218,7 @@ pub fn remove(config: &mut Config, path: &Path) -> Option<Project> {
     let index = config
         .projects
         .iter()
-        .position(|project| project.path == path)?;
+        .position(|project| normalize(&project.path) == path)?;
     Some(config.projects.remove(index))
 }
 
@@ -210,6 +229,33 @@ pub fn remove_slug(config: &mut Config, slug: &str) -> Option<Project> {
         .iter()
         .position(|project| project.slug == slug)?;
     Some(config.projects.remove(index))
+}
+
+pub(crate) fn warn_nonportable_projects(projects: &[Project]) {
+    let Some(home) = non_empty_env("HOME").map(PathBuf::from) else {
+        return;
+    };
+    for path in nonportable_paths(projects, &home) {
+        eprintln!(
+            "warning: project path {} is outside HOME and will not be portable",
+            path.display()
+        );
+    }
+}
+
+fn nonportable_paths(projects: &[Project], home: &Path) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    projects
+        .iter()
+        .filter_map(|project| {
+            let path = canonicalize_path(&project.path);
+            (is_nonportable_path(&path, Some(home)) && seen.insert(path.clone())).then_some(path)
+        })
+        .collect()
+}
+
+fn is_nonportable_path(path: &Path, home: Option<&Path>) -> bool {
+    home.is_some_and(|home| !path_is_under_home(path, home))
 }
 
 /// Slug candidates: the directory name, then `-2`, `-3`, ... until neither a
@@ -241,6 +287,56 @@ mod tests {
     }
 
     #[test]
+    fn paths_outside_home_are_nonportable_but_home_paths_are_not() {
+        let home = Path::new("/home/user");
+        assert!(!is_nonportable_path(
+            Path::new("/home/user/work"),
+            Some(home)
+        ));
+        assert!(!is_nonportable_path(home, Some(home)));
+        assert!(is_nonportable_path(Path::new("/srv/work"), Some(home)));
+        assert!(!is_nonportable_path(Path::new("/srv/work"), None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonportable_warnings_cover_distinct_paths_and_resolve_home_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let actual_home = dir.path().join("real-home");
+        let home_alias = dir.path().join("home-alias");
+        let portable = actual_home.join("work");
+        let portable_alias = home_alias.join("not-created");
+        let outside_one = dir.path().join("outside-one");
+        let outside_two = dir.path().join("outside-two");
+        fs::create_dir_all(&portable).expect("portable project");
+        fs::create_dir_all(&outside_one).expect("outside project");
+        fs::create_dir_all(&outside_two).expect("outside project");
+        symlink(&actual_home, &home_alias).expect("home symlink");
+        let project = |path: PathBuf| Project {
+            path,
+            slug: "slug".to_owned(),
+            never_ask_nested: false,
+        };
+
+        let warnings = nonportable_paths(
+            &[
+                project(portable.clone()),
+                project(portable_alias),
+                project(outside_one.clone()),
+                project(outside_two.clone()),
+                project(outside_one.clone()),
+            ],
+            &home_alias,
+        );
+        assert_eq!(
+            warnings,
+            vec![normalize(&outside_one), normalize(&outside_two)]
+        );
+    }
+
+    #[test]
     fn slug_collisions_get_numeric_suffixes() {
         let root = tempfile::tempdir().expect("temp dir");
         let data = root.path().join("data");
@@ -257,6 +353,23 @@ mod tests {
         assert!(data.join("pkg-2").is_dir(), "second store dir created");
         assert!(first.path.is_absolute(), "absolute path stored");
         assert_eq!(config.projects.len(), 2);
+    }
+
+    #[test]
+    fn missing_registered_project_is_not_recreated_or_removed() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let data = root.path().join("data");
+        let missing_path = root.path().join("missing-project");
+        let project = Project {
+            path: missing_path.clone(),
+            slug: "stable-slug".to_owned(),
+            never_ask_nested: true,
+        };
+        let config = Config::with_projects(vec![project.clone()]);
+
+        assert!(open_store(&data, &project).is_err());
+        assert!(!data.join("stable-slug").exists());
+        assert_eq!(config.projects, vec![project]);
     }
 
     #[test]
@@ -284,6 +397,35 @@ mod tests {
 
         assert_eq!(first, again);
         assert_eq!(config.projects.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registering_under_symlinked_home_is_idempotent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let data = root.path().join("data");
+        let actual_home = root.path().join("real-home");
+        let home_alias = root.path().join("home-alias");
+        let target = actual_home.join("pkg");
+        fs::create_dir_all(&target).expect("project dir");
+        symlink(&actual_home, &home_alias).expect("home symlink");
+
+        // A `~/pkg` entry loaded against a symlinked `$HOME` keeps the alias,
+        // while registration canonicalizes the incoming path.
+        let existing = Project {
+            path: home_alias.join("pkg"),
+            slug: "pkg".to_owned(),
+            never_ask_nested: false,
+        };
+        let mut config = Config::with_projects(vec![existing.clone()]);
+
+        let registered = register_in(&mut config, &target, &data).expect("register");
+
+        assert_eq!(registered, existing, "returns the existing entry");
+        assert_eq!(config.projects.len(), 1, "no duplicate registered");
+        assert!(!data.join("pkg-2").exists(), "no duplicate store folder");
     }
 
     #[test]
@@ -343,6 +485,45 @@ mod tests {
         let reloaded = Config::load_from(Some(config_path)).expect("reload");
         assert_eq!(reloaded.projects.len(), 1);
         assert!(reloaded.projects[0].never_ask_nested, "saved by the facade");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_symlink_aliases_can_be_removed_and_set_never_ask() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let actual_home = root.path().join("real-home");
+        let home_alias = root.path().join("home-alias");
+        let target = actual_home.join("pkg");
+        let config_path = root.path().join("tt").join("config.toml");
+        fs::create_dir_all(&target).expect("project dir");
+        symlink(&actual_home, &home_alias).expect("home symlink");
+        let alias_project = Project {
+            path: home_alias.join("pkg"),
+            slug: "pkg".to_owned(),
+            never_ask_nested: false,
+        };
+        let mut config = Config::load_from(Some(config_path.clone())).expect("load config");
+        config.projects.push(alias_project);
+
+        let project = Project {
+            path: normalize(&target),
+            slug: "pkg".to_owned(),
+            never_ask_nested: false,
+        };
+        set_never_ask(&mut config, &project).expect("set never ask through alias");
+        assert!(config.projects[0].never_ask_nested);
+        let reloaded = Config::load_from(Some(config_path)).expect("reload");
+        assert!(reloaded.projects[0].never_ask_nested);
+
+        assert_eq!(
+            remove(&mut config, &target)
+                .expect("remove through alias")
+                .slug,
+            "pkg"
+        );
+        assert!(config.projects.is_empty());
     }
 
     #[test]

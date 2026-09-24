@@ -17,16 +17,12 @@ _Avoid_: Note, item, entry, todo — a "group" is a Task with sub-tasks, and a
 Project is something else entirely.
 
 **Project**:
-A directory the user works in, registered with `tt`. Running `tt` anywhere
-inside a project resolves to it, and its tasks live in that project's Store.
+A directory the user works in, registered with `tt`. Paths under HOME are recorded with `~/` notation and interpreted per machine; absolute paths outside HOME are allowed but nonportable. Running `tt` anywhere inside a project resolves to it, and its tasks live in that project's Store.
 Projects are the unit of scoping: one store, one task tree, one TUI session.
 _Avoid_: vault, workspace, repo, folder
 
 **Registry**:
-The mapping in the config file (`~/.config/tt/config.toml`) from registered
-project paths to store slugs, plus per-project never-ask rules and display
-settings. Rewrites are atomic and preserve unknown keys; users rarely edit it
-by hand.
+The shared mapping of Project paths to Store slugs, alongside project preferences. It lives alongside Stores in the tt data root (`$XDG_DATA_HOME/tt/config.toml` or `~/.local/share/tt/config.toml`); `TT_CONFIG` can override its location.
 _Avoid_: index, database
 
 **Store**:

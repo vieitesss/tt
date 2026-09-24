@@ -46,6 +46,40 @@ pub(crate) fn write_atomic(path: &Path, contents: &str, create_parents: bool) ->
     Ok(())
 }
 
+/// Atomically create `path` without replacing it. Returns `false` if another
+/// writer already created the target.
+pub(crate) fn write_atomic_new(
+    path: &Path,
+    contents: &str,
+    create_parents: bool,
+) -> io::Result<bool> {
+    let folder = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().and_then(OsStr::to_str).unwrap_or("file");
+    let temp_path = folder.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        random_suffix()
+    ));
+
+    let outcome = (|| -> io::Result<bool> {
+        if create_parents {
+            fs::create_dir_all(folder)?;
+        }
+        let mut file = File::create(&temp_path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        match fs::hard_link(&temp_path, path) {
+            Ok(()) => Ok(true),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(source) => Err(source),
+        }
+    })();
+
+    let _ = fs::remove_file(&temp_path);
+    outcome
+}
+
 fn random_suffix() -> String {
     let mut rng = rand::thread_rng();
     (0..6)

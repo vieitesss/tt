@@ -1,8 +1,9 @@
 # Project-centric central store and list-first TUI
 
 `tt` v2 pivots from "one vault you point at" to **projects**: a project is a
-directory the user already works in, registered in `~/.config/tt/config.toml`,
-and its tasks live in an invisible central store
+directory the user already works in, registered in the shared config (default
+`$XDG_DATA_HOME/tt/config.toml`, else `~/.local/share/tt/config.toml`; overridden
+by `$TT_CONFIG`), with its tasks in an invisible central store
 (`$XDG_DATA_HOME/tt/<slug>/`, else `~/.local/share/tt/<slug>/`). Resolution
 walks up from `--path`/`$TT_PATH`/cwd and takes the nearest registered project;
 an unregistered directory can be registered on first use, and a directory
