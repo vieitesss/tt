@@ -12,6 +12,7 @@
 //! is `--projects`: skip those questions and pick a project.
 
 mod app;
+mod clipboard;
 mod keymap;
 mod launch;
 mod list;

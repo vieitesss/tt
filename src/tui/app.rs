@@ -454,6 +454,14 @@ impl App {
 
     /// Route one key press to the active mode.
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
+        self.handle_key_with(key, super::clipboard::copy);
+    }
+
+    pub(super) fn handle_key_with(
+        &mut self,
+        key: KeyEvent,
+        copy: impl FnOnce(&str) -> std::io::Result<()>,
+    ) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             self.should_quit = true;
             return;
@@ -490,7 +498,7 @@ impl App {
             return;
         }
         match self.mode {
-            InputMode::Navigate => self.handle_list(key),
+            InputMode::Navigate => self.handle_list_with(key, copy),
             InputMode::Add { .. }
             | InputMode::Capture
             | InputMode::Rename { .. }
@@ -632,7 +640,7 @@ impl App {
     /// The list is the only main view. `j`/`k` (and the arrows) walk the
     /// flattened tree in order, `gg`/`G` jump to the ends, and the task
     /// hotkeys operate on the selection.
-    fn handle_list(&mut self, key: KeyEvent) {
+    fn handle_list_with(&mut self, key: KeyEvent, copy: impl FnOnce(&str) -> std::io::Result<()>) {
         let was_pending_g = std::mem::take(&mut self.pending_g);
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
@@ -669,6 +677,7 @@ impl App {
             KeyCode::Char('d') => self.start_delete(),
             KeyCode::Char('L') => self.start_create_link(),
             KeyCode::Char('r') => self.start_rename(),
+            KeyCode::Char('y') => self.copy_selected_task_with(copy),
             KeyCode::Char('e') | KeyCode::Enter => self.start_edit(),
             KeyCode::Char('/') => self.start_search(),
             KeyCode::Char('p') => self.start_project_pick(),
@@ -1255,6 +1264,47 @@ impl App {
         self.input.clear();
         self.select_id(selected);
         self.status = None;
+    }
+
+    pub(super) fn copy_selected_task_with(
+        &mut self,
+        copy: impl FnOnce(&str) -> std::io::Result<()>,
+    ) {
+        let Some(id) = self.selected.as_ref() else {
+            self.set_toast("no task selected");
+            return;
+        };
+        let Some(task) = self.vault.get(id) else {
+            self.set_toast("task not found");
+            return;
+        };
+        let project_path = self
+            .project
+            .as_ref()
+            .map_or_else(|| self.vault.root(), |project| project.path.as_path());
+        let paths = std::fs::canonicalize(project_path).and_then(|project| {
+            let task_path = std::fs::canonicalize(self.vault.root().join(id.file_name()))?;
+            Ok((project, task_path))
+        });
+        let (project_path, task_path) = match paths {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.set_toast(format!("error: {error}"));
+                return;
+            }
+        };
+        let metadata = format!(
+            "Project path: {}\nTask file: {}\nID: {}\nTitle: {}\nState: {}",
+            project_path.display(),
+            task_path.display(),
+            task.id,
+            task.title,
+            task.state
+        );
+        match copy(&metadata) {
+            Ok(()) => self.set_toast(format!("copied task {}", task.id)),
+            Err(error) => self.set_toast(format!("clipboard error: {error}")),
+        }
     }
 
     /// Request the external editor for the selected task (`e`/`Enter`).

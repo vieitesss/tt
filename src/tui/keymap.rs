@@ -43,6 +43,7 @@ pub(crate) const KEYMAP_GROUPS: &[KeymapGroup] = &[
             ("t", "edit tags"),
             ("J / K", "move among siblings"),
             ("r", "rename"),
+            ("y", "copy task metadata"),
             ("e / Enter", "edit in $EDITOR"),
             ("m", "move marked"),
             ("d", "delete marked"),

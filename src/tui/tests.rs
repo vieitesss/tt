@@ -3617,6 +3617,52 @@ fn keymap_scroll_is_modal_and_clamped() {
 }
 
 #[test]
+fn y_key_copies_task_metadata_for_registered_project_and_reports_clipboard_failure() {
+    let (dir, mut app) = setup();
+    let workspace = dir.path().join("workspace");
+    fs::create_dir(&workspace).expect("registered project directory");
+    app.project = Some(project(
+        workspace.to_str().expect("workspace path"),
+        "workspace",
+    ));
+    let id = add_task(&mut app, "Copy this", None);
+    app.refresh();
+
+    let copied = std::cell::RefCell::new(String::new());
+    app.handle_key_with(key(KeyCode::Char('y')), |text| {
+        *copied.borrow_mut() = text.to_owned();
+        Ok(())
+    });
+
+    let task_path = dir.path().join(id.file_name());
+    let expected = format!(
+        "Project path: {}\nTask file: {}\nID: {}\nTitle: Copy this\nState: open",
+        workspace
+            .canonicalize()
+            .expect("absolute registered project path")
+            .display(),
+        task_path
+            .canonicalize()
+            .expect("absolute task path")
+            .display(),
+        id
+    );
+    assert_eq!(*copied.borrow(), expected);
+    assert_eq!(
+        app.toast.as_ref().expect("success toast").text,
+        format!("copied task {id}")
+    );
+
+    app.handle_key_with(key(KeyCode::Char('y')), |_| {
+        Err(std::io::Error::other("clipboard unavailable"))
+    });
+    assert_eq!(
+        app.toast.as_ref().expect("failure toast").text,
+        "clipboard error: clipboard unavailable"
+    );
+}
+
+#[test]
 fn keymap_overlay_shows_grouped_bindings_and_close_hint() {
     let (_dir, mut app) = setup();
     add_task(&mut app, "Only", None);
@@ -3630,6 +3676,8 @@ fn keymap_overlay_shows_grouped_bindings_and_close_hint() {
         "j / k",
         "move selection (also up/down arrows)",
         "Tasks",
+        "y",
+        "copy task metadata",
         "Jump",
         "Vault",
         "g ?",
