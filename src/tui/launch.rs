@@ -165,7 +165,7 @@ impl Launch {
         Some((
             query.as_str(),
             picker.highlight,
-            picker::project_matches(query, &self.config.projects),
+            picker::project_matches(query, &self.config.projects, self.path_display()),
         ))
     }
 
@@ -313,7 +313,7 @@ impl Launch {
             };
             return;
         }
-        let matches = picker::project_matches("", &self.config.projects);
+        let matches = picker::project_matches("", &self.config.projects, &self.config.path_display);
         let highlight = current
             .and_then(|current| {
                 matches
@@ -334,7 +334,8 @@ impl Launch {
     fn handle_launch_pick(&mut self, key: KeyEvent) {
         let count = match &self.state {
             LaunchState::Pick { query, .. } => {
-                picker::project_matches(query, &self.config.projects).len()
+                picker::project_matches(query, &self.config.projects, &self.config.path_display)
+                    .len()
             }
             _ => return,
         };
@@ -380,7 +381,8 @@ impl Launch {
         let LaunchState::Pick { query, picker, .. } = &self.state else {
             return;
         };
-        let matches = picker::project_matches(query, &self.config.projects);
+        let matches =
+            picker::project_matches(query, &self.config.projects, &self.config.path_display);
         if matches.is_empty() {
             self.error = Some("no matching projects".to_owned());
             return;

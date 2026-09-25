@@ -895,7 +895,11 @@ impl App {
 
     /// Registered projects matching the live query (all of them when empty).
     pub(crate) fn project_matches(&self) -> Vec<Project> {
-        picker::project_matches(&self.input, &self.config.projects)
+        picker::project_matches(
+            &self.input,
+            &self.config.projects,
+            &self.config.path_display,
+        )
     }
 
     fn commit_project_pick(&mut self) {

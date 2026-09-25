@@ -6,6 +6,8 @@
 //! clients' commit/cancel handlers.
 
 use std::collections::BTreeSet;
+use std::env;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tt::{
@@ -352,23 +354,60 @@ fn collect_search_matches(nodes: &[TreeNode<'_>], query: &str, matches: &mut Vec
     }
 }
 
-/// Registered projects matching `query` over slug or path (all of them when
-/// the query is empty).
-pub(crate) fn project_matches(query: &str, projects: &[Project]) -> Vec<Project> {
+/// Registered projects matching `query` over slug or the path as it is shown
+/// in the picker, best match first (all of them in config order when the
+/// query is empty).
+///
+/// Ties are broken by config order rather than by path, so the ranking is
+/// stable and predictable.
+///
+/// Matches are ranked: exact slug, slug prefix, slug substring, then a
+/// substring of the displayed path. Matching the displayed path (with `$HOME`
+/// collapsed to `~`) keeps the username in a raw absolute path from matching
+/// every project.
+pub(crate) fn project_matches(
+    query: &str,
+    projects: &[Project],
+    display: &PathDisplay,
+) -> Vec<Project> {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    project_matches_with_home(query, projects, display, home.as_deref())
+}
+
+/// [`project_matches`] with an explicit home directory, for tests.
+fn project_matches_with_home(
+    query: &str,
+    projects: &[Project],
+    display: &PathDisplay,
+    home: Option<&Path>,
+) -> Vec<Project> {
     let query = query.trim().to_lowercase();
-    projects
+    if query.is_empty() {
+        return projects.to_vec();
+    }
+    let mut matches: Vec<(u8, Project)> = projects
         .iter()
-        .filter(|project| {
-            query.is_empty()
-                || project.slug.to_lowercase().contains(&query)
-                || project
-                    .path
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .contains(&query)
+        .filter_map(|project| {
+            let slug = project.slug.to_lowercase();
+            let rank = if slug == query {
+                0
+            } else if slug.starts_with(&query) {
+                1
+            } else if slug.contains(&query) {
+                2
+            } else if path_display::shorten_with_home(&project.path, display, home)
+                .to_lowercase()
+                .contains(&query)
+            {
+                3
+            } else {
+                return None;
+            };
+            Some((rank, project.clone()))
         })
-        .cloned()
-        .collect()
+        .collect();
+    matches.sort_by_key(|(rank, _)| *rank);
+    matches.into_iter().map(|(_, project)| project).collect()
 }
 
 /// Minimum path cells reserved in a project row, so long slugs yield space to
@@ -486,8 +525,18 @@ fn collect_task_matches(
 
 #[cfg(test)]
 mod tests {
-    use super::{Picker, PickerInput, PickerKind};
+    use super::{project_matches_with_home, Picker, PickerInput, PickerKind};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::path::{Path, PathBuf};
+    use tt::{PathDisplay, Project};
+
+    fn project(path: &str, slug: &str) -> Project {
+        Project {
+            path: PathBuf::from(path),
+            slug: slug.to_owned(),
+            never_ask_nested: false,
+        }
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -581,5 +630,70 @@ mod tests {
             PickerInput::Cancel
         );
         assert_eq!(query, "projects");
+    }
+
+    #[test]
+    fn project_matches_ranks_the_exact_slug_above_home_path_matches() {
+        // Every path lives under a home directory whose name contains `rp`
+        // (`vieitesrpi`). Matching the raw path would leave the `rp` project
+        // last; collapsing home to `~` removes the false positives.
+        let home = Path::new("/home/vieitesrpi");
+        let display = PathDisplay::default();
+        let projects = vec![
+            project("/home/vieitesrpi/personal/tt-3", "tt-3"),
+            project("/home/vieitesrpi/personal/dotfiles", "dotfiles"),
+            project(
+                "/home/vieitesrpi/personal/prefapp-backstage",
+                "prefapp-backstage",
+            ),
+            project("/home/vieitesrpi/personal/gitops-k8s", "gitops-k8s"),
+            project("/home/vieitesrpi/personal/agent-radar", "agent-radar"),
+            project("/home/vieitesrpi/personal/contx", "contx"),
+            project("/home/vieitesrpi/personal/rp", "rp"),
+        ];
+
+        let matches = project_matches_with_home("rp", &projects, &display, Some(home));
+
+        assert_eq!(
+            matches.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(),
+            ["rp"],
+            "home is collapsed so only the real rp project matches"
+        );
+    }
+
+    #[test]
+    fn project_matches_ranks_exact_then_prefix_then_substring() {
+        let display = PathDisplay::default();
+        let projects = vec![
+            project("/xapp", "xapp"),
+            project("/apple", "apple"),
+            project("/app", "app"),
+        ];
+
+        let matches = project_matches_with_home("app", &projects, &display, None);
+
+        assert_eq!(
+            matches.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(),
+            ["app", "apple", "xapp"],
+            "exact beats prefix beats substring, config order as tie-breaker"
+        );
+    }
+
+    #[test]
+    fn project_matches_empty_query_keeps_config_order() {
+        let display = PathDisplay::default();
+        let projects = vec![
+            project("/one", "gamma"),
+            project("/two", "alpha"),
+            project("/three", "beta"),
+        ];
+
+        let matches = project_matches_with_home("   ", &projects, &display, None);
+
+        assert_eq!(
+            matches.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(),
+            ["gamma", "alpha", "beta"],
+            "an empty query lists every project in config order"
+        );
     }
 }
