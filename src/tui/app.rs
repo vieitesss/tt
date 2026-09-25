@@ -23,7 +23,7 @@ use tt::{
 
 use super::keymap::{keymap_columns, keymap_content_lines, keymap_content_width, keymap_geometry};
 use super::list::TaskList;
-use super::picker::{self, FilterChoice, FilterCriterion, Picker, PickerKind};
+use super::picker::{self, FilterChoice, FilterCriterion, MoveChoice, Picker, PickerKind};
 use super::text::pop_word;
 
 /// How often the event loop wakes to check for external changes.
@@ -84,7 +84,7 @@ const SELECTION_HINTS: &[Hint] = &[
     },
     Hint {
         key: "m",
-        label: "move",
+        label: "move tasks",
     },
     Hint {
         key: "d",
@@ -246,7 +246,7 @@ pub(crate) enum Prompt {
     /// Typing the first tag when the vault has no defined tags yet.
     Tag,
     /// A picker's own prompt prefix.
-    Picker(&'static str),
+    Picker(String),
 }
 
 /// A picker's popup content, ready for [`super::ui`] to draw.
@@ -321,6 +321,9 @@ pub(crate) struct App {
     /// Data directory the project stores live under; `None` disables the
     /// project picker with a status message.
     pub(crate) store_root: Option<PathBuf>,
+    /// Destination project and Store while the cross-project move picker is
+    /// choosing a parent.
+    move_destination: Option<(Project, Vault)>,
     /// Set by `e`/`Enter`: the task file the event loop should open in
     /// `$EDITOR` after the current key press is handled. `handle_key` never
     /// spawns a process, so tests can assert the request directly.
@@ -366,6 +369,7 @@ impl App {
             project,
             config,
             store_root,
+            move_destination: None,
             pending_edit: None,
             pending_g: false,
             watcher,
@@ -564,7 +568,7 @@ impl App {
             )),
             Prompt::Rename => Some("rename to: ".to_owned()),
             Prompt::Tag => Some("tag: ".to_owned()),
-            Prompt::Picker(prompt) => Some(prompt.to_owned()),
+            Prompt::Picker(prompt) => Some(prompt),
         }
     }
 
@@ -1048,6 +1052,9 @@ impl App {
         self.input.clear();
         self.status = None;
         let held_reload = kind.holds_buffer();
+        if matches!(&kind, PickerKind::MoveParent { .. }) {
+            self.move_destination = None;
+        }
         if let PickerKind::Search { previous: Some(id) } = kind {
             self.selected = Some(id);
         }
@@ -1080,11 +1087,25 @@ impl App {
                 .map(|id| self.resolve_title(id))
                 .collect(),
             PickerKind::Move { .. } => self
-                .move_matches()
+                .move_choices()
+                .iter()
+                .map(|choice| match choice {
+                    MoveChoice::Parent(None) => "⌂ root".to_owned(),
+                    MoveChoice::Parent(Some(id)) => self.resolve_title(id),
+                    MoveChoice::OtherProject => "⇄ another project…".to_owned(),
+                })
+                .collect(),
+            PickerKind::MoveProject { .. } => picker::project_rows(
+                &self.move_project_matches(),
+                &self.config.path_display,
+                row_width,
+            ),
+            PickerKind::MoveParent { .. } => self
+                .move_parent_matches()
                 .iter()
                 .map(|target| match target {
                     None => "⌂ root".to_owned(),
-                    Some(id) => self.resolve_title(id),
+                    Some(id) => self.move_parent_title(id),
                 })
                 .collect(),
             PickerKind::Priority => self
@@ -1165,6 +1186,8 @@ impl App {
             PickerKind::Project => self.commit_project_pick(),
             PickerKind::Link { .. } => self.commit_link_pick(),
             PickerKind::Move { .. } => self.commit_move_pick(),
+            PickerKind::MoveProject { .. } => self.commit_move_project_pick(),
+            PickerKind::MoveParent { .. } => self.commit_move_parent_pick(),
             PickerKind::Priority => self.commit_priority_pick(),
             PickerKind::Tags => self.commit_tag_pick(),
             PickerKind::Filter => self.commit_filter_pick(),
@@ -1635,28 +1658,77 @@ impl App {
         }
     }
 
-    /// Start the move picker (`m`) for the active selection set.
+    /// Start the move picker (`m`) for the top-level tasks in the active
+    /// selection set. Selecting an ancestor already moves its whole subtree.
     fn start_move_pick(&mut self) {
-        let ids = self.action_ids();
-        if ids.is_empty() {
+        let moving = move_roots(&self.vault, &self.action_ids());
+        if moving.is_empty() {
             return;
         }
-        self.mode = InputMode::Pick(Picker::new(PickerKind::Move { moving: ids }));
+        self.move_destination = None;
+        self.mode = InputMode::Pick(Picker::new(PickerKind::Move { moving }));
         self.input.clear();
         self.status = None;
     }
 
-    /// Move targets matching the live query: the root entry, then every task
-    /// outside the moving set and its descendants.
-    pub(crate) fn move_matches(&self) -> Vec<Option<TaskId>> {
+    /// Move targets in the current Project, optionally followed by the route
+    /// to another registered Project.
+    pub(crate) fn move_choices(&self) -> Vec<MoveChoice> {
         let Some(PickerKind::Move { moving }) = self.picker_kind() else {
             return Vec::new();
         };
-        picker::move_matches(&self.input, &self.vault, moving)
+        picker::move_choices(
+            &self.input,
+            &self.vault,
+            moving,
+            !self.other_move_projects().is_empty(),
+        )
     }
 
-    /// Commit the move picker: reparent every moving task to the highlighted
-    /// target, unfold the new parent, and select the first moved task.
+    /// Registered projects other than the current Project, matching the live
+    /// query. A `--vault` session has no current registry entry to exclude.
+    pub(crate) fn move_project_matches(&self) -> Vec<Project> {
+        picker::project_matches(
+            &self.input,
+            &self.other_move_projects(),
+            &self.config.path_display,
+        )
+    }
+
+    fn other_move_projects(&self) -> Vec<Project> {
+        self.config
+            .projects
+            .iter()
+            .filter(|destination| {
+                !self.project.as_ref().is_some_and(|current| {
+                    destination.slug == current.slug
+                        || registry::normalize(&destination.path)
+                            == registry::normalize(&current.path)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Parent candidates in the selected destination Project.
+    pub(crate) fn move_parent_matches(&self) -> Vec<Option<TaskId>> {
+        let Some(PickerKind::MoveParent { moving, .. }) = self.picker_kind() else {
+            return Vec::new();
+        };
+        let Some((_, vault)) = &self.move_destination else {
+            return Vec::new();
+        };
+        picker::move_matches(&self.input, vault, moving)
+    }
+
+    fn move_parent_title(&self, id: &TaskId) -> String {
+        self.move_destination
+            .as_ref()
+            .and_then(|(_, vault)| vault.get(id))
+            .map_or_else(|| format!("{id} (missing)"), |task| task.title.clone())
+    }
+
+    /// Commit the in-project move picker or advance to registered projects.
     fn commit_move_pick(&mut self) {
         let Some(highlight) = self.picker_highlight() else {
             return;
@@ -1664,11 +1736,22 @@ impl App {
         let Some(PickerKind::Move { moving }) = self.picker_kind().cloned() else {
             return;
         };
-        let matches = self.move_matches();
-        if matches.is_empty() {
+        let choices = self.move_choices();
+        if choices.is_empty() {
             return;
         }
-        let target = matches[highlight.min(matches.len() - 1)].clone();
+        match choices[highlight.min(choices.len() - 1)].clone() {
+            MoveChoice::OtherProject => {
+                self.mode = InputMode::Pick(Picker::new(PickerKind::MoveProject { moving }));
+                self.input.clear();
+                self.status = None;
+            }
+            MoveChoice::Parent(target) => self.commit_in_project_move(moving, target),
+        }
+    }
+
+    fn commit_in_project_move(&mut self, moving: Vec<TaskId>, target: Option<TaskId>) {
+        let count = moving.len() + self.vault.descendant_count(&moving);
         for id in &moving {
             if let Err(error) = self.vault.set_parent(id, target.as_ref()) {
                 self.mode = InputMode::Navigate;
@@ -1684,12 +1767,108 @@ impl App {
         if let Some(first) = moving.first().cloned() {
             self.select_id(first);
         }
-        let count = moving.len();
         self.set_toast(format!(
             "moved {count} {}",
             if count == 1 { "task" } else { "tasks" }
         ));
         self.marked.clear();
+    }
+
+    /// Choose a different registered Project and open its Store for the final
+    /// parent/root choice.
+    fn commit_move_project_pick(&mut self) {
+        let Some(highlight) = self.picker_highlight() else {
+            return;
+        };
+        let Some(PickerKind::MoveProject { moving }) = self.picker_kind().cloned() else {
+            return;
+        };
+        let projects = self.move_project_matches();
+        if projects.is_empty() {
+            self.set_toast("no matching projects");
+            return;
+        }
+        let project = projects[highlight.min(projects.len() - 1)].clone();
+        let Some(root) = self.store_root.clone() else {
+            self.mode = InputMode::Navigate;
+            self.input.clear();
+            self.set_toast("no data directory is available");
+            return;
+        };
+        match registry::open_store(&root, &project) {
+            Ok(vault) => {
+                self.move_destination = Some((project.clone(), vault));
+                self.mode =
+                    InputMode::Pick(Picker::new(PickerKind::MoveParent { moving, project }));
+                self.input.clear();
+                self.status = None;
+            }
+            Err(error) => {
+                self.move_destination = None;
+                self.mode = InputMode::Navigate;
+                self.input.clear();
+                self.set_toast(format!("error: {error}"));
+            }
+        }
+    }
+
+    /// Commit the destination parent/root choice, moving the whole subtree and
+    /// switching the list to the destination Project on success.
+    fn commit_move_parent_pick(&mut self) {
+        let Some(highlight) = self.picker_highlight() else {
+            return;
+        };
+        let Some(PickerKind::MoveParent { moving, .. }) = self.picker_kind().cloned() else {
+            return;
+        };
+        let matches = self.move_parent_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let parent = matches[highlight.min(matches.len() - 1)].clone();
+        let Some((project, mut target)) = self.move_destination.take() else {
+            self.mode = InputMode::Navigate;
+            self.input.clear();
+            self.set_toast("move destination is unavailable");
+            return;
+        };
+        if let Err(error) = target.reload() {
+            self.mode = InputMode::Navigate;
+            self.input.clear();
+            self.refresh();
+            self.set_toast(format!("error: {error}"));
+            return;
+        }
+        let outcome = match self.vault.move_to(&mut target, &moving, parent.as_ref()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.mode = InputMode::Navigate;
+                self.input.clear();
+                self.refresh();
+                self.set_toast(format!("error: {error}"));
+                return;
+            }
+        };
+
+        let count = outcome.tasks.len();
+        let slug = project.slug.clone();
+        self.vault = target;
+        self.watcher = self.vault.watch().ok();
+        self.project = Some(project);
+        self.mode = InputMode::Navigate;
+        self.input.clear();
+        self.status = None;
+        self.active_filter = None;
+        self.collapsed.clear();
+        self.marked.clear();
+        self.selected = outcome.roots.first().cloned();
+        self.list_scroll = 0;
+        self.external_change_pending = false;
+        self.refresh();
+        self.set_toast(format!(
+            "moved {count} {} to {slug}",
+            if count == 1 { "task" } else { "tasks" }
+        ));
     }
 
     /// `d`: ask before deleting the active selection (or the cursor task
@@ -1989,6 +2168,27 @@ impl App {
             None => "root".to_owned(),
         }
     }
+}
+
+/// Keep selected tasks that are not descendants of another selected task, in
+/// the caller's order. A move always carries each retained task's full subtree.
+fn move_roots(vault: &Vault, ids: &[TaskId]) -> Vec<TaskId> {
+    let requested: BTreeSet<TaskId> = ids.iter().cloned().collect();
+    let mut seen = BTreeSet::new();
+    ids.iter()
+        .filter(|id| vault.get(id).is_some() && seen.insert((*id).clone()))
+        .filter(|id| {
+            let mut ancestor = vault.parent(id);
+            while let Some(parent) = ancestor {
+                if requested.contains(parent) {
+                    return false;
+                }
+                ancestor = vault.parent(parent);
+            }
+            true
+        })
+        .cloned()
+        .collect()
 }
 
 /// Append the ids of `nodes` and their descendants that are in `wanted`, in

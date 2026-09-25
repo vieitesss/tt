@@ -140,6 +140,7 @@ fn projects_option_is_only_advertised_for_bare_tt() {
         &["cancel", "--help"],
         &["reopen", "--help"],
         &["edit", "--help"],
+        &["move", "--help"],
         &["project", "--help"],
         &["project", "add", "--help"],
     ] {
@@ -752,6 +753,393 @@ fn nested_add_in_json_mode_uses_the_parent_project_without_prompting() {
         2,
         "both tasks live in the parent store"
     );
+}
+
+#[test]
+fn move_reparents_a_subtree_within_the_current_project() {
+    let sandbox = Sandbox::new();
+    run_json(sandbox.command().args(["--json", "project", "add"]));
+    let parent = run_json(
+        sandbox
+            .command()
+            .args(["--json", "add", "--title", "New parent"]),
+    );
+    let parent_id = id_of(&parent);
+    let moving = run_json(
+        sandbox
+            .command()
+            .args(["--json", "add", "--title", "Moving root"]),
+    );
+    let moving_id = id_of(&moving);
+    let child = run_json(
+        sandbox
+            .command()
+            .args(["--json", "add", "--title", "Child", "--parent", &moving_id]),
+    );
+    let child_id = id_of(&child);
+
+    let moved = run_json(
+        sandbox
+            .command()
+            .args(["--json", "move", &moving_id, "--parent", &parent_id]),
+    );
+
+    assert_eq!(moved["target_project"]["slug"], "project");
+    assert_eq!(
+        moved["target_project"]["path"],
+        sandbox
+            .project
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    let tasks = moved["tasks"].as_array().expect("moved task array");
+    assert_eq!(tasks.len(), 2, "include the whole moved subtree");
+    let moved_root = tasks
+        .iter()
+        .find(|task| task["id"] == moving_id)
+        .expect("moved root in output");
+    let moved_child = tasks
+        .iter()
+        .find(|task| task["id"] == child_id)
+        .expect("descendant in output");
+    assert_eq!(moved_root["parent"], parent_id);
+    assert_eq!(moved_child["parent"], moving_id);
+
+    let shown = run_json(sandbox.command().args(["--json", "show", &moving_id]));
+    assert_eq!(shown["parent"], parent_id);
+    let tree = run_json(sandbox.command().args(["--json", "list"]));
+    let parent_node = tree["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == parent_id)
+        .expect("destination remains root");
+    assert_eq!(parent_node["children"][0]["id"], moving_id);
+    assert_eq!(parent_node["children"][0]["children"][0]["id"], child_id);
+}
+
+#[test]
+fn move_makes_a_task_a_root_within_the_current_project() {
+    let sandbox = Sandbox::new();
+    run_json(sandbox.command().args(["--json", "project", "add"]));
+    let parent = run_json(
+        sandbox
+            .command()
+            .args(["--json", "add", "--title", "Old parent"]),
+    );
+    let parent_id = id_of(&parent);
+    let moving = run_json(sandbox.command().args([
+        "--json",
+        "add",
+        "--title",
+        "Moving root",
+        "--parent",
+        &parent_id,
+    ]));
+    let moving_id = id_of(&moving);
+
+    let moved = run_json(
+        sandbox
+            .command()
+            .args(["--json", "move", &moving_id, "--root"]),
+    );
+
+    assert_eq!(moved["target_project"]["slug"], "project");
+    let tasks = moved["tasks"].as_array().expect("moved task array");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["id"], moving_id);
+    assert!(tasks[0]["parent"].is_null());
+    let shown = run_json(sandbox.command().args(["--json", "show", &moving_id]));
+    assert!(shown["parent"].is_null());
+    let old_parent = run_json(sandbox.command().args(["--json", "show", &parent_id]));
+    assert_eq!(old_parent["children"], serde_json::json!([]));
+}
+
+#[test]
+fn move_rejects_reparenting_under_its_own_descendant() {
+    let sandbox = Sandbox::new();
+    run_json(sandbox.command().args(["--json", "project", "add"]));
+    let root = run_json(sandbox.command().args(["--json", "add", "--title", "Root"]));
+    let root_id = id_of(&root);
+    let child = run_json(
+        sandbox
+            .command()
+            .args(["--json", "add", "--title", "Child", "--parent", &root_id]),
+    );
+    let child_id = id_of(&child);
+
+    let output = sandbox
+        .command()
+        .args(["--json", "move", &root_id, "--parent", &child_id])
+        .output()
+        .expect("run invalid move");
+
+    assert_eq!(output.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error JSON");
+    assert!(error["error"]
+        .as_str()
+        .expect("error string")
+        .contains("cannot parent itself or a descendant"));
+    let shown = run_json(sandbox.command().args(["--json", "show", &root_id]));
+    assert!(
+        shown["parent"].is_null(),
+        "failed move leaves task unchanged"
+    );
+}
+
+#[test]
+fn move_requires_exactly_one_of_parent_and_root_without_a_destination() {
+    let sandbox = Sandbox::new();
+    for (args, expected_error) in [
+        (
+            vec![
+                "--json",
+                "move",
+                "task000001",
+                "--parent",
+                "parent0001",
+                "--root",
+            ],
+            "cannot be used with",
+        ),
+        (vec!["--json", "move", "task000001"], "required arguments"),
+    ] {
+        let output = sandbox
+            .command()
+            .args(args)
+            .output()
+            .expect("run invalid move");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty(), "usage errors are not JSON");
+        let stderr = String::from_utf8(output.stderr).expect("usage stderr");
+        assert!(stderr.contains(expected_error), "{stderr}");
+        assert!(stderr.contains("Usage:"), "{stderr}");
+    }
+}
+
+#[test]
+fn move_by_registered_path_moves_a_subtree_and_keeps_links_in_the_json_contract() {
+    let sandbox = Sandbox::new();
+    run_json(sandbox.command().args(["--json", "project", "add"]));
+    let target_project = sandbox.root().join("target");
+    fs::create_dir_all(&target_project).expect("target project directory");
+    run_json(
+        sandbox
+            .command()
+            .args(["--json", "project", "add"])
+            .arg(&target_project),
+    );
+    let destination_parent = run_json(
+        sandbox
+            .command()
+            .args(["--json", "--path"])
+            .arg(&target_project)
+            .args(["add", "--title", "Destination parent"]),
+    );
+    let destination_parent_id = id_of(&destination_parent);
+    let root = run_json(sandbox.command().args([
+        "--json",
+        "add",
+        "--title",
+        "Moving root",
+        "--body",
+        &format!("See [[{destination_parent_id}.md|Destination parent]]"),
+    ]));
+    let root_id = id_of(&root);
+    let child = run_json(
+        sandbox
+            .command()
+            .args(["--json", "add", "--title", "Child", "--parent", &root_id]),
+    );
+    let child_id = id_of(&child);
+    let bystander = run_json(
+        sandbox
+            .command()
+            .args(["--json", "add", "--title", "Bystander"]),
+    );
+    let bystander_id = id_of(&bystander);
+    let source_store = sandbox.store_dir("project");
+    append_body(
+        &source_store,
+        &bystander_id,
+        &format!("See [[{root_id}.md|Moving root]]"),
+    );
+
+    let moved = run_json(
+        sandbox
+            .command()
+            .args(["--json", "move", &root_id, "--to-project"])
+            .arg(&target_project)
+            .args(["--parent", &destination_parent_id]),
+    );
+
+    assert_eq!(moved["target_project"]["slug"], "target");
+    assert_eq!(
+        moved["target_project"]["path"],
+        target_project
+            .canonicalize()
+            .expect("canonical target")
+            .to_string_lossy()
+            .as_ref()
+    );
+    let tasks = moved["tasks"].as_array().expect("moved task array");
+    assert_eq!(tasks.len(), 2);
+    let moved_root = tasks
+        .iter()
+        .find(|task| task["id"] == root_id)
+        .expect("moved root in output");
+    let moved_child = tasks
+        .iter()
+        .find(|task| task["id"] == child_id)
+        .expect("moved child in output");
+    assert_eq!(moved_root["parent"], destination_parent_id);
+    assert!(moved_root["rank"].is_null(), "the moved root is unranked");
+    assert_eq!(moved_child["parent"], root_id);
+
+    let shown = run_json(
+        sandbox
+            .command()
+            .args(["--json", "--path"])
+            .arg(&target_project)
+            .args(["show", &root_id]),
+    );
+    assert_eq!(
+        shown["body"],
+        format!("See [[{destination_parent_id}.md|Destination parent]]")
+    );
+    assert_eq!(shown["links"], serde_json::json!([destination_parent_id]));
+    let source_link = run_json(sandbox.command().args(["--json", "show", &bystander_id]));
+    assert_eq!(
+        source_link["body"],
+        format!("See [[{root_id}.md|Moving root]]")
+    );
+    assert_eq!(source_link["links"], serde_json::json!([root_id]));
+    let remaining = run_json(sandbox.command().args(["--json", "list", "--flat"]));
+    assert_eq!(collect_ids(&remaining), vec![bystander_id]);
+    assert!(!source_store.join(format!("{root_id}.md")).exists());
+    assert!(sandbox
+        .store_dir("target")
+        .join(format!("{root_id}.md"))
+        .is_file());
+}
+
+#[test]
+fn move_to_the_current_project_reparents_instead_of_refusing() {
+    let sandbox = Sandbox::new();
+    run_json(sandbox.command().args(["--json", "project", "add"]));
+    let parent = run_json(
+        sandbox
+            .command()
+            .args(["--json", "add", "--title", "Parent"]),
+    );
+    let parent_id = id_of(&parent);
+    let moving = run_json(
+        sandbox
+            .command()
+            .args(["--json", "add", "--title", "Moving"]),
+    );
+    let moving_id = id_of(&moving);
+
+    let moved = run_json(
+        sandbox
+            .command()
+            .args(["--json", "move", &moving_id, "--to-project"])
+            .arg(&sandbox.project)
+            .args(["--parent", &parent_id]),
+    );
+
+    assert_eq!(moved["target_project"]["slug"], "project");
+    assert_eq!(moved["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(moved["tasks"][0]["parent"], parent_id);
+    let shown = run_json(sandbox.command().args(["--json", "show", &moving_id]));
+    assert_eq!(shown["parent"], parent_id);
+}
+
+#[test]
+fn move_requires_a_registered_destination_and_accepts_a_slug() {
+    let sandbox = Sandbox::new();
+    run_json(sandbox.command().args(["--json", "project", "add"]));
+    let task = run_json(
+        sandbox
+            .command()
+            .args(["--json", "add", "--title", "Keep me"]),
+    );
+    let id = id_of(&task);
+    let unregistered = sandbox.root().join("unregistered");
+    fs::create_dir_all(&unregistered).expect("unregistered target");
+    let unregistered_path = unregistered.to_string_lossy().into_owned();
+
+    let output = sandbox
+        .command()
+        .args([
+            "--json",
+            "move",
+            &id,
+            "--to-project",
+            unregistered_path.as_str(),
+        ])
+        .output()
+        .expect("run rejected move");
+    assert_eq!(output.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&output.stdout).expect("error JSON");
+    assert!(error["error"]
+        .as_str()
+        .expect("error string")
+        .contains("not a registered project"));
+    assert!(sandbox
+        .store_dir("project")
+        .join(format!("{id}.md"))
+        .is_file());
+
+    let target_project = sandbox.root().join("target");
+    fs::create_dir_all(&target_project).expect("target directory");
+    run_json(
+        sandbox
+            .command()
+            .args(["--json", "project", "add"])
+            .arg(&target_project),
+    );
+    let collision_path = sandbox.store_dir("target").join(format!("{id}.md"));
+    fs::write(
+        &collision_path,
+        format!("---\nid: {id}\ntitle: Existing target\nstate: open\n---\n"),
+    )
+    .expect("write target collision");
+    let collision = sandbox
+        .command()
+        .args(["--json", "move", &id, "--to-project", "target"])
+        .output()
+        .expect("run colliding move");
+    assert_eq!(collision.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&collision.stdout).expect("collision JSON error");
+    assert!(error["error"]
+        .as_str()
+        .expect("error string")
+        .contains("already exists"));
+    assert!(sandbox
+        .store_dir("project")
+        .join(format!("{id}.md"))
+        .is_file());
+    fs::remove_file(&collision_path).expect("remove target collision");
+
+    let moved = run_json(sandbox.command().args([
+        "--json",
+        "move",
+        &id,
+        "--to-project",
+        "target",
+        "--root",
+    ]));
+    assert_eq!(moved["target_project"]["slug"], "target");
+    assert_eq!(moved["tasks"].as_array().expect("tasks").len(), 1);
+    assert!(moved["tasks"][0]["parent"].is_null());
+    assert!(moved["tasks"][0]["rank"].is_null());
+    assert!(!sandbox
+        .store_dir("project")
+        .join(format!("{id}.md"))
+        .exists());
 }
 
 #[test]

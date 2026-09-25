@@ -9,10 +9,11 @@ is a list.
 
 **Task**:
 The fundamental unit of the app. Every node in the system is a Task. A Task has
-a title, a state, and may have sub-tasks, links, and tags. Deleting a Task
-deletes its whole subtree: descendants are never reparented or kept alive, so
-keeping them means moving them out first with `m`; `[[id]]` links to the
-deleted Task are left dangling.
+a title, a state, and may have sub-tasks, links, and tags. Moving a Task with
+`m` carries its whole subtree, keeping descendants attached and preserving
+every Identity. Deleting a Task deletes its whole subtree: descendants are
+never reparented or kept alive, so keeping them means moving them out first
+with `m`; `[[id]]` links to the deleted Task are left dangling.
 _Avoid_: Note, item, entry, todo — a "group" is a Task with sub-tasks, and a
 Project is something else entirely.
 
@@ -131,11 +132,18 @@ present (relative due, priority, `done/total` rollup); parents also carry a
 fold marker. Selection is linear (`j`/`k`, `gg`/`G`); `J`/`K` change the
 cursor Task's Rank among its siblings (never across sibling groups, and
 disabled while a Filter is active), and `Tab` adds
-rows to a multi-selection; `/` searches titles, `p` switches projects, and
-`o` jumps through the selected task's links. While anything is marked, `m`
-moves the marked tasks under another task (or the root) and `d` deletes them
-and all their descendants after a confirmation; `r` renames the cursor task
-from a prefilled prompt and cascades mirror aliases in the same action.
+rows to a multi-selection; `/` searches titles, `p` switches Projects, and
+`o` jumps through the selected Task's links. `m` moves the selected subtree
+within this Project or into another registered Project; when anything is
+marked, it moves each marked subtree and an ancestor mark subsumes its marked
+descendants. CLI `tt move` supports the same in-Project reparenting with
+`--parent` or `--root`; `--to-project` moves into a registered Project, and a
+destination resolving to the current Project uses in-Project reparenting. A TUI
+move into another Project can choose a parent there or its root, then switches
+the List to that Project. `d` deletes the selection (or every
+marked Task) and all its descendants after a confirmation; `r` renames the
+cursor Task from a prefilled prompt and cascades mirror aliases in the same
+action.
 Subtrees can be collapsed in memory (`h`/`l`); folds are visual only, never
 persisted, and never hide a
 search or link target. No

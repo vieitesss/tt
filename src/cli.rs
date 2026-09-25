@@ -50,6 +50,8 @@ pub(crate) enum Command {
     Reopen(IdArgs),
     /// Rename a task, or open its file in `$EDITOR`.
     Edit(EditArgs),
+    /// Reparent a task or move its subtree to another project.
+    Move(MoveArgs),
     /// List, add, or remove registered projects.
     Project(ProjectArgs),
 }
@@ -112,6 +114,31 @@ pub(crate) struct IdArgs {
     /// Task id.
     #[arg(value_name = "ID")]
     id: String,
+}
+
+/// `tt move <ID> [--to-project DIR|SLUG] [--parent ID|--root]`
+#[derive(Debug, Args)]
+pub(crate) struct MoveArgs {
+    /// Task id whose subtree will move.
+    #[arg(value_name = "ID")]
+    id: String,
+
+    /// Registered destination project directory or slug.
+    #[arg(long, value_name = "DIR|SLUG")]
+    to_project: Option<String>,
+
+    /// Parent task id; within the current project or in the destination project.
+    #[arg(
+        long,
+        value_name = "ID",
+        conflicts_with = "root",
+        required_unless_present_any = ["to_project", "root"]
+    )]
+    parent: Option<String>,
+
+    /// Make the task a root task.
+    #[arg(long, conflicts_with = "parent")]
+    root: bool,
 }
 
 /// `tt edit <ID>`
@@ -267,6 +294,7 @@ fn execute(cli: &Cli) -> Result<()> {
         Some(Command::Cancel(args)) => set_state(&mut vault, args, TaskState::Cancelled, json),
         Some(Command::Reopen(args)) => set_state(&mut vault, args, TaskState::Open, json),
         Some(Command::Edit(args)) => edit(&mut vault, args, json),
+        Some(Command::Move(args)) => move_tasks(&mut vault, &config, args, json),
         Some(Command::Project(_)) | None => {
             unreachable!("the TUI and project commands are handled before opening a vault")
         }
@@ -609,6 +637,118 @@ fn edit(vault: &mut Vault, args: &EditArgs, json: bool) -> Result<()> {
     print_task(task, json, "edited")
 }
 
+fn move_tasks(source: &mut Vault, config: &Config, args: &MoveArgs, json: bool) -> Result<()> {
+    let id = parse_id(&args.id)?;
+    let parent = if args.root {
+        None
+    } else {
+        args.parent.as_deref().map(parse_id).transpose()?
+    };
+
+    let Some(raw_project) = args.to_project.as_deref() else {
+        let project = project_for_store(config, source)?;
+        return move_within_project(source, &id, parent.as_ref(), &project, json);
+    };
+
+    let project = registered_project(config, raw_project)?;
+    let mut target = open_store(&project)?;
+    if source.root() == target.root() {
+        return move_within_project(source, &id, parent.as_ref(), &project, json);
+    }
+    for issue in target.issues() {
+        eprintln!("warning: {issue}");
+    }
+
+    let outcome = source
+        .move_to(&mut target, std::slice::from_ref(&id), parent.as_ref())
+        .context("moving the task subtree")?;
+    if json {
+        print_json(&MoveJson {
+            tasks: outcome.tasks.iter().map(TaskJson::new).collect(),
+            target_project: project_ref(&project),
+        })
+    } else {
+        print_move_summary(outcome.tasks.len(), &project.slug);
+        Ok(())
+    }
+}
+
+fn move_within_project(
+    vault: &mut Vault,
+    id: &TaskId,
+    parent: Option<&TaskId>,
+    project: &Project,
+    json: bool,
+) -> Result<()> {
+    vault
+        .set_parent(id, parent)
+        .context("moving the task subtree")?;
+    let mut ids = vec![id.clone()];
+    let mut index = 0;
+    while index < ids.len() {
+        ids.extend(vault.children(&ids[index]).iter().cloned());
+        index += 1;
+    }
+    ids.sort();
+    let tasks: Vec<_> = ids
+        .iter()
+        .filter_map(|id| vault.get(id))
+        .map(TaskJson::new)
+        .collect();
+    if json {
+        print_json(&MoveJson {
+            tasks,
+            target_project: project_ref(project),
+        })
+    } else {
+        print_move_summary(ids.len(), &project.slug);
+        Ok(())
+    }
+}
+
+fn print_move_summary(count: usize, slug: &str) {
+    println!(
+        "moved {} {} to {}",
+        count,
+        if count == 1 { "task" } else { "tasks" },
+        slug
+    );
+}
+
+fn project_ref(project: &Project) -> ProjectRefJson {
+    ProjectRefJson {
+        path: project.path.to_string_lossy().into_owned(),
+        slug: project.slug.clone(),
+    }
+}
+
+fn project_for_store(config: &Config, vault: &Vault) -> Result<Project> {
+    let data = registry::data_dir().context("cannot determine the data directory")?;
+    config
+        .projects
+        .iter()
+        .find(|project| {
+            registry::normalize(&registry::store_path(&data, &project.slug))
+                == registry::normalize(vault.root())
+        })
+        .cloned()
+        .context("the current store is not a registered project")
+}
+
+/// Resolve a move destination by registered slug or normalized project path.
+fn registered_project(config: &Config, raw: &str) -> Result<Project> {
+    if let Some(project) = config.projects.iter().find(|project| project.slug == raw) {
+        return Ok(project.clone());
+    }
+    let path = registry::normalize(Path::new(raw));
+    config
+        .projects
+        .iter()
+        .find(|project| registry::normalize(&project.path) == path)
+        .cloned()
+        .with_context(|| format!("not a registered project: {raw}"))
+}
+
 fn parse_id(raw: &str) -> Result<TaskId> {
     TaskId::parse(raw).with_context(|| format!("invalid task id: {raw}"))
 }
@@ -824,6 +964,13 @@ struct ProjectsJson {
 struct ProjectRefJson {
     path: String,
     slug: String,
+}
+
+/// `tt move` payload.
+#[derive(Debug, Serialize)]
+struct MoveJson {
+    tasks: Vec<TaskJson>,
+    target_project: ProjectRefJson,
 }
 
 /// `tt project remove` payload.

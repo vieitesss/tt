@@ -45,7 +45,7 @@ pub(crate) const KEYMAP_GROUPS: &[KeymapGroup] = &[
             ("r", "rename"),
             ("y", "copy task metadata"),
             ("e / Enter", "edit in $EDITOR"),
-            ("m", "move marked"),
+            ("m", "move marked subtrees within/across Projects"),
             ("d", "delete marked"),
             ("L", "add link"),
             ("f", "filter list"),

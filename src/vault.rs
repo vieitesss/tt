@@ -44,6 +44,39 @@ pub enum VaultError {
         /// Rejected parent.
         parent: TaskId,
     },
+    /// A task id already exists in the target Store.
+    #[error("task id {id} already exists in the target store (target_written={target_written})")]
+    IdCollision {
+        /// Conflicting identity.
+        id: TaskId,
+        /// Tasks safely copied to the target before a concurrent collision.
+        target_written: usize,
+    },
+    /// Source and target are the same Store.
+    #[error("source and target are the same store")]
+    SameStore,
+    /// A cross-Store move failed after starting its target-first commit.
+    #[error("partial move (target_written={target_written}, source_removed={source_removed}) at {path}: {source}")]
+    PartialMove {
+        /// Tasks safely written to the target Store.
+        target_written: usize,
+        /// Tasks removed from the source Store after all target writes.
+        source_removed: usize,
+        /// File operation or source verification that failed.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A source task file no longer contains a valid task document.
+    #[error("cannot move task file at {path}: {source}")]
+    InvalidTaskFile {
+        /// Source file whose contents could not be parsed.
+        path: PathBuf,
+        /// Parse failure in the current on-disk contents.
+        #[source]
+        source: ParseError,
+    },
     /// A filesystem operation failed.
     #[error("filesystem error at {path}: {source}")]
     Io {
@@ -200,6 +233,15 @@ pub enum ShiftOutcome {
 pub struct DeleteOutcome {
     /// Task files that were removed, descendants included.
     pub deleted: usize,
+}
+
+/// Result of moving task subtrees between Stores.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoveOutcome {
+    /// Every moved task in id order, with moved roots updated for the target.
+    pub tasks: Vec<Task>,
+    /// Requested tasks that were not covered by a selected ancestor, in input order.
+    pub roots: Vec<TaskId>,
 }
 
 /// Result of changing a task title.
@@ -792,6 +834,195 @@ impl Vault {
             self.persist_ranks(&remaining)?;
         }
         self.cloned(id)
+    }
+
+    /// Move task subtrees from this Store into `target`.
+    ///
+    /// Requested tasks covered by another requested ancestor are deduplicated.
+    /// Every moved root receives `new_parent` (or becomes a root) and has its
+    /// rank cleared; descendants keep their parent pointers and ranks. Ids,
+    /// bodies, links, and all other task data are preserved. Target files are
+    /// created atomically without replacement before any source file is
+    /// removed, so a failure or concurrent source edit can leave duplicates
+    /// but never lose a task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::Io`] if a source file cannot be read,
+    /// [`VaultError::NotFound`] for an unknown source task or target parent,
+    /// [`VaultError::InvalidTaskFile`] if a source file no longer parses,
+    /// [`VaultError::IdCollision`] if any id already exists in the target,
+    /// [`VaultError::SameStore`] when both vaults refer to one Store, or
+    /// [`VaultError::PartialMove`] if a filesystem operation fails or a source
+    /// changes after target copies are written.
+    pub fn move_to(
+        &mut self,
+        target: &mut Vault,
+        ids: &[TaskId],
+        new_parent: Option<&TaskId>,
+    ) -> Result<MoveOutcome, VaultError> {
+        let same_canonical_root = fs::canonicalize(&self.root)
+            .ok()
+            .zip(fs::canonicalize(&target.root).ok())
+            .is_some_and(|(source, destination)| source == destination);
+        if self.root == target.root || same_canonical_root {
+            return Err(VaultError::SameStore);
+        }
+
+        let mut requested = BTreeSet::new();
+        for id in ids {
+            self.cloned(id)?;
+            requested.insert(id.clone());
+        }
+        if requested.is_empty() {
+            return Ok(MoveOutcome {
+                tasks: Vec::new(),
+                roots: Vec::new(),
+            });
+        }
+        if let Some(parent) = new_parent {
+            target.cloned(parent)?;
+        }
+
+        let mut roots = Vec::new();
+        let mut seen_roots = BTreeSet::new();
+        for id in ids {
+            if !seen_roots.insert(id.clone()) {
+                continue;
+            }
+            let mut ancestor = self.parent(id).cloned();
+            let mut covered = false;
+            while let Some(parent) = ancestor {
+                if requested.contains(&parent) {
+                    covered = true;
+                    break;
+                }
+                ancestor = self.parent(&parent).cloned();
+            }
+            if !covered {
+                roots.push(id.clone());
+            }
+        }
+
+        let root_set: BTreeSet<TaskId> = roots.iter().cloned().collect();
+        let moved_ids = self.closure(&root_set);
+        for id in &moved_ids {
+            if target.tasks.contains_key(id) || target.path_for(id).exists() {
+                return Err(VaultError::IdCollision {
+                    id: id.clone(),
+                    target_written: 0,
+                });
+            }
+        }
+
+        // The cache can lag behind external edits. Read and parse every source
+        // file before writing any target copies, retaining the exact bytes for
+        // the later compare-before-remove check.
+        let moved_sources: Vec<(TaskId, String, Task)> = moved_ids
+            .iter()
+            .map(|id| {
+                let path = self.path_for(id);
+                let document = fs::read_to_string(&path).map_err(|source| VaultError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                let mut task = Task::from_document(&document).map_err(|source| {
+                    VaultError::InvalidTaskFile {
+                        path: path.clone(),
+                        source,
+                    }
+                })?;
+                task.id = id.clone();
+                if root_set.contains(id) {
+                    task.parent = new_parent.cloned();
+                    task.rank = None;
+                }
+                Ok((id.clone(), document, task))
+            })
+            .collect::<Result<_, VaultError>>()?;
+        let moved_tasks: Vec<Task> = moved_sources
+            .iter()
+            .map(|(_, _, task)| task.clone())
+            .collect();
+
+        let mut target_written = 0;
+        for task in &moved_tasks {
+            let path = target.path_for(&task.id);
+            match crate::fsutil::write_atomic_new(&path, &task.to_document(), false) {
+                Ok(true) => {
+                    target.tasks.insert(task.id.clone(), task.clone());
+                    target.rebuild_index();
+                    target_written += 1;
+                }
+                Ok(false) => {
+                    return Err(VaultError::IdCollision {
+                        id: task.id.clone(),
+                        target_written,
+                    });
+                }
+                Err(source) => {
+                    return Err(VaultError::PartialMove {
+                        target_written,
+                        source_removed: 0,
+                        path,
+                        source,
+                    });
+                }
+            }
+        }
+
+        let mut source_removed = 0;
+        for (id, copied_document, _) in &moved_sources {
+            let path = self.path_for(id);
+            let source = match fs::read(&path) {
+                Ok(current) if current == copied_document.as_bytes() => None,
+                Ok(_) => Some(std::io::Error::other(
+                    "source changed after target copy; source was kept",
+                )),
+                Err(source) => Some(source),
+            };
+            if let Some(source) = source {
+                // Refresh only the source cache; do not run title sync as part
+                // of a partially completed cross-Store operation.
+                let (tasks, scan_issues) = scan(&self.root);
+                self.tasks = tasks;
+                self.scan_issues = scan_issues;
+                self.rebuild_index();
+                return Err(VaultError::PartialMove {
+                    target_written,
+                    source_removed,
+                    path,
+                    source,
+                });
+            }
+
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    self.tasks.remove(id);
+                    source_removed += 1;
+                }
+                Err(source) => {
+                    // Refresh only the source cache; do not run title sync as
+                    // part of a partially completed cross-Store operation.
+                    let (tasks, scan_issues) = scan(&self.root);
+                    self.tasks = tasks;
+                    self.scan_issues = scan_issues;
+                    self.rebuild_index();
+                    return Err(VaultError::PartialMove {
+                        target_written,
+                        source_removed,
+                        path,
+                        source,
+                    });
+                }
+            }
+        }
+        self.rebuild_index();
+
+        Ok(MoveOutcome {
+            tasks: moved_tasks,
+            roots,
+        })
     }
 
     /// Delete tasks and their whole subtrees.
@@ -1766,6 +1997,224 @@ mod tests {
             vault.set_title(&task.id, "\t"),
             Err(VaultError::EmptyTitle)
         ));
+    }
+
+    #[test]
+    fn move_to_copies_a_subtree_before_removing_it_and_keeps_links_and_identity() {
+        let (source_dir, mut source) = open_vault();
+        let (_target_dir, mut target) = open_vault();
+        let root_id = parse_id("root000001");
+        let child_id = parse_id("child00001");
+        let grandchild_id = parse_id("grand00001");
+        let mut root = Task::new(root_id.clone(), "Moving root");
+        root.rank = Some(7);
+        root.body = "See [[outside001]] and [[inside001]]".to_owned();
+        let mut child = Task::new(child_id.clone(), "Child");
+        child.parent = Some(root_id.clone());
+        child.rank = Some(4);
+        let mut grandchild = Task::new(grandchild_id.clone(), "Grandchild");
+        grandchild.parent = Some(child_id.clone());
+        for task in [&root, &child, &grandchild] {
+            fs::write(
+                source_dir.path().join(task.id.file_name()),
+                task.to_document(),
+            )
+            .expect("write source task");
+        }
+        source.reload().expect("load source tasks");
+        let parent = target
+            .add(NewTask::new("Destination parent"))
+            .expect("add destination parent");
+
+        let outcome = source
+            .move_to(
+                &mut target,
+                &[root_id.clone(), child_id.clone(), grandchild_id.clone()],
+                Some(&parent.id),
+            )
+            .expect("move subtree");
+
+        assert_eq!(outcome.roots, vec![root_id.clone()]);
+        assert_eq!(outcome.tasks.len(), 3);
+        assert!(source.is_empty(), "the source subtree is removed last");
+        assert_eq!(target.parent(&root_id), Some(&parent.id));
+        assert_eq!(target.parent(&child_id), Some(&root_id));
+        assert_eq!(target.parent(&grandchild_id), Some(&child_id));
+        assert_eq!(target.get(&root_id).expect("root").rank, None);
+        assert_eq!(target.get(&child_id).expect("child").rank, Some(4));
+        assert_eq!(
+            target.get(&root_id).expect("root").body,
+            "See [[outside001]] and [[inside001]]"
+        );
+        let stored_root = Task::from_document(
+            &fs::read_to_string(target.root().join(root_id.file_name())).expect("target root"),
+        )
+        .expect("parse target root");
+        assert_eq!(stored_root.id, root_id);
+        assert_eq!(stored_root.parent, Some(parent.id.clone()));
+        assert_eq!(stored_root.rank, None);
+        assert_eq!(stored_root.body, root.body);
+        let reopened = Vault::open(target.root()).expect("reopen target");
+        assert_eq!(reopened.parent(&root_id), Some(&parent.id));
+        assert_eq!(reopened.parent(&child_id), Some(&root_id));
+    }
+
+    #[test]
+    fn move_to_uses_the_latest_source_document_after_an_external_edit() {
+        let (source_dir, mut source) = open_vault();
+        let (_target_dir, mut target) = open_vault();
+        let task = source
+            .add(NewTask::new("Original title"))
+            .expect("add source");
+        let edited = Task {
+            title: "Edited externally".to_owned(),
+            body: "New body".to_owned(),
+            ..task.clone()
+        };
+        let source_path = source_dir.path().join(task.id.file_name());
+        fs::write(&source_path, edited.to_document()).expect("external edit");
+
+        source
+            .move_to(&mut target, std::slice::from_ref(&task.id), None)
+            .expect("move edited task");
+
+        let moved = Task::from_document(&read_task_file(&target, &task.id)).expect("parse target");
+        assert_eq!(moved.title, "Edited externally");
+        assert_eq!(moved.body, "New body");
+        assert!(!source_path.exists(), "the copied source is removed");
+    }
+
+    #[test]
+    fn move_to_rejects_a_malformed_source_before_writing_targets() {
+        let (source_dir, mut source) = open_vault();
+        let (target_dir, mut target) = open_vault();
+        let root = source.add(NewTask::new("Root")).expect("add root");
+        let child = source
+            .add(NewTask {
+                parent: Some(root.id.clone()),
+                ..NewTask::new("Child")
+            })
+            .expect("add child");
+        let child_path = source_dir.path().join(child.id.file_name());
+        let malformed = "---\nid: child00001\ntitle: [broken\n---\n";
+        fs::write(&child_path, malformed).expect("malformed external edit");
+
+        let error = source
+            .move_to(&mut target, std::slice::from_ref(&root.id), None)
+            .expect_err("malformed source must stop the move");
+
+        assert!(matches!(error, VaultError::InvalidTaskFile { .. }));
+        assert!(!target_dir.path().join(root.id.file_name()).exists());
+        assert!(!target_dir.path().join(child.id.file_name()).exists());
+        assert!(source_dir.path().join(root.id.file_name()).is_file());
+        assert_eq!(
+            fs::read_to_string(child_path).expect("read malformed"),
+            malformed
+        );
+    }
+
+    #[test]
+    fn move_to_rejects_a_missing_source_before_writing_targets() {
+        let (source_dir, mut source) = open_vault();
+        let (target_dir, mut target) = open_vault();
+        let root = source.add(NewTask::new("Root")).expect("add root");
+        let child = source
+            .add(NewTask {
+                parent: Some(root.id.clone()),
+                ..NewTask::new("Child")
+            })
+            .expect("add child");
+        let missing_path = source_dir.path().join(child.id.file_name());
+        fs::remove_file(&missing_path).expect("external deletion");
+
+        let error = source
+            .move_to(&mut target, std::slice::from_ref(&root.id), None)
+            .expect_err("missing source must stop the move");
+
+        assert!(matches!(
+            error,
+            VaultError::Io { path, source }
+                if path == missing_path && source.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(!target_dir.path().join(root.id.file_name()).exists());
+        assert!(!target_dir.path().join(child.id.file_name()).exists());
+        assert!(source_dir.path().join(root.id.file_name()).is_file());
+    }
+
+    #[test]
+    fn move_to_refuses_an_existing_target_identity_without_removing_the_source() {
+        let (_source_dir, mut source) = open_vault();
+        let (target_dir, mut target) = open_vault();
+        let task = source.add(NewTask::new("Source task")).expect("add source");
+        let conflicting = Task::new(task.id.clone(), "Existing target task");
+        let target_path = target_dir.path().join(task.id.file_name());
+        fs::write(&target_path, conflicting.to_document()).expect("write collision");
+        target.reload().expect("load collision");
+        let target_before = fs::read_to_string(&target_path).expect("read collision");
+
+        let error = source
+            .move_to(&mut target, std::slice::from_ref(&task.id), None)
+            .expect_err("target identity collision");
+
+        assert!(matches!(
+            error,
+            VaultError::IdCollision {
+                target_written: 0,
+                ..
+            }
+        ));
+        assert!(source.get(&task.id).is_some(), "source task remains loaded");
+        assert!(source.root().join(task.id.file_name()).is_file());
+        assert_eq!(
+            fs::read_to_string(target_path).expect("read unchanged target"),
+            target_before
+        );
+    }
+
+    #[test]
+    fn move_to_keeps_target_copies_when_source_removal_fails() {
+        let (source_dir, mut source) = open_vault();
+        let (_target_dir, mut target) = open_vault();
+        let root_id = parse_id("aaa0000001");
+        let child_id = parse_id("bbb0000001");
+        let root = Task::new(root_id.clone(), "Root");
+        let mut child = Task::new(child_id.clone(), "Child");
+        child.parent = Some(root_id.clone());
+        for task in [&root, &child] {
+            fs::write(
+                source_dir.path().join(task.id.file_name()),
+                task.to_document(),
+            )
+            .expect("write source task");
+        }
+        source.reload().expect("load source tasks");
+        let source_permissions = fs::metadata(source_dir.path())
+            .expect("source directory metadata")
+            .permissions();
+        let mut read_only = source_permissions.clone();
+        read_only.set_readonly(true);
+        fs::set_permissions(source_dir.path(), read_only).expect("block source removal");
+
+        let error = source
+            .move_to(&mut target, std::slice::from_ref(&root_id), None)
+            .expect_err("source removal should fail");
+
+        fs::set_permissions(source_dir.path(), source_permissions).expect("restore permissions");
+
+        assert!(matches!(
+            error,
+            VaultError::PartialMove {
+                target_written: 2,
+                source_removed: 0,
+                ..
+            }
+        ));
+        assert!(target.get(&root_id).is_some());
+        assert!(target.get(&child_id).is_some());
+        assert_eq!(target.parent(&child_id), Some(&root_id));
+        assert_eq!(source.len(), 2, "source files remain when removal fails");
+        assert!(source_dir.path().join(root_id.file_name()).is_file());
+        assert!(source_dir.path().join(child_id.file_name()).is_file());
     }
 
     #[test]

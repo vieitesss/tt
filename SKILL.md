@@ -174,6 +174,44 @@ $ tt --json edit 3wcss7oxg4 --title "Ship it v2"
 {"id":"3wcss7oxg4","title":"Ship it v2","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0}
 ```
 
+### `tt move <ID> [--to-project DIR|SLUG] [--parent ID | --root]`
+
+Reparent a task within the current Project, or move it and its entire subtree
+to another registered Project. Without `--to-project`, exactly one of
+`--parent` or `--root` is required: `--parent` makes the task a child of that
+Task in the current Store, and `--root` makes it a root. `--parent` and
+`--root` conflict. In-project moves use the same rules as the TUI: the task
+cannot be its own parent or move under a descendant, an unknown task or parent
+is an error, the task is appended among its new siblings, and its old sibling
+rank gap is closed.
+
+With `--to-project`, resolve the destination by its registered directory path
+or slug; an unregistered path is an error and is never registered implicitly.
+Without `--parent`, the moved root becomes a root in the destination Store;
+`--root` is equivalent to omitting `--parent`. If the destination resolves to
+the current Store, the command reparents within the current Project instead of
+performing a cross-Store move. Descendant parent pointers and ranks are kept;
+each moved root's rank is cleared. Identities, bodies, and `[[id]]` link text
+are unchanged. Links from tasks left in the source may now be dangling, which
+is legitimate; Title sync remains Store-local.
+
+A cross-Project move writes every task to the target Store atomically without
+replacement before removing anything from the source. An id collision is an
+error. If a filesystem failure occurs after the move begins, the error reports
+the partial progress; duplicate copies may remain, but a task is never removed
+before its target copy is safe.
+
+With `--json`, either kind of move returns all moved Task objects in id order
+and a `target_project` reference with `path` and `slug`:
+
+```json
+{"tasks":[{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":[],"due":null,"priority":null,"rank":0},{"id":"8d7jfebh28","title":"Write the plan","state":"open","parent":"abc1234567","tags":[],"due":null,"priority":null,"rank":null}],"target_project":{"path":"/work/other","slug":"other"}}
+```
+
+The `tasks` array contains the moved root and every descendant, not just the
+requested ID, for both in-project and cross-Project moves. Runtime errors
+follow the normal exit-1 / `{"error":"…"}` contract.
+
 ### `tt project list` / `tt project add [DIR]` / `tt project remove DIR|SLUG`
 
 Register, list, and unregister directories. `add` defaults to the resolved
@@ -238,7 +276,7 @@ Link and backlink navigation stays on `o`.
 | `t` | Toggle an existing tag, or add a typed tag, on the selection (or every marked task) |
 | `f` | Filter by one state, priority, or tag; matching tasks form a flat session-only list, and `clear filter` restores the tree |
 | `Tab` | Toggle the current row in the multi-selection; `Esc` clears the selection first |
-| `m` | Move the selection (or every marked task) under another task or `⌂ root` |
+| `m` | Move the selection (or every marked subtree) within this Project or into another registered Project |
 | `d` | Delete the selection (or every marked task) and its descendants after confirming |
 | `L` | Append a `[[{id}.md|{Title}]]` link from the selected task to another task |
 | `r` | Rename the selected task from a prompt prefilled with its current title; committing rewrites the title and immediately cascades mirror aliases in other tasks |
@@ -256,14 +294,20 @@ left gutter over a yellow background, and the footer switches to selection
 hints. While anything is marked, `m`, `d`, `x`, `!`, and `t` act on every marked task;
 with nothing marked they act on the selection alone.
 `A` inserts the new sibling immediately after the selection, while `a`, `N`,
-`m`, and CLI `tt add` append to the destination sibling group; any of these
-writes materialize consecutive ranks `0..n-1` for the group. `J`/`K` move the
-cursor task one place later/earlier among its siblings, ignoring marks; with a
+and CLI `tt add` append to the destination sibling group; those writes
+materialize consecutive ranks `0..n-1` for the group. An in-Project `m` move
+appends each moved root among its destination siblings; a cross-Project move
+clears each moved root's Rank. `J`/`K` move the cursor task one place
+later/earlier among its siblings, ignoring marks; with a
 filter active, no siblings, or already at that end, they toast and write
 nothing.
 `m` opens a `move under…` picker offering `⌂ root` plus every task outside the
-moving set and its descendants; committing unfolds the new parent and selects
-the first moved task. `d` opens a confirmation: one task asks
+moving set and its descendants, followed by `⇄ another project…` when another
+registered Project is available. Choosing a Project opens a parent picker in
+that Store (`⌂ root` plus its tasks); committing moves the whole subtree,
+switches the List to that Project, and selects the moved root. In-Project moves
+keep descendants attached; marked tasks whose ancestor is also marked are
+deduplicated. `d` opens a confirmation: one task asks
 `Delete "<title>"?` and several ask `Delete N tasks?`, adding
 `and its K descendants` or `and their K descendants` when the subtrees hold
 more than the requested tasks. `[ Delete ] [ Cancel ]` are highlighted with

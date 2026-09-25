@@ -33,11 +33,23 @@ pub(crate) enum PickerKind {
         /// Candidate task ids.
         targets: Vec<TaskId>,
     },
-    /// `m`: move the active selection under another task or the root.
+    /// `m`: move the active subtree within this Project or choose another.
     Move {
-        /// Ids being moved, in action order; these and all their descendants
-        /// are excluded from the candidate list.
+        /// Top-level selected tasks; these and all their descendants are
+        /// excluded from in-project parent candidates.
         moving: Vec<TaskId>,
+    },
+    /// `m`: choose another registered Project as the move destination.
+    MoveProject {
+        /// Top-level selected tasks being moved.
+        moving: Vec<TaskId>,
+    },
+    /// `m`: choose a parent in the selected destination Project.
+    MoveParent {
+        /// Top-level selected tasks being moved.
+        moving: Vec<TaskId>,
+        /// Registered destination Project.
+        project: Project,
     },
     /// `!`: set or clear priority on the active task set.
     Priority,
@@ -74,16 +86,18 @@ impl PickerKind {
     }
 
     /// Prompt prefix for the status line.
-    pub(crate) fn prompt(&self) -> &'static str {
+    pub(crate) fn prompt(&self) -> String {
         match self {
-            Self::Search { .. } => "search: ",
-            Self::Project => "project: ",
-            Self::Link { .. } => "link: ",
-            Self::Move { .. } => "move under: ",
-            Self::Priority => "priority: ",
-            Self::Tags => "tag: ",
-            Self::Filter => "filter: ",
-            Self::CreateLink { .. } => "link to: ",
+            Self::Search { .. } => "search: ".to_owned(),
+            Self::Project => "project: ".to_owned(),
+            Self::Link { .. } => "link: ".to_owned(),
+            Self::Move { .. } => "move under: ".to_owned(),
+            Self::MoveProject { .. } => "move to project: ".to_owned(),
+            Self::MoveParent { project, .. } => format!("move under {}: ", project.slug),
+            Self::Priority => "priority: ".to_owned(),
+            Self::Tags => "tag: ".to_owned(),
+            Self::Filter => "filter: ".to_owned(),
+            Self::CreateLink { .. } => "link to: ".to_owned(),
         }
     }
 
@@ -93,7 +107,9 @@ impl PickerKind {
             Self::Search { .. } => "↑↓ select · enter open · esc cancel",
             Self::Project => "↑↓ select · enter switch · esc cancel",
             Self::Link { .. } => "↑↓ select · enter jump · esc cancel",
-            Self::Move { .. } => "↑↓ select · enter move · esc cancel",
+            Self::Move { .. } => "↑↓ parent/project · enter choose · esc cancel",
+            Self::MoveProject { .. } => "↑↓ select · enter choose · esc cancel",
+            Self::MoveParent { .. } => "↑↓ parent/root · enter move · esc cancel",
             Self::Priority => "↑↓ select · enter set · esc cancel",
             Self::Tags => "↑↓ select · enter toggle/add · esc cancel",
             Self::Filter => "↑↓ select · enter apply · esc cancel",
@@ -108,6 +124,8 @@ impl PickerKind {
             Self::Project => "projects",
             Self::Link { .. } => "links",
             Self::Move { .. } => "move under…",
+            Self::MoveProject { .. } => "move to project…",
+            Self::MoveParent { .. } => "move under…",
             Self::Priority => "priority",
             Self::Tags => "tags",
             Self::Filter => "filter",
@@ -459,6 +477,34 @@ pub(crate) fn link_matches(query: &str, targets: &[TaskId], vault: &Vault) -> Ve
         })
         .cloned()
         .collect()
+}
+
+/// One choice in the first stage of the move picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MoveChoice {
+    /// Move under the task or to the root in the current Project.
+    Parent(Option<TaskId>),
+    /// Continue to the registered-Project picker.
+    OtherProject,
+}
+
+/// Choices in the first move picker: current-Project roots and tasks, plus an
+/// optional route to another registered Project.
+pub(crate) fn move_choices(
+    query: &str,
+    vault: &Vault,
+    moving: &[TaskId],
+    has_other_projects: bool,
+) -> Vec<MoveChoice> {
+    let mut choices: Vec<MoveChoice> = move_matches(query, vault, moving)
+        .into_iter()
+        .map(MoveChoice::Parent)
+        .collect();
+    let query = query.trim().to_lowercase();
+    if has_other_projects && (query.is_empty() || "another project".contains(&query)) {
+        choices.push(MoveChoice::OtherProject);
+    }
+    choices
 }
 
 /// Move-target candidates matching `query` over title or id (all of them when

@@ -22,7 +22,7 @@ use super::app::{
 };
 use super::keymap::{keymap_columns, keymap_content_lines, keymap_content_width, keymap_geometry};
 use super::launch::Launch;
-use super::picker::{FilterCriterion, PickerKind};
+use super::picker::{FilterCriterion, MoveChoice, PickerKind};
 use super::ui::{layout, render, render_launch};
 
 fn setup() -> (tempfile::TempDir, App) {
@@ -1162,7 +1162,7 @@ fn selection_hints_replace_the_list_hints_while_marked() {
     app.handle_key(key(KeyCode::Tab));
     assert_eq!(
         footer_text(&app.status_line()),
-        "tab un/select   esc clear   m move   d delete   x state   ! priority   t tags"
+        "tab un/select   esc clear   m move tasks   d delete   x state   ! priority   t tags"
     );
 
     app.handle_key(key(KeyCode::Esc));
@@ -1282,8 +1282,11 @@ fn move_picker_offers_root_first_and_hides_the_moving_subtree() {
         })
     );
     assert_eq!(
-        app.move_matches(),
-        vec![None, Some(other.clone())],
+        app.move_choices(),
+        vec![
+            MoveChoice::Parent(None),
+            MoveChoice::Parent(Some(other.clone()))
+        ],
         "root entry first, then the one task outside the moving subtree"
     );
     assert!(
@@ -1302,9 +1305,10 @@ fn move_picker_offers_root_first_and_hides_the_moving_subtree() {
     app.handle_key(key(KeyCode::Char('h')));
     assert!(app.collapsed.contains(&root));
     app.handle_key(key(KeyCode::Char('m')));
-    let matches = app.move_matches();
+    let matches = app.move_choices();
     assert!(
-        !matches.contains(&Some(child.clone())) && !matches.contains(&Some(grandchild.clone())),
+        !matches.contains(&MoveChoice::Parent(Some(child.clone())))
+            && !matches.contains(&MoveChoice::Parent(Some(grandchild.clone()))),
         "descendants stay excluded behind a fold: {matches:?}"
     );
 }
@@ -1325,14 +1329,14 @@ fn move_picker_filters_by_query_but_keeps_root_first() {
     }
 
     assert_eq!(
-        app.move_matches(),
-        vec![None, Some(alpha)],
+        app.move_choices(),
+        vec![MoveChoice::Parent(None), MoveChoice::Parent(Some(alpha))],
         "query filters tasks, and the root entry always stays first"
     );
 }
 
 #[test]
-fn move_commit_reparents_marks_and_selects_the_first_moved_task() {
+fn move_commit_moves_marked_subtrees_once_and_selects_the_first_root() {
     let (_dir, mut app) = setup();
     let root = add_task(&mut app, "Root", None);
     let child = add_task(&mut app, "Child", Some(&root));
@@ -1345,8 +1349,11 @@ fn move_commit_reparents_marks_and_selects_the_first_moved_task() {
     app.handle_key(key(KeyCode::Tab));
     app.handle_key(key(KeyCode::Char('m')));
     assert_eq!(
-        app.move_matches(),
-        vec![None, Some(other.clone())],
+        app.move_choices(),
+        vec![
+            MoveChoice::Parent(None),
+            MoveChoice::Parent(Some(other.clone()))
+        ],
         "the moving set is excluded"
     );
 
@@ -1354,7 +1361,7 @@ fn move_commit_reparents_marks_and_selects_the_first_moved_task() {
     app.handle_key(key(KeyCode::Enter));
 
     assert_eq!(app.vault.parent(&root), Some(&other));
-    assert_eq!(app.vault.parent(&child), Some(&other));
+    assert_eq!(app.vault.parent(&child), Some(&root));
     assert_eq!(app.mode, InputMode::Navigate);
     assert_eq!(
         app.selected_id(),
@@ -1379,8 +1386,11 @@ fn move_to_root_clears_the_parent() {
     app.handle_key(key(KeyCode::Tab));
     app.handle_key(key(KeyCode::Char('m')));
     assert_eq!(
-        app.move_matches(),
-        vec![None, Some(root.clone())],
+        app.move_choices(),
+        vec![
+            MoveChoice::Parent(None),
+            MoveChoice::Parent(Some(root.clone()))
+        ],
         "the root entry comes first; the current parent is also a candidate"
     );
 
@@ -1397,6 +1407,187 @@ fn move_to_root_clears_the_parent() {
 }
 
 #[test]
+fn move_can_choose_another_project_then_a_parent_and_switch_to_that_store() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let source_project = dir.path().join("source-project");
+    let target_project = dir.path().join("target-project");
+    fs::create_dir_all(&source_project).expect("source project");
+    fs::create_dir_all(&target_project).expect("target project");
+    let store_root = dir.path().join("data");
+    let source_store = store_root.join("source");
+    let target_store = store_root.join("target");
+    let mut source = Vault::open(&source_store).expect("source store");
+    let root = source
+        .add(NewTask {
+            body: "See [[missing0001.md|Still dangling]]".to_owned(),
+            ..NewTask::new("Moving root")
+        })
+        .expect("add root");
+    let child = source
+        .add(NewTask {
+            parent: Some(root.id.clone()),
+            ..NewTask::new("Moving child")
+        })
+        .expect("add child");
+    let bystander = source
+        .add(NewTask {
+            body: format!("See [[{}.md|Moving root]]", root.id),
+            ..NewTask::new("Bystander")
+        })
+        .expect("add bystander");
+    let mut target = Vault::open(&target_store).expect("target store");
+    let destination_parent = target
+        .add(NewTask::new("Destination parent"))
+        .expect("add destination parent");
+    drop(target);
+    let source_project_entry = project(source_project.to_str().expect("source path"), "source");
+    let target_project_entry = project(target_project.to_str().expect("target path"), "target");
+    let mut config = Config::load_from(Some(dir.path().join("config.toml"))).expect("config");
+    config.projects = vec![source_project_entry.clone(), target_project_entry.clone()];
+    let mut app = App::new(
+        source,
+        config,
+        Some(source_project_entry),
+        Some(store_root.clone()),
+    );
+    app.selected = Some(root.id.clone());
+    app.handle_key(key(KeyCode::Tab));
+    app.handle_key(key(KeyCode::Char('j')));
+    app.handle_key(key(KeyCode::Tab));
+    app.handle_key(key(KeyCode::Char('m')));
+
+    assert_eq!(
+        app.picker_kind(),
+        Some(&PickerKind::Move {
+            moving: vec![root.id.clone()]
+        }),
+        "an ancestor mark dedupes its child mark"
+    );
+    assert_eq!(
+        app.move_choices(),
+        vec![
+            MoveChoice::Parent(None),
+            MoveChoice::Parent(Some(bystander.id.clone())),
+            MoveChoice::OtherProject,
+        ]
+    );
+    assert!(app
+        .picker_popup(80)
+        .expect("move picker")
+        .entries
+        .iter()
+        .any(|entry| entry.contains("another project")));
+
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.picker_kind(),
+        Some(PickerKind::MoveProject { .. })
+    ));
+    assert!(footer_text(&app.status_line()).contains("move to project: "));
+    assert_eq!(
+        app.move_project_matches()
+            .iter()
+            .map(|project| project.slug.as_str())
+            .collect::<Vec<_>>(),
+        ["target"],
+        "the current Project is not offered as a destination"
+    );
+
+    app.handle_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.picker_kind(),
+        Some(PickerKind::MoveParent { .. })
+    ));
+    assert!(footer_text(&app.status_line()).contains("move under target: "));
+    assert_eq!(
+        app.move_parent_matches(),
+        vec![None, Some(destination_parent.id.clone())]
+    );
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(
+        app.project.as_ref().expect("current project").slug,
+        "target"
+    );
+    assert_eq!(app.vault.root(), target_store.as_path());
+    assert_eq!(app.vault.parent(&root.id), Some(&destination_parent.id));
+    assert_eq!(app.vault.parent(&child.id), Some(&root.id));
+    assert_eq!(app.vault.get(&root.id).expect("moved root").rank, None);
+    assert_eq!(
+        app.vault.get(&root.id).expect("moved root").body,
+        "See [[missing0001.md|Still dangling]]"
+    );
+    assert_eq!(app.selected_id(), Some(root.id.clone()));
+    assert!(app.marked.is_empty());
+    assert_eq!(
+        app.toast.as_ref().map(|toast| toast.text.as_str()),
+        Some("moved 2 tasks to target")
+    );
+    assert!(!source_store.join(root.id.file_name()).exists());
+    assert!(!source_store.join(child.id.file_name()).exists());
+    assert_eq!(
+        fs::read_to_string(source_store.join(bystander.id.file_name())).expect("bystander"),
+        bystander.to_document(),
+        "cross-Project move leaves source-side wikilinks untouched"
+    );
+}
+
+#[test]
+fn cross_project_move_fails_if_the_chosen_parent_was_deleted() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let source_project = dir.path().join("source-project");
+    let target_project = dir.path().join("target-project");
+    fs::create_dir_all(&source_project).expect("source project");
+    fs::create_dir_all(&target_project).expect("target project");
+    let store_root = dir.path().join("data");
+    let source_store = store_root.join("source");
+    let target_store = store_root.join("target");
+    let mut source = Vault::open(&source_store).expect("source store");
+    let moving = source
+        .add(NewTask::new("Moving task"))
+        .expect("add moving task");
+    let mut target = Vault::open(&target_store).expect("target store");
+    let parent = target
+        .add(NewTask::new("Destination parent"))
+        .expect("add destination parent");
+    drop(target);
+    let source_project_entry = project(source_project.to_str().expect("source path"), "source");
+    let target_project_entry = project(target_project.to_str().expect("target path"), "target");
+    let mut config = Config::default();
+    config.projects = vec![source_project_entry.clone(), target_project_entry];
+    let mut app = App::new(source, config, Some(source_project_entry), Some(store_root));
+    app.selected = Some(moving.id.clone());
+    app.handle_key(key(KeyCode::Tab));
+    app.handle_key(key(KeyCode::Char('m')));
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.picker_kind(),
+        Some(PickerKind::MoveParent { .. })
+    ));
+    assert_eq!(
+        app.move_parent_matches(),
+        vec![None, Some(parent.id.clone())]
+    );
+    app.handle_key(key(KeyCode::Down));
+
+    fs::remove_file(target_store.join(parent.id.file_name())).expect("external deletion");
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(app.vault.root(), source_store.as_path());
+    assert!(source_store.join(moving.id.file_name()).is_file());
+    assert!(!target_store.join(moving.id.file_name()).exists());
+    assert_eq!(
+        app.toast.as_ref().map(|toast| toast.text.as_str()),
+        Some(format!("error: task not found: {}", parent.id).as_str())
+    );
+}
+
+#[test]
 fn move_with_a_single_task_offers_only_the_root_entry() {
     let (_dir, mut app) = setup();
     let only = add_task(&mut app, "Only", None);
@@ -1406,8 +1597,8 @@ fn move_with_a_single_task_offers_only_the_root_entry() {
     app.handle_key(key(KeyCode::Tab));
     app.handle_key(key(KeyCode::Char('m')));
     assert_eq!(
-        app.move_matches(),
-        vec![None],
+        app.move_choices(),
+        vec![MoveChoice::Parent(None)],
         "with every other task moving, only ⌂ root is left"
     );
 
