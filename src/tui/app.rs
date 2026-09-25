@@ -24,6 +24,7 @@ use tt::{
 use super::keymap::{keymap_columns, keymap_content_lines, keymap_content_width, keymap_geometry};
 use super::list::TaskList;
 use super::picker::{self, FilterChoice, FilterCriterion, Picker, PickerKind};
+use super::text::pop_word;
 
 /// How often the event loop wakes to check for external changes.
 pub(crate) const TICK: Duration = Duration::from_millis(250);
@@ -1179,6 +1180,9 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.input.pop();
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                pop_word(&mut self.input);
             }
             KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.input.push(character);

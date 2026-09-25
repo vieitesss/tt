@@ -2810,6 +2810,35 @@ fn a_opens_a_prompt_and_commits_a_child_on_disk() {
 }
 
 #[test]
+fn ctrl_w_removes_the_previous_word_in_the_new_task_prompt() {
+    let (_dir, mut app) = setup();
+    app.refresh();
+
+    app.handle_key(key(KeyCode::Char('a')));
+    for character in "Buy oat milk".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.input, "Buy oat milk");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.input, "Buy oat ",
+        "ctrl-w removes everything back to the previous word boundary"
+    );
+
+    // Existing edit keys keep working alongside the new shortcut.
+    app.handle_key(key(KeyCode::Backspace));
+    assert_eq!(app.input, "Buy oat");
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(app.mode, InputMode::Navigate);
+    assert!(
+        app.vault.tasks().any(|task| task.title == "Buy oat"),
+        "the word-edited title is committed"
+    );
+}
+
+#[test]
 fn shift_a_opens_a_prompt_for_a_sibling() {
     let (_dir, mut app) = setup();
     let parent = add_task(&mut app, "Parent", None);

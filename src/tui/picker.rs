@@ -12,7 +12,7 @@ use tt::{
     path_display, PathDisplay, Priority, Project, TaskFilter, TaskId, TaskState, TreeNode, Vault,
 };
 
-use super::text::{text_width, truncate_title};
+use super::text::{pop_word, text_width, truncate_title};
 
 /// What a picker is choosing between, and how its keys differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +171,11 @@ impl Picker {
             KeyCode::Char('p') if control => {
                 self.move_highlight(-1, match_count);
                 PickerInput::Continue
+            }
+            KeyCode::Char('w') if control => {
+                pop_word(query);
+                self.highlight = 0;
+                PickerInput::QueryChanged
             }
             KeyCode::Backspace => {
                 query.pop();
@@ -512,6 +517,24 @@ mod tests {
             PickerInput::QueryChanged
         );
         assert_eq!(query, "k");
+        assert_eq!(picker.highlight, 0);
+    }
+
+    #[test]
+    fn input_ctrl_w_removes_the_previous_word_and_resets_highlight() {
+        let mut picker = Picker::new(PickerKind::Project);
+        let mut query = "alpha beta".to_owned();
+        picker.highlight = 2;
+
+        assert_eq!(
+            picker.handle_input(
+                &mut query,
+                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+                3,
+            ),
+            PickerInput::QueryChanged
+        );
+        assert_eq!(query, "alpha ");
         assert_eq!(picker.highlight, 0);
     }
 

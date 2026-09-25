@@ -17,6 +17,7 @@ use tt::{registry, Config, Project};
 
 use super::app::expand_tilde;
 use super::picker::{self, Picker, PickerKind};
+use super::text::pop_word;
 
 /// What the pre-App launch modal is asking, or what to do next.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,6 +357,12 @@ impl Launch {
             KeyCode::Backspace => {
                 if let LaunchState::RegisterDir { input, .. } = &mut self.state {
                     input.pop();
+                }
+                self.error = None;
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let LaunchState::RegisterDir { input, .. } = &mut self.state {
+                    pop_word(input);
                 }
                 self.error = None;
             }
