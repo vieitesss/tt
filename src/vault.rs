@@ -191,6 +191,9 @@ pub struct NewTask {
     /// Destination sibling after which to insert. When absent, or when the id
     /// is not in the destination sibling group, the task is appended.
     pub insert_after: Option<TaskId>,
+    /// Insert at the front of the destination sibling group instead of
+    /// appending. Takes precedence over [`NewTask::insert_after`].
+    pub insert_first: bool,
     /// Tags, with or without a leading `#`; normalized on add.
     pub tags: Vec<String>,
     /// Due date, if any.
@@ -208,6 +211,7 @@ impl NewTask {
             title: title.into(),
             parent: None,
             insert_after: None,
+            insert_first: false,
             tags: Vec::new(),
             due: None,
             priority: None,
@@ -533,8 +537,8 @@ impl Vault {
 
     /// Create a task, assign it a fresh id, and place it in its destination
     /// sibling group. Existing display order is materialized as consecutive
-    /// ranks; the new task appends unless [`NewTask::insert_after`] names a
-    /// destination sibling.
+    /// ranks; the new task appends unless [`NewTask::insert_first`] places it
+    /// at the front or [`NewTask::insert_after`] names a destination sibling.
     ///
     /// # Errors
     ///
@@ -547,6 +551,7 @@ impl Vault {
             title,
             parent,
             insert_after,
+            insert_first,
             tags,
             due,
             priority,
@@ -570,10 +575,14 @@ impl Vault {
         task.body = body;
 
         let siblings = self.destination_siblings(task.parent.as_ref());
-        let insertion = insert_after
-            .as_ref()
-            .and_then(|after| siblings.iter().position(|id| id == after))
-            .map_or(siblings.len(), |index| index + 1);
+        let insertion = if insert_first {
+            0
+        } else {
+            insert_after
+                .as_ref()
+                .and_then(|after| siblings.iter().position(|id| id == after))
+                .map_or(siblings.len(), |index| index + 1)
+        };
         for (index, sibling) in siblings.iter().enumerate() {
             let rank = index + usize::from(index >= insertion);
             let mut sibling = self.cloned(sibling)?;
@@ -1365,6 +1374,27 @@ mod tests {
         assert_eq!(
             vault.roots(),
             &[zebra.id.clone(), mango.id.clone(), apple.id.clone()]
+        );
+        for (rank, id) in vault.roots().iter().enumerate() {
+            assert_eq!(vault.get(id).expect("task").rank, Some(rank as i32));
+        }
+    }
+
+    #[test]
+    fn add_can_insert_at_the_front_of_a_sibling_group() {
+        let (_dir, mut vault) = open_vault();
+        let zebra = vault.add(NewTask::new("Zebra")).expect("add zebra");
+        let apple = vault.add(NewTask::new("Apple")).expect("add apple");
+        let first = vault
+            .add(NewTask {
+                insert_first: true,
+                ..NewTask::new("First")
+            })
+            .expect("insert first");
+
+        assert_eq!(
+            vault.roots(),
+            &[first.id.clone(), zebra.id.clone(), apple.id.clone()]
         );
         for (rank, id) in vault.roots().iter().enumerate() {
             assert_eq!(vault.get(id).expect("task").rank, Some(rank as i32));

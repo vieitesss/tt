@@ -168,8 +168,9 @@ pub(crate) enum InputMode {
     Add {
         /// Parent for the new task; `None` means the vault root.
         parent: Option<TaskId>,
-        /// Current sibling after which `A` inserts; `a` leaves this unset.
-        insert_after: Option<TaskId>,
+        /// Insert at the front of the destination sibling group (`A`)
+        /// instead of appending (`a`).
+        insert_first: bool,
     },
     /// Typing a new title for `r`; the target is the cursor task from when
     /// the prompt opened, and committing cascades mirror aliases.
@@ -665,8 +666,8 @@ impl App {
                     self.select_index(self.list.len() - 1);
                 }
             }
-            KeyCode::Char('a') => self.start_add(false),
-            KeyCode::Char('A') => self.start_add(true),
+            KeyCode::Char('a') => self.start_add_child(),
+            KeyCode::Char('A') => self.start_add_first(),
             KeyCode::Char('h') | KeyCode::Left => self.fold_selection(),
             KeyCode::Char('l') | KeyCode::Right => self.unfold_selection(),
             KeyCode::Char('N') => {
@@ -1422,20 +1423,23 @@ impl App {
         }
     }
 
-    /// Start an add prompt: `child` adds under the selection, otherwise a
-    /// sibling of the selection.
-    fn start_add(&mut self, sibling: bool) {
-        let insert_after = sibling.then(|| self.selected_id()).flatten();
-        let parent = if sibling {
-            insert_after
-                .as_ref()
-                .and_then(|id| self.vault.parent(id).cloned())
-        } else {
-            self.selected_id()
-        };
+    /// Start an add prompt for `a`: a child under the selection, appended to
+    /// its destination sibling group.
+    fn start_add_child(&mut self) {
         self.mode = InputMode::Add {
-            parent,
-            insert_after,
+            parent: self.selected_id(),
+            insert_first: false,
+        };
+        self.input.clear();
+        self.status = None;
+    }
+
+    /// Start an add prompt for `A`: a new root task at the top of the list,
+    /// independent of the selection.
+    fn start_add_first(&mut self) {
+        self.mode = InputMode::Add {
+            parent: None,
+            insert_first: true,
         };
         self.input.clear();
         self.status = None;
@@ -2081,12 +2085,12 @@ impl App {
             self.commit_tag_prompt();
             return;
         }
-        let (parent, insert_after) = match &self.mode {
+        let (parent, insert_first) = match &self.mode {
             InputMode::Add {
                 parent,
-                insert_after,
-            } => (parent.clone(), insert_after.clone()),
-            InputMode::Capture => (self.config.capture_target.clone(), None),
+                insert_first,
+            } => (parent.clone(), *insert_first),
+            InputMode::Capture => (self.config.capture_target.clone(), false),
             InputMode::Navigate
             | InputMode::Rename { .. }
             | InputMode::Tag
@@ -2099,7 +2103,8 @@ impl App {
 
         let new_task = NewTask {
             parent,
-            insert_after,
+            insert_after: None,
+            insert_first,
             ..NewTask::new(title)
         };
         match self.vault.add(new_task) {

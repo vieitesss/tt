@@ -539,6 +539,7 @@ fn add(vault: &mut Vault, config: &Config, args: &AddArgs, json: bool) -> Result
             title,
             parent,
             insert_after: None,
+            insert_first: false,
             tags: args.tag.clone(),
             due,
             priority: args.priority.map(Priority::from),

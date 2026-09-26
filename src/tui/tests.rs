@@ -3030,7 +3030,7 @@ fn ctrl_w_removes_the_previous_word_in_the_new_task_prompt() {
 }
 
 #[test]
-fn shift_a_opens_a_prompt_for_a_sibling() {
+fn shift_a_opens_a_prompt_for_a_new_root_task() {
     let (_dir, mut app) = setup();
     let parent = add_task(&mut app, "Parent", None);
     let child = add_task(&mut app, "Child", Some(&parent));
@@ -3039,9 +3039,9 @@ fn shift_a_opens_a_prompt_for_a_sibling() {
     assert_eq!(app.selected_id(), Some(child.clone()));
 
     app.handle_key(key(KeyCode::Char('A')));
-    assert!(matches!(app.mode, InputMode::Add { parent: Some(ref id), .. } if id == &parent));
+    assert!(matches!(app.mode, InputMode::Add { parent: None, .. }));
 
-    for character in "Sibling".chars() {
+    for character in "Top".chars() {
         app.handle_key(key(KeyCode::Char(character)));
     }
     app.handle_key(key(KeyCode::Enter));
@@ -3049,22 +3049,22 @@ fn shift_a_opens_a_prompt_for_a_sibling() {
     let created = app
         .vault
         .tasks()
-        .find(|task| task.title == "Sibling")
+        .find(|task| task.title == "Top")
         .expect("created task");
-    assert_eq!(created.parent, Some(parent));
+    assert_eq!(created.parent, None);
 }
 
 #[test]
-fn shift_a_inserts_the_new_task_after_the_cursor_sibling() {
+fn shift_a_inserts_a_new_root_at_the_top_regardless_of_selection() {
     let (_dir, mut app) = setup();
     let alpha = add_task(&mut app, "Alpha", None);
     let beta = add_task(&mut app, "Beta", None);
-    let gamma = add_task(&mut app, "Gamma", None);
+    let child = add_task(&mut app, "Child", Some(&beta));
     app.refresh();
-    app.selected = Some(alpha.clone());
+    app.selected = Some(child.clone());
 
     app.handle_key(key(KeyCode::Char('A')));
-    for character in "After alpha".chars() {
+    for character in "New top".chars() {
         app.handle_key(key(KeyCode::Char(character)));
     }
     app.handle_key(key(KeyCode::Enter));
@@ -3072,10 +3072,20 @@ fn shift_a_inserts_the_new_task_after_the_cursor_sibling() {
     let created = app
         .vault
         .tasks()
-        .find(|task| task.title == "After alpha")
+        .find(|task| task.title == "New top")
         .expect("created task");
-    assert_eq!(app.vault.roots(), &[alpha, created.id.clone(), beta, gamma]);
+    assert_eq!(created.parent, None, "A adds a root task");
+    assert_eq!(
+        app.vault.roots(),
+        &[created.id.clone(), alpha, beta],
+        "the new task is first regardless of the nested selection"
+    );
     assert_eq!(app.selected_id(), Some(created.id.clone()));
+    assert_eq!(
+        app.list.id_at(0),
+        Some(&created.id),
+        "the new task is the first visible row"
+    );
 }
 
 #[test]

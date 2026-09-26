@@ -269,7 +269,7 @@ Link and backlink navigation stays on `o`.
 | `gg`/`G` | Jump to the first/last row |
 | `h`/`←` | Collapse the selected parent; if already collapsed or childless, jump to its parent |
 | `l`/`→` | Expand the selected collapsed parent (no-op otherwise) |
-| `a`/`A` | Add a child under the selection / a sibling immediately after it |
+| `a`/`A` | Add a child under the selection / a new root task at the top of the list |
 | `N` | Quick capture to the configured `capture_target`, else the project root |
 | `x` | Cycle the selection (or every marked task) open ↔ done; cancelled tasks are left unchanged |
 | `!` | Set or clear priority on the selection (or every marked task) |
@@ -293,8 +293,9 @@ Link and backlink navigation stays on `o`.
 left gutter over a yellow background, and the footer switches to selection
 hints. While anything is marked, `m`, `d`, `x`, `!`, and `t` act on every marked task;
 with nothing marked they act on the selection alone.
-`A` inserts the new sibling immediately after the selection, while `a`, `N`,
-and CLI `tt add` append to the destination sibling group; those writes
+`A` inserts a new root task at the top of the list, regardless of the
+selection, while `a`, `N`, and CLI `tt add` append to the destination
+sibling group; those writes
 materialize consecutive ranks `0..n-1` for the group. An in-Project `m` move
 appends each moved root among its destination siblings; a cross-Project move
 clears each moved root's Rank. `J`/`K` move the cursor task one place

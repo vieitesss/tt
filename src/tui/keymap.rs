@@ -36,7 +36,7 @@ pub(crate) const KEYMAP_GROUPS: &[KeymapGroup] = &[
         title: "Tasks",
         rows: &[
             ("a", "add child"),
-            ("A", "add sibling after"),
+            ("A", "add task at top"),
             ("N", "quick capture"),
             ("x", "cycle state"),
             ("!", "set priority"),
