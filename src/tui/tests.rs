@@ -348,6 +348,32 @@ fn gg_and_shift_g_jump_to_the_ends() {
     assert_eq!(app.selected_id(), Some(first), "gg goes to the top");
 }
 
+#[test]
+fn ctrl_d_and_ctrl_u_jump_ten_rows_clamped_at_the_ends() {
+    let (_dir, mut app) = setup();
+    let ids: Vec<_> = (0..25)
+        .map(|index| add_task(&mut app, &format!("Task {index:02}"), None))
+        .collect();
+    app.refresh();
+    app.handle_key(key(KeyCode::Char('g')));
+    app.handle_key(key(KeyCode::Char('g')));
+    let ctrl = |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
+
+    for expected in [10, 20, 24] {
+        app.handle_key(ctrl('d'));
+        assert_eq!(app.selected_id(), Some(ids[expected].clone()));
+    }
+    assert_eq!(
+        app.mode,
+        InputMode::Navigate,
+        "ctrl-d must not start a delete"
+    );
+    for expected in [14, 4, 0] {
+        app.handle_key(ctrl('u'));
+        assert_eq!(app.selected_id(), Some(ids[expected].clone()));
+    }
+}
+
 /// `Parent > [Child > Grandchild, Sibling]`; returns the ids.
 fn fold_fixture(app: &mut App) -> (TaskId, TaskId, TaskId, TaskId) {
     let parent = add_task(app, "Parent", None);
@@ -4174,7 +4200,7 @@ fn keymap_overlay_rendering_honours_shared_geometry_scroll_and_body() {
     // left column is never clipped by the popup width, unlike the right
     // column's tail, so these survive horizontal clipping. Update them if the
     // keymap table or the test size changes.
-    let first_window = ["Movement", "move selection", "first / last"];
+    let first_window = ["Movement", "move selection", "jump 10 down / up"];
     let last_window = [
         "confirm / cancel delete",
         "move through issues",
@@ -4215,7 +4241,7 @@ fn keymap_overlay_rendering_honours_shared_geometry_scroll_and_body() {
         "the last content line must be hidden at scroll 0"
     );
     assert!(
-        !top_screen.contains("fold / unfold"),
+        !top_screen.contains("first / last"),
         "the row just past the body must not be drawn at scroll 0"
     );
 

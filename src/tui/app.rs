@@ -32,6 +32,9 @@ pub(crate) const TICK: Duration = Duration::from_millis(250);
 /// How many [`TICK`]s a toast stays on screen: 12 ticks is about 3 seconds.
 pub(crate) const TOAST_TICKS: u32 = 12;
 
+/// How many rows `ctrl-d`/`ctrl-u` move the selection.
+const JUMP_ROWS: isize = 10;
+
 /// A key/label pair shown in the single footer hint row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Hint {
@@ -652,6 +655,12 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_selection(JUMP_ROWS);
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_selection(-JUMP_ROWS);
+            }
             KeyCode::Char('J') => self.shift_selected_rank(1),
             KeyCode::Char('K') => self.shift_selected_rank(-1),
             KeyCode::Char('g') => {

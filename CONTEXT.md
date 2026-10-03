@@ -129,7 +129,7 @@ matching Tasks. A Task whose parent is missing or part of a
 cycle renders as a root (see **Dangling**). Each row is a state glyph (`○` open, `●`
 done, `—` cancelled), the title, and quiet right-aligned metadata only when
 present (relative due, priority, `done/total` rollup); parents also carry a
-fold marker. Selection is linear (`j`/`k`, `gg`/`G`); `J`/`K` change the
+fold marker. Selection is linear (`j`/`k`, `ctrl-d`/`ctrl-u`, `gg`/`G`); `J`/`K` change the
 cursor Task's Rank among its siblings (never across sibling groups, and
 disabled while a Filter is active), and `Tab` adds
 rows to a multi-selection; `/` searches titles, `p` switches Projects, and

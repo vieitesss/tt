@@ -266,6 +266,7 @@ Link and backlink navigation stays on `o`.
 | --- | --- |
 | `j`/`k`, `↓`/`↑` | Move the selection through the flat list |
 | `J`/`K` | Move the cursor task later/earlier among its siblings (marks are ignored; clear a filter first) |
+| `ctrl-d`/`ctrl-u` | Move the selection 10 rows down/up |
 | `gg`/`G` | Jump to the first/last row |
 | `h`/`←` | Collapse the selected parent; if already collapsed or childless, jump to its parent |
 | `l`/`→` | Expand the selected collapsed parent (no-op otherwise) |

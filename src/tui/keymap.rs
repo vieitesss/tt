@@ -26,6 +26,7 @@ pub(crate) const KEYMAP_GROUPS: &[KeymapGroup] = &[
         title: "Movement",
         rows: &[
             ("j / k", "move selection (also up/down arrows)"),
+            ("ctrl-d / u", "jump 10 down / up"),
             ("gg / G", "first / last"),
             ("h / l", "fold / unfold (also left/right)"),
             ("Tab", "mark / unmark"),
