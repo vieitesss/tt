@@ -70,17 +70,7 @@ impl VaultWatcher {
                 let Ok(event) = event else {
                     return;
                 };
-                // Opening/reading the vault (which every reload does) emits
-                // access events; signalling on them would make a reload look
-                // like an external change and loop forever. Only real content
-                // changes count.
-                if matches!(
-                    event.kind,
-                    EventKind::Any
-                        | EventKind::Create(_)
-                        | EventKind::Modify(_)
-                        | EventKind::Remove(_)
-                ) {
+                if is_change(&event) {
                     let _ = raw_tx.send(());
                 }
             })
@@ -131,6 +121,24 @@ impl VaultWatcher {
     }
 }
 
+/// Whether a raw filesystem event means the vault may have changed.
+///
+/// Rescan requests (`Flag::Rescan`, from the backend's dropped-events or
+/// "directory changed under us" notices) count: they exist because the
+/// backend could not report every change, and the TUI keeps an in-memory
+/// snapshot that would otherwise stay stale silently.
+///
+/// Access events are excluded on purpose: opening and reading the vault (what
+/// every [`Vault::reload`](crate::Vault::reload) does) must never look like an
+/// external change, or the reload would loop forever.
+fn is_change(event: &notify::Event) -> bool {
+    event.need_rescan()
+        || matches!(
+            event.kind,
+            EventKind::Any | EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        )
+}
+
 /// Coalesce raw events: after the first event, wait for `interval` of quiet
 /// before signalling once. Ends when either channel closes.
 fn debounce_loop(raw: &Receiver<()>, signal: &Sender<()>, interval: Duration) {
@@ -154,6 +162,28 @@ fn debounce_loop(raw: &Receiver<()>, signal: &Sender<()>, interval: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rescan_requests_count_as_changes_but_reads_do_not() {
+        use notify::event::{AccessKind, CreateKind, DataChange, Flag, ModifyKind, RemoveKind};
+        use notify::Event;
+
+        assert!(
+            is_change(&Event::new(EventKind::Other).set_flag(Flag::Rescan)),
+            "a dropped-events rescan request must wake the watcher"
+        );
+        assert!(is_change(&Event::new(EventKind::Create(CreateKind::File))));
+        assert!(is_change(&Event::new(EventKind::Modify(ModifyKind::Data(
+            DataChange::Content
+        )))));
+        assert!(is_change(&Event::new(EventKind::Remove(RemoveKind::File))));
+        assert!(is_change(&Event::new(EventKind::Any)));
+        assert!(
+            !is_change(&Event::new(EventKind::Access(AccessKind::Read))),
+            "reload reads must never look like external changes"
+        );
+        assert!(!is_change(&Event::new(EventKind::Other)));
+    }
 
     #[test]
     fn debounce_coalesces_a_burst_into_one_signal() {

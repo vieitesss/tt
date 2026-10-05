@@ -16,6 +16,7 @@ mod clipboard;
 mod keymap;
 mod launch;
 mod list;
+mod live;
 mod markdown;
 mod picker;
 #[cfg(test)]
@@ -104,6 +105,9 @@ fn run_project_inner(
                 }
             }
         }
+        // Registry changes made by the CLI reach the modal on the same bounded
+        // clock as the running app.
+        launch.on_tick();
     }
     if launch.should_quit() {
         return Ok(());

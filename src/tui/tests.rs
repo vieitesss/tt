@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::NaiveDate;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -13,8 +13,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::Terminal;
 use tt::resolve::Resolution;
 use tt::{
-    Config, NewTask, PathDisplay, PathDisplayStyle, Priority, Project, Task, TaskId, TaskState,
-    Vault,
+    registry, Config, NewTask, PathDisplay, PathDisplayStyle, Priority, Project, Task, TaskId,
+    TaskState, Vault,
 };
 
 use super::app::{
@@ -22,6 +22,7 @@ use super::app::{
 };
 use super::keymap::{keymap_columns, keymap_content_lines, keymap_content_width, keymap_geometry};
 use super::launch::Launch;
+use super::live::{ReconcileClock, RECONCILE_INTERVAL};
 use super::picker::{FilterCriterion, MoveChoice, PickerKind};
 use super::ui::{layout, render, render_launch};
 
@@ -49,6 +50,96 @@ fn setup_with_issues(names: &[&str]) -> (tempfile::TempDir, App) {
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::from(code)
+}
+
+/// Virtual wall clock for the reconciliation tests: time only moves when a
+/// test moves it, so a burst of input cannot be mistaken for elapsed time and
+/// no test sleeps. Start it after building the app or modal under test; both
+/// seed their clock with the real instant.
+struct Clock(Instant);
+
+impl Clock {
+    fn start() -> Self {
+        Self(Instant::now())
+    }
+
+    /// The current instant: no time passed since the previous call.
+    fn now(&self) -> Instant {
+        self.0
+    }
+
+    /// One reconciliation interval later, as an idle session sees it.
+    fn idle(&mut self) -> Instant {
+        self.0 += RECONCILE_INTERVAL;
+        self.0
+    }
+}
+
+/// Write a task file directly into the store, as the CLI or another process
+/// would; both the watcher and the bounded rescan have to notice it.
+fn write_external_task(dir: &tempfile::TempDir, id: &TaskId, title: &str) {
+    fs::write(
+        dir.path().join(format!("{id}.md")),
+        Task::new(id.clone(), title).to_document(),
+    )
+    .expect("external write");
+}
+
+/// A temp dir whose config file registers one project, plus the pieces the
+/// App and launch fixtures build on. The temp dir must outlive the rest.
+fn config_file_with_one_project() -> (tempfile::TempDir, Config, PathBuf, PathBuf, Project) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store_root = dir.path().join("data");
+    let config_path = dir.path().join("config").join("config.toml");
+    let project_dir = dir.path().join("first-project");
+    fs::create_dir_all(&project_dir).expect("project dir");
+    let mut config = Config::load_from(Some(config_path.clone())).expect("load config");
+    let project = registry::register_and_save_in(&mut config, &project_dir, &store_root)
+        .expect("register first project");
+    (dir, config, config_path, store_root, project)
+}
+
+/// An app whose config lives in a file, so registry reloads have a path.
+/// Returns the app, the config file path, the data directory and the app's
+/// project (registered in the config file).
+fn setup_with_config_file() -> (tempfile::TempDir, App, PathBuf, PathBuf, Project) {
+    let (dir, config, config_path, store_root, project) = config_file_with_one_project();
+    let vault = registry::open_store(&store_root, &project).expect("open store");
+    let app = App::new(
+        vault,
+        config,
+        Some(project.clone()),
+        Some(store_root.clone()),
+    );
+    (dir, app, config_path, store_root, project)
+}
+
+/// Register a project by writing the config file, as the CLI would.
+fn register_on_disk(config_path: &Path, store_root: &Path, project_dir: &Path) -> Project {
+    fs::create_dir_all(project_dir).expect("project dir");
+    let mut config = Config::load_from(Some(config_path.to_path_buf())).expect("load config");
+    registry::register_and_save_in(&mut config, project_dir, store_root).expect("register on disk")
+}
+
+/// Unregister a project by rewriting the config file, as the CLI would.
+fn remove_on_disk(config_path: &Path, project_dir: &Path) {
+    let mut config = Config::load_from(Some(config_path.to_path_buf())).expect("load config");
+    registry::remove(&mut config, project_dir).expect("registered");
+    config.save().expect("save config");
+}
+
+/// Unregister and re-register `project_dir` while its old store folder stays
+/// on disk, so the new registration picks a different slug (what the CLI does
+/// after a store folder or a slug collision).
+fn re_register_with_a_new_slug(
+    config_path: &Path,
+    store_root: &Path,
+    project_dir: &Path,
+) -> Project {
+    let mut config = Config::load_from(Some(config_path.to_path_buf())).expect("load config");
+    registry::remove(&mut config, project_dir).expect("registered");
+    registry::register_and_save_in(&mut config, project_dir, store_root)
+        .expect("re-register on disk")
 }
 
 fn footer_text(line: &FooterLine) -> String {
@@ -1470,6 +1561,9 @@ fn move_can_choose_another_project_then_a_parent_and_switch_to_that_store() {
     let target_project_entry = project(target_project.to_str().expect("target path"), "target");
     let mut config = Config::load_from(Some(dir.path().join("config.toml"))).expect("config");
     config.projects = vec![source_project_entry.clone(), target_project_entry.clone()];
+    config
+        .save()
+        .expect("the registry lives in the config file");
     let mut app = App::new(
         source,
         config,
@@ -1610,6 +1704,226 @@ fn cross_project_move_fails_if_the_chosen_parent_was_deleted() {
     assert_eq!(
         app.toast.as_ref().map(|toast| toast.text.as_str()),
         Some(format!("error: task not found: {}", parent.id).as_str())
+    );
+}
+
+#[test]
+fn a_re_registered_project_switch_opens_the_new_slug() {
+    let (dir, mut app, config_path, store_root, _first) = setup_with_config_file();
+    let second_dir = dir.path().join("second-project");
+    let second = register_on_disk(&config_path, &store_root, &second_dir);
+
+    app.handle_key(key(KeyCode::Char('p')));
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(
+        app.project_matches()[app.picker_highlight().expect("highlight")].slug,
+        second.slug
+    );
+
+    // The CLI unregisters and re-registers the same directory; the old store
+    // folder keeps the old name, so the new registration gets a new slug.
+    let fresh = re_register_with_a_new_slug(&config_path, &store_root, &second_dir);
+    assert_ne!(fresh.slug, second.slug, "the slug really changed");
+
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(
+        app.project.as_ref(),
+        Some(&fresh),
+        "the switch resolves to the registry's current entry, not the stale clone"
+    );
+    assert_eq!(
+        app.vault.root(),
+        registry::store_path(&store_root, &fresh.slug).as_path(),
+        "the fresh slug's store is the one opened"
+    );
+}
+
+#[test]
+fn a_move_project_pick_resolves_a_re_registered_destination() {
+    let (dir, mut app, config_path, store_root, first) = setup_with_config_file();
+    let target_dir = dir.path().join("target-project");
+    let target = register_on_disk(&config_path, &store_root, &target_dir);
+    let moving = app
+        .vault
+        .add(NewTask::new("Moving task"))
+        .expect("add moving task")
+        .id;
+    app.refresh();
+
+    app.selected = Some(moving.clone());
+    app.handle_key(key(KeyCode::Tab));
+    app.handle_key(key(KeyCode::Char('m')));
+    let other = app
+        .move_choices()
+        .iter()
+        .position(|choice| matches!(choice, MoveChoice::OtherProject))
+        .expect("another project is offered");
+    for _ in 0..other {
+        app.handle_key(key(KeyCode::Down));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.picker_kind(),
+        Some(PickerKind::MoveProject { .. })
+    ));
+
+    // The destination is re-registered under a new slug while the picker is
+    // open; committing it must open the fresh store, never the old slug's.
+    let fresh = re_register_with_a_new_slug(&config_path, &store_root, &target_dir);
+    assert_ne!(fresh.slug, target.slug, "the slug really changed");
+    app.handle_key(key(KeyCode::Enter));
+
+    assert!(
+        matches!(
+            app.picker_kind(),
+            Some(PickerKind::MoveParent { project, .. }) if project.slug == fresh.slug
+        ),
+        "the parent picker targets the fresh registration: {:?}",
+        app.picker_kind()
+    );
+
+    // Committing the root moves into the fresh store.
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.project.as_ref(), Some(&fresh));
+    assert_eq!(
+        app.vault.root(),
+        registry::store_path(&store_root, &fresh.slug).as_path()
+    );
+    assert!(app.vault.get(&moving).is_some(), "the task moved");
+    assert!(
+        !registry::store_path(&store_root, &target.slug)
+            .join(moving.file_name())
+            .exists(),
+        "nothing may be written to the old slug's store"
+    );
+    assert_eq!(
+        app.project.as_ref(),
+        Some(&fresh),
+        "the session follows the fresh registration"
+    );
+    let _ = first;
+}
+
+#[test]
+fn a_move_parent_pick_rejects_a_destination_re_registered_under_a_new_slug() {
+    let (dir, mut app, config_path, store_root, first) = setup_with_config_file();
+    let target_dir = dir.path().join("target-project");
+    let target = register_on_disk(&config_path, &store_root, &target_dir);
+    let moving = app
+        .vault
+        .add(NewTask::new("Moving task"))
+        .expect("add moving task")
+        .id;
+    app.refresh();
+
+    app.selected = Some(moving.clone());
+    app.handle_key(key(KeyCode::Tab));
+    app.handle_key(key(KeyCode::Char('m')));
+    let other = app
+        .move_choices()
+        .iter()
+        .position(|choice| matches!(choice, MoveChoice::OtherProject))
+        .expect("another project is offered");
+    for _ in 0..other {
+        app.handle_key(key(KeyCode::Down));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Enter));
+    assert!(
+        matches!(
+            app.picker_kind(),
+            Some(PickerKind::MoveParent { project, .. }) if project.slug == target.slug
+        ),
+        "the parent picker opened on the old registration"
+    );
+
+    // The destination is re-registered under a new slug while the parent
+    // picker is open. The already-open vault must never be written.
+    let fresh = re_register_with_a_new_slug(&config_path, &store_root, &target_dir);
+    assert_ne!(fresh.slug, target.slug);
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(
+        app.project.as_ref(),
+        Some(&first),
+        "the session stays on the source project"
+    );
+    assert!(
+        app.vault.get(&moving).is_some(),
+        "the task must not leave the source store"
+    );
+    assert!(
+        !registry::store_path(&store_root, &target.slug)
+            .join(moving.file_name())
+            .exists(),
+        "nothing may be written to the old slug's store"
+    );
+    assert!(
+        app.toast.as_ref().is_some_and(|toast| {
+            toast.text.contains(&target.slug) && toast.text.contains(&fresh.slug)
+        }),
+        "the toast names both slugs: {:?}",
+        app.toast
+    );
+}
+
+#[test]
+fn a_move_destination_removed_before_the_move_is_rejected() {
+    let (dir, mut app, config_path, store_root, first) = setup_with_config_file();
+    let target = register_on_disk(
+        &config_path,
+        &store_root,
+        &dir.path().join("target-project"),
+    );
+    let moving = app
+        .vault
+        .add(NewTask::new("Moving task"))
+        .expect("add moving task")
+        .id;
+    app.refresh();
+
+    app.selected = Some(moving.clone());
+    app.handle_key(key(KeyCode::Tab));
+    app.handle_key(key(KeyCode::Char('m')));
+    let other = app
+        .move_choices()
+        .iter()
+        .position(|choice| matches!(choice, MoveChoice::OtherProject))
+        .expect("another project is offered");
+    for _ in 0..other {
+        app.handle_key(key(KeyCode::Down));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.picker_kind(),
+        Some(PickerKind::MoveProject { .. })
+    ));
+    app.handle_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.picker_kind(),
+        Some(PickerKind::MoveParent { .. })
+    ));
+
+    // The CLI unregisters the chosen destination before the parent is picked.
+    remove_on_disk(&config_path, &target.path);
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(
+        app.project.as_ref(),
+        Some(&first),
+        "the session stays on the source project"
+    );
+    assert!(
+        app.vault.get(&moving).is_some(),
+        "the task must not leave the source store"
+    );
+    assert!(
+        app.toast
+            .as_ref()
+            .is_some_and(|toast| toast.text.contains("no longer registered")),
+        "the failure is surfaced: {:?}",
+        app.toast
     );
 }
 
@@ -3186,15 +3500,14 @@ fn editor_reload_keeps_the_selection_and_picks_up_changes() {
 fn watcher_reloads_when_idle_and_warns_while_editing() {
     let (dir, mut app) = setup();
     let external = parse_id("external01");
-    fs::write(
-        dir.path().join("external01.md"),
-        Task::new(external.clone(), "External").to_document(),
-    )
-    .expect("external write");
+    write_external_task(&dir, &external, "External");
 
+    // Pin the clock to the watcher's own path: bounded reconciliation is
+    // covered separately and must not mask a broken watcher here.
+    let frozen = Instant::now();
     let mut reloaded = false;
     for _ in 0..40 {
-        app.on_tick();
+        app.on_tick_at(frozen);
         if app.vault.get(&external).is_some() {
             reloaded = true;
             break;
@@ -3209,15 +3522,11 @@ fn watcher_reloads_when_idle_and_warns_while_editing() {
     }
 
     let second = parse_id("external02");
-    fs::write(
-        dir.path().join("external02.md"),
-        Task::new(second.clone(), "External two").to_document(),
-    )
-    .expect("external write");
+    write_external_task(&dir, &second, "External two");
 
     let mut warned = false;
     for _ in 0..40 {
-        app.on_tick();
+        app.on_tick_at(frozen);
         if app.external_change_pending {
             warned = true;
             break;
@@ -3251,15 +3560,12 @@ fn watcher_reload_preserves_the_selected_task() {
     app.selected = Some(second.clone());
 
     let external = parse_id("external01");
-    fs::write(
-        dir.path().join("external01.md"),
-        Task::new(external.clone(), "External").to_document(),
-    )
-    .expect("external write");
+    write_external_task(&dir, &external, "External");
 
+    let frozen = Instant::now();
     let mut reloaded = false;
     for _ in 0..40 {
-        app.on_tick();
+        app.on_tick_at(frozen);
         if app.vault.get(&external).is_some() {
             reloaded = true;
             break;
@@ -3283,15 +3589,12 @@ fn watcher_pauses_during_search() {
     }
 
     let external = parse_id("external01");
-    fs::write(
-        dir.path().join("external01.md"),
-        Task::new(external.clone(), "External").to_document(),
-    )
-    .expect("external write");
+    write_external_task(&dir, &external, "External");
 
+    let frozen = Instant::now();
     let mut warned = false;
     for _ in 0..40 {
-        app.on_tick();
+        app.on_tick_at(frozen);
         if app.external_change_pending {
             warned = true;
             break;
@@ -3313,6 +3616,594 @@ fn watcher_pauses_during_search() {
     assert!(
         app.vault.get(&external).is_some(),
         "the pending change is applied after cancelling search"
+    );
+}
+
+#[test]
+fn reconciliation_recovers_a_change_the_watcher_misses() {
+    let (dir, mut app) = setup();
+    let mut clock = Clock::start();
+    // The native watcher may fail to start or drop events; recovery must not
+    // depend on it at all.
+    app.watcher = None;
+    let external = parse_id("external01");
+    write_external_task(&dir, &external, "External");
+
+    app.on_tick_at(clock.idle());
+
+    assert!(
+        app.vault.get(&external).is_some(),
+        "a bounded rescan must pick up the change without the watcher"
+    );
+}
+
+#[test]
+fn reconciliation_defers_for_an_open_buffer_and_catches_up_after() {
+    let (dir, mut app) = setup();
+    let mut clock = Clock::start();
+    app.watcher = None;
+    app.handle_key(key(KeyCode::Char('a')));
+    for character in "draft".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    let external = parse_id("external01");
+    write_external_task(&dir, &external, "External");
+
+    // Several intervals pass while the buffer is open; none may touch it.
+    app.on_tick_at(clock.idle());
+    app.on_tick_at(clock.idle());
+
+    assert!(
+        app.vault.get(&external).is_none(),
+        "no reload may touch the store while an edit buffer is open"
+    );
+    assert_eq!(app.input, "draft", "the buffer must be preserved");
+    assert!(
+        !app.external_change_pending,
+        "a routine rescan must not fake an observed external change"
+    );
+
+    app.handle_key(key(KeyCode::Esc));
+    assert!(
+        app.vault.get(&external).is_some(),
+        "the deferred rescan applies once the buffer settles"
+    );
+}
+
+#[test]
+fn reconciliation_keeps_selection_folds_marks_and_filter() {
+    let (dir, mut app) = setup();
+    let mut clock = Clock::start();
+    app.watcher = None;
+    let root = add_task(&mut app, "Root", None);
+    add_task(&mut app, "Child", Some(&root));
+    let egg = add_task(&mut app, "Egg", None);
+    app.refresh();
+    app.selected = Some(root.clone());
+    app.marked.insert(egg.clone());
+    app.handle_key(key(KeyCode::Char('h')));
+    assert!(app.collapsed.contains(&root));
+    app.active_filter = Some(FilterCriterion::State(TaskState::Open));
+
+    let external = parse_id("external01");
+    write_external_task(&dir, &external, "External");
+    app.on_tick_at(clock.idle());
+
+    assert!(app.vault.get(&external).is_some(), "the rescan happened");
+    assert_eq!(app.selected_id(), Some(root.clone()), "selection survives");
+    assert!(
+        app.collapsed.contains(&root),
+        "folds survive a reconciliation"
+    );
+    assert_eq!(
+        app.marked,
+        std::collections::BTreeSet::from([egg]),
+        "marks survive a reconciliation"
+    );
+    assert_eq!(
+        app.active_filter,
+        Some(FilterCriterion::State(TaskState::Open)),
+        "the filter survives a reconciliation"
+    );
+}
+
+#[test]
+fn idle_reconciliation_never_rewrites_files() {
+    let (dir, mut app) = setup();
+    let mut clock = Clock::start();
+    app.watcher = None;
+    let target = app
+        .vault
+        .add(NewTask::new("Synced title"))
+        .expect("add target");
+    let mirror = app
+        .vault
+        .add(NewTask {
+            body: format!("[[{}.md|Synced title]]", target.id),
+            ..NewTask::new("Mirror")
+        })
+        .expect("add mirror");
+    app.refresh();
+
+    let paths = [
+        dir.path().join(format!("{}.md", target.id)),
+        dir.path().join(format!("{}.md", mirror.id)),
+    ];
+    let snapshot = |path: &PathBuf| {
+        (
+            fs::metadata(path)
+                .expect("metadata")
+                .modified()
+                .expect("mtime"),
+            fs::read(path).expect("read"),
+        )
+    };
+    let before: Vec<_> = paths.iter().map(snapshot).collect();
+
+    // Keep the rescans busy so this is not vacuously green, then prove the
+    // synced files were never touched.
+    let external = parse_id("external01");
+    write_external_task(&dir, &external, "External");
+    for _ in 0..3 {
+        app.on_tick_at(clock.idle());
+    }
+    assert!(
+        app.vault.get(&external).is_some(),
+        "the bounded rescans really ran"
+    );
+
+    let after: Vec<_> = paths.iter().map(snapshot).collect();
+    assert_eq!(
+        before, after,
+        "rescanning an unchanged store must not rewrite its files"
+    );
+}
+
+#[test]
+fn a_failed_watcher_start_is_visible_and_reconciliation_still_recovers() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let vault = Vault::open(dir.path()).expect("open vault");
+    // Watching a folder that vanished must fail, as it would on a broken
+    // data directory.
+    fs::remove_dir_all(dir.path()).expect("remove store folder");
+
+    let mut app = App::new(vault, Config::default(), None, None);
+    let mut clock = Clock::start();
+
+    assert!(
+        app.watcher.is_none(),
+        "watching a missing folder cannot start"
+    );
+    assert!(
+        app.toast
+            .as_ref()
+            .is_some_and(|toast| toast.text.contains("instant updates unavailable")),
+        "a watcher that never starts must not be silent: {:?}",
+        app.toast
+    );
+
+    // The session stays usable: bounded reconciliation is independent of the
+    // watcher.
+    fs::create_dir_all(dir.path()).expect("recreate store folder");
+    let mut cli = Vault::open(dir.path()).expect("open store again");
+    let task = cli.add(NewTask::new("Recovered")).expect("add").id;
+    app.on_tick_at(clock.idle());
+    assert!(
+        app.vault.get(&task).is_some(),
+        "reconciliation keeps the session usable without a watcher"
+    );
+}
+
+#[test]
+fn two_open_tuis_each_reconcile_the_shared_store() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = dir.path().join("store");
+    let mut first = App::new(
+        Vault::open(&store).expect("open first"),
+        Config::default(),
+        None,
+        None,
+    );
+    let mut second = App::new(
+        Vault::open(&store).expect("open second"),
+        Config::default(),
+        None,
+        None,
+    );
+    first.watcher = None;
+    second.watcher = None;
+    let mut clock = Clock::start();
+
+    // A third process (the CLI) writes through its own vault.
+    let mut cli = Vault::open(&store).expect("open cli");
+    let task = cli.add(NewTask::new("From the CLI")).expect("cli add").id;
+
+    first.on_tick_at(clock.idle());
+    second.on_tick_at(clock.idle());
+
+    assert!(
+        first.vault.get(&task).is_some(),
+        "every open TUI must see the CLI's task"
+    );
+    assert!(second.vault.get(&task).is_some());
+}
+
+#[test]
+fn reconciliation_leaves_an_in_memory_config_alone() {
+    let (_dir, mut app) = setup();
+    let mut clock = Clock::start();
+    app.config.projects.push(project("/somewhere", "somewhere"));
+
+    app.on_tick_at(clock.idle());
+    app.on_tick_at(clock.idle());
+
+    assert_eq!(
+        app.config.projects.len(),
+        1,
+        "a config with no file path (tests, embedding) is never reloaded"
+    );
+}
+
+#[test]
+fn the_reconcile_clock_fires_on_elapsed_time_not_calls() {
+    let start = Instant::now();
+    let mut clock = ReconcileClock::new(start);
+
+    for _ in 0..1000 {
+        assert!(
+            !clock.due(start + Duration::from_millis(999)),
+            "calls alone never reach the interval"
+        );
+    }
+    assert!(
+        clock.due(start + RECONCILE_INTERVAL),
+        "an elapsed interval fires"
+    );
+    assert!(
+        !clock.due(start + RECONCILE_INTERVAL + Duration::from_millis(999)),
+        "the due moment restarts the interval"
+    );
+    assert!(clock.due(start + 2 * RECONCILE_INTERVAL));
+}
+
+#[test]
+fn a_keypress_burst_does_not_accelerate_reconciliation() {
+    let (dir, mut app) = setup();
+    let mut clock = Clock::start();
+    app.watcher = None;
+    let external = parse_id("external01");
+    write_external_task(&dir, &external, "External");
+
+    // The event loop ticks on every keypress and resize; input within one
+    // interval must not add up to a rescan.
+    for _ in 0..200 {
+        app.handle_key(key(KeyCode::Char('j')));
+        app.on_tick_at(clock.now());
+    }
+    assert!(
+        app.vault.get(&external).is_none(),
+        "input must not schedule a bounded rescan"
+    );
+
+    app.on_tick_at(clock.idle());
+    assert!(
+        app.vault.get(&external).is_some(),
+        "elapsed time still reconciles"
+    );
+}
+
+#[test]
+fn a_project_picker_opened_later_sees_a_cli_registration() {
+    let (dir, mut app, config_path, store_root, _first) = setup_with_config_file();
+    let second = register_on_disk(
+        &config_path,
+        &store_root,
+        &dir.path().join("second-project"),
+    );
+
+    app.handle_key(key(KeyCode::Char('p')));
+
+    let matches = app.project_matches();
+    assert!(
+        matches.iter().any(|project| project.slug == second.slug),
+        "a picker opened now must show the CLI's registration: {matches:?}"
+    );
+}
+
+#[test]
+fn an_open_project_picker_follows_a_registry_reload_by_identity() {
+    let (dir, mut app, config_path, store_root, first) = setup_with_config_file();
+    let second = register_on_disk(
+        &config_path,
+        &store_root,
+        &dir.path().join("second-project"),
+    );
+
+    app.handle_key(key(KeyCode::Char('p')));
+    for character in "project".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(
+        app.project_matches()[app.picker_highlight().expect("highlight")].slug,
+        second.slug
+    );
+    let mut clock = Clock::start();
+
+    // The CLI removes the project above the highlighted one; the highlight
+    // must follow `second` instead of shifting onto `first`.
+    remove_on_disk(&config_path, &first.path);
+    app.on_tick_at(clock.idle());
+
+    assert_eq!(app.input, "project", "the query survives a registry reload");
+    let matches = app.project_matches();
+    assert!(
+        !matches.iter().any(|project| project.slug == first.slug),
+        "the stale choice is gone: {matches:?}"
+    );
+    assert_eq!(
+        matches[app.picker_highlight().expect("highlight")].slug,
+        second.slug,
+        "the highlight follows the same project by identity"
+    );
+}
+
+#[test]
+fn a_project_removed_before_commit_cannot_be_opened() {
+    let (dir, mut app, config_path, store_root, first) = setup_with_config_file();
+    let second_dir = dir.path().join("second-project");
+    let second = register_on_disk(&config_path, &store_root, &second_dir);
+
+    app.handle_key(key(KeyCode::Char('p')));
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(
+        app.project_matches()[app.picker_highlight().expect("highlight")].slug,
+        second.slug
+    );
+    remove_on_disk(&config_path, &second_dir);
+
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(
+        app.project,
+        Some(first),
+        "a project removed from the registry must not be opened"
+    );
+    assert!(
+        matches!(app.mode, InputMode::Pick(_)),
+        "the picker stays open so another project can be chosen"
+    );
+    assert!(
+        app.toast
+            .as_ref()
+            .is_some_and(|toast| toast.text.contains("no longer registered")),
+        "the failure is surfaced: {:?}",
+        app.toast
+    );
+}
+
+#[test]
+fn removing_the_current_registration_keeps_its_store_open() {
+    let (dir, mut app, config_path, store_root, _first) = setup_with_config_file();
+    let second = register_on_disk(
+        &config_path,
+        &store_root,
+        &dir.path().join("second-project"),
+    );
+    app.handle_key(key(KeyCode::Char('p')));
+    for character in "second-project".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.project.as_ref(), Some(&second));
+    let store = registry::store_path(&store_root, &second.slug);
+    let mut clock = Clock::start();
+
+    // The CLI unregisters the project the session is currently on.
+    remove_on_disk(&config_path, &second.path);
+    app.watcher = None;
+    app.on_tick_at(clock.idle());
+
+    assert_eq!(
+        app.project.as_ref(),
+        Some(&second),
+        "removing the registration must not force a switch"
+    );
+    assert_eq!(app.vault.root(), store.as_path(), "the store stays open");
+    app.vault
+        .add(NewTask::new("Still writable"))
+        .expect("the store stays usable");
+}
+
+#[test]
+fn a_broken_config_keeps_the_last_good_registry_and_warns_once() {
+    let (_dir, mut app, config_path, _store_root, first) = setup_with_config_file();
+    let mut clock = Clock::start();
+    fs::write(&config_path, "this is not toml [[[").expect("corrupt config");
+
+    app.on_tick_at(clock.idle());
+    assert_eq!(
+        app.config.projects,
+        vec![first],
+        "a parse failure keeps the last good registry"
+    );
+    assert!(
+        app.toast
+            .as_ref()
+            .is_some_and(|toast| toast.text.contains("config error")),
+        "the parse failure is surfaced: {:?}",
+        app.toast
+    );
+
+    // A later action's feedback must not be replaced by the same failure on
+    // every bounded rescan.
+    app.set_toast("action");
+    app.on_tick_at(clock.idle());
+    app.on_tick_at(clock.idle());
+    assert_eq!(
+        app.toast.as_ref().map(|toast| toast.text.as_str()),
+        Some("action"),
+        "a persistent config error must not spam the toast"
+    );
+}
+
+#[test]
+fn the_p_prompt_save_keeps_cli_registry_changes_written_while_it_waits() {
+    let (dir, mut app, config_path, store_root, first) = setup_with_config_file();
+    let new_dir = dir.path().join("new-project");
+    fs::create_dir_all(&new_dir).expect("new project dir");
+    app.handle_key(key(KeyCode::Char('P')));
+    for character in new_dir.to_str().expect("path").chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    // The CLI registers a project and drops another while the prompt waits.
+    let second = register_on_disk(
+        &config_path,
+        &store_root,
+        &dir.path().join("second-project"),
+    );
+    remove_on_disk(&config_path, &first.path);
+
+    app.handle_key(key(KeyCode::Enter));
+
+    let registered = app
+        .project
+        .as_ref()
+        .expect("the typed project registered")
+        .slug
+        .clone();
+    let saved = Config::load_from(Some(config_path)).expect("reload config");
+    let slugs: Vec<&str> = saved
+        .projects
+        .iter()
+        .map(|project| project.slug.as_str())
+        .collect();
+    assert!(
+        slugs.contains(&second.slug.as_str()),
+        "the save must not erase a CLI registration: {slugs:?}"
+    );
+    assert!(slugs.contains(&registered.as_str()));
+    assert!(
+        !slugs.contains(&first.slug.as_str()),
+        "the save must not resurrect a CLI removal: {slugs:?}"
+    );
+}
+
+#[test]
+fn the_p_prompt_refuses_to_overwrite_a_broken_config() {
+    let (dir, mut app, config_path, _store_root, _first) = setup_with_config_file();
+    let new_dir = dir.path().join("new-project");
+    fs::create_dir_all(&new_dir).expect("new project dir");
+    app.handle_key(key(KeyCode::Char('P')));
+    let typed = new_dir.to_str().expect("path").to_owned();
+    for character in typed.chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    let broken = "this is not toml [[[";
+    fs::write(&config_path, broken).expect("corrupt config");
+    // The periodic rescan may already have surfaced the failure and the user
+    // moved on; the save must still answer.
+    let mut clock = Clock::start();
+    app.on_tick_at(clock.idle());
+    app.set_toast("action");
+
+    app.handle_key(key(KeyCode::Enter));
+
+    assert!(
+        matches!(app.mode, InputMode::RegisterPath),
+        "the prompt stays open so the path can be retried"
+    );
+    assert_eq!(app.input, typed, "the typed path is preserved");
+    assert!(
+        app.toast
+            .as_ref()
+            .is_some_and(|toast| toast.text.contains("config error")),
+        "the failed save answers: {:?}",
+        app.toast
+    );
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("read"),
+        broken,
+        "an unreadable registry is never overwritten"
+    );
+}
+
+#[test]
+fn reconciliation_follows_the_store_after_switching_projects() {
+    let (dir, mut app, config_path, store_root, first) = setup_with_config_file();
+    let second = register_on_disk(
+        &config_path,
+        &store_root,
+        &dir.path().join("second-project"),
+    );
+
+    app.handle_key(key(KeyCode::Char('p')));
+    for character in "second-project".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.project.as_ref(), Some(&second));
+    let second_store = registry::store_path(&store_root, &second.slug);
+    assert_eq!(app.vault.root(), second_store.as_path());
+
+    app.watcher = None;
+    let mut clock = Clock::start();
+    let mut cli = Vault::open(&second_store).expect("open second store");
+    let task = cli
+        .add(NewTask::new("Written in the second store"))
+        .expect("add")
+        .id;
+    let first_store = registry::store_path(&store_root, &first.slug);
+    let mut first_cli = Vault::open(&first_store).expect("open first store");
+    let stray = first_cli
+        .add(NewTask::new("Written in the first store"))
+        .expect("add")
+        .id;
+
+    app.on_tick_at(clock.idle());
+
+    assert!(
+        app.vault.get(&task).is_some(),
+        "reconciliation must rescan the current store"
+    );
+    assert!(
+        app.vault.get(&stray).is_none(),
+        "the previous project's store must not be scanned"
+    );
+    assert_eq!(
+        app.project.as_ref(),
+        Some(&second),
+        "a registry reload must not change the current project"
+    );
+}
+
+#[test]
+fn reconciliation_follows_a_newly_registered_store() {
+    let (dir, mut app, _config_path, store_root, _first) = setup_with_config_file();
+    let new_dir = dir.path().join("new-project");
+    fs::create_dir_all(&new_dir).expect("new project dir");
+
+    app.handle_key(key(KeyCode::Char('P')));
+    for character in new_dir.to_str().expect("path").chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    let project = app.project.clone().expect("registered project");
+    app.watcher = None;
+    let mut clock = Clock::start();
+
+    let store = registry::store_path(&store_root, &project.slug);
+    let mut cli = Vault::open(&store).expect("open new store");
+    let task = cli
+        .add(NewTask::new("Written after re-registering"))
+        .expect("add")
+        .id;
+
+    app.on_tick_at(clock.idle());
+
+    assert!(
+        app.vault.get(&task).is_some(),
+        "reconciliation must follow the store the session switched to"
     );
 }
 
@@ -4905,6 +5796,36 @@ fn unregistered_launch_with_other() -> (tempfile::TempDir, Launch) {
     (dir, launch)
 }
 
+/// Unregistered cwd plus one already-registered project, with a config file so
+/// the launch modal can reconcile its registry from its original path.
+fn launch_picker_with_config_file() -> (tempfile::TempDir, Launch, PathBuf, PathBuf, Project) {
+    let (dir, config, config_path, store_root, project) = config_file_with_one_project();
+    let fresh = dir.path().join("fresh");
+    fs::create_dir_all(&fresh).expect("fresh");
+    let launch = Launch::new_projects(
+        config,
+        Resolution::Unregistered { path: fresh },
+        store_root.clone(),
+    );
+    (dir, launch, config_path, store_root, project)
+}
+
+/// A launch modal backed by an empty config file, for register-path tests.
+fn launch_with_config_file() -> (tempfile::TempDir, Launch, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fresh = dir.path().join("fresh");
+    fs::create_dir_all(&fresh).expect("fresh");
+    let store_root = dir.path().join("data");
+    let config_path = dir.path().join("config").join("config.toml");
+    let config = Config::load_from(Some(config_path.clone())).expect("load config");
+    let launch = Launch::new(
+        config,
+        Resolution::Unregistered { path: fresh },
+        store_root.clone(),
+    );
+    (dir, launch, config_path, store_root)
+}
+
 /// An unregistered launch question backed by a config with the given
 /// registered projects, so the project picker has candidates to navigate.
 fn launch_with_projects(projects: Vec<Project>) -> (tempfile::TempDir, Launch) {
@@ -5774,6 +6695,319 @@ fn launch_project_picker_no_match_enter_sets_error_and_a_query_edit_clears_it() 
     launch.handle_key(key(KeyCode::Backspace));
     assert_eq!(launch.project_pick().expect("picker").0, "zzz");
     assert_eq!(launch.overlay_error(), None);
+}
+
+#[test]
+fn launch_picker_refreshes_from_the_config_file_while_open() {
+    let (dir, mut launch, config_path, store_root, _first) = launch_picker_with_config_file();
+    assert_eq!(launch.project_pick().expect("picker").2.len(), 1);
+    let mut clock = Clock::start();
+
+    let second = register_on_disk(
+        &config_path,
+        &store_root,
+        &dir.path().join("second-project"),
+    );
+    launch.on_tick_at(clock.idle());
+
+    let (_, _, matches) = launch.project_pick().expect("picker");
+    assert!(
+        matches.iter().any(|project| project.slug == second.slug),
+        "an open picker must see the CLI's registration: {matches:?}"
+    );
+}
+
+#[test]
+fn launch_registry_refresh_waits_for_elapsed_time() {
+    let (dir, mut launch, config_path, store_root, _first) = launch_picker_with_config_file();
+    let second = register_on_disk(
+        &config_path,
+        &store_root,
+        &dir.path().join("second-project"),
+    );
+    let mut clock = Clock::start();
+
+    // Keys within one interval must not re-read the registry...
+    for _ in 0..50 {
+        launch.handle_key(key(KeyCode::Down));
+        launch.on_tick_at(clock.now());
+    }
+    let (_, _, matches) = launch.project_pick().expect("picker");
+    assert_eq!(
+        matches.len(),
+        1,
+        "input must not refresh the registry: {matches:?}"
+    );
+
+    // ...but an idle interval does.
+    launch.on_tick_at(clock.idle());
+    let (_, _, matches) = launch.project_pick().expect("picker");
+    assert!(
+        matches.iter().any(|project| project.slug == second.slug),
+        "an idle interval refreshes the picker: {matches:?}"
+    );
+}
+
+#[test]
+fn launch_picker_keeps_query_and_highlight_identity_across_a_reload() {
+    let (dir, mut launch, config_path, store_root, first) = launch_picker_with_config_file();
+    let second = register_on_disk(
+        &config_path,
+        &store_root,
+        &dir.path().join("second-project"),
+    );
+    let mut clock = Clock::start();
+    launch.on_tick_at(clock.idle());
+    for character in "project".chars() {
+        launch.handle_key(key(KeyCode::Char(character)));
+    }
+    launch.handle_key(key(KeyCode::Down));
+    let (query, highlight, matches) = launch.project_pick().expect("picker");
+    assert_eq!(query, "project");
+    assert_eq!(matches[highlight].slug, second.slug);
+
+    // The CLI removes the project above the highlighted one; the highlight
+    // must follow `second` instead of shifting onto `first`.
+    remove_on_disk(&config_path, &first.path);
+    launch.on_tick_at(clock.idle());
+
+    let (query, highlight, matches) = launch.project_pick().expect("picker");
+    assert_eq!(query, "project", "the query survives a registry reload");
+    assert!(
+        !matches.iter().any(|project| project.slug == first.slug),
+        "the stale choice is gone: {matches:?}"
+    );
+    assert_eq!(
+        matches[highlight].slug, second.slug,
+        "the highlight follows the same project by identity"
+    );
+}
+
+#[test]
+fn launch_pick_enter_resolves_a_re_registered_project_to_its_new_slug() {
+    let (_dir, mut launch, config_path, store_root, first) = launch_picker_with_config_file();
+    let fresh = re_register_with_a_new_slug(&config_path, &store_root, &first.path);
+    assert_ne!(fresh.slug, first.slug, "the slug really changed");
+
+    launch.handle_key(key(KeyCode::Enter));
+
+    assert!(launch.ready());
+    let (_, project) = launch.into_parts();
+    assert_eq!(
+        project.slug, fresh.slug,
+        "the pick resolves to the registry's current entry, not the stale clone"
+    );
+}
+
+#[test]
+fn launch_pick_rejects_a_project_removed_from_the_registry() {
+    let (_dir, mut launch, config_path, _store_root, first) = launch_picker_with_config_file();
+    remove_on_disk(&config_path, &first.path);
+
+    launch.handle_key(key(KeyCode::Enter));
+
+    assert!(!launch.ready(), "a removed project must not be opened");
+    assert!(
+        launch.project_pick().is_some(),
+        "the picker stays open so another project can be chosen"
+    );
+    assert!(
+        launch
+            .overlay_error()
+            .is_some_and(|error| error.contains("no longer registered")),
+        "the failure is surfaced: {:?}",
+        launch.overlay_error()
+    );
+}
+
+#[test]
+fn launch_register_prompt_keeps_typed_input_across_a_registry_reload() {
+    let (dir, mut launch, config_path, store_root) = launch_with_config_file();
+    launch.handle_key(key(KeyCode::Char('p')));
+    assert_eq!(
+        launch.path_input(),
+        Some(""),
+        "an empty registry opens the path prompt: {:?}",
+        launch.path_input()
+    );
+    for character in "/tmp/typed".chars() {
+        launch.handle_key(key(KeyCode::Char(character)));
+    }
+    let mut clock = Clock::start();
+
+    register_on_disk(&config_path, &store_root, &dir.path().join("cli-project"));
+    launch.on_tick_at(clock.idle());
+
+    assert_eq!(
+        launch.path_input(),
+        Some("/tmp/typed"),
+        "a registry change must not discard typed input"
+    );
+    assert!(!launch.ready(), "the prompt stays open");
+}
+
+#[test]
+fn launch_picker_opened_later_sees_a_cli_registration() {
+    let (dir, mut launch, config_path, store_root) = launch_with_config_file();
+    let second = register_on_disk(
+        &config_path,
+        &store_root,
+        &dir.path().join("second-project"),
+    );
+
+    launch.handle_key(key(KeyCode::Char('p')));
+
+    let (_, _, matches) = launch.project_pick().expect("picker opened later");
+    assert!(
+        matches.iter().any(|project| project.slug == second.slug),
+        "a picker opened now must show the CLI's registration: {matches:?}"
+    );
+}
+
+#[test]
+fn launch_registration_keeps_a_cli_registration_written_while_it_waits() {
+    let (dir, mut launch, config_path, store_root) = launch_with_config_file();
+    let first = register_on_disk(&config_path, &store_root, &dir.path().join("first-project"));
+    let second = register_on_disk(
+        &config_path,
+        &store_root,
+        &dir.path().join("second-project"),
+    );
+
+    // Accept: register cwd. The save must not erase what the CLI wrote.
+    launch.handle_key(key(KeyCode::Char('y')));
+    assert!(launch.ready());
+    let (config, project) = launch.into_parts();
+    assert_eq!(project.slug, "fresh");
+    for slug in [&first.slug, &second.slug, &project.slug] {
+        assert!(
+            config.projects.iter().any(|entry| &entry.slug == slug),
+            "{slug} survives the registration save: {:?}",
+            config.projects
+        );
+    }
+
+    let reloaded = Config::load_from(Some(config_path)).expect("reload config");
+    assert!(reloaded
+        .projects
+        .iter()
+        .any(|entry| entry.slug == second.slug));
+}
+
+#[test]
+fn launch_broken_config_keeps_the_last_good_registry_and_warns_once() {
+    let (_dir, mut launch, config_path, _store_root, first) = launch_picker_with_config_file();
+    let mut clock = Clock::start();
+    fs::write(&config_path, "this is not toml [[[").expect("corrupt config");
+
+    launch.on_tick_at(clock.idle());
+    let (_, _, matches) = launch.project_pick().expect("picker");
+    assert_eq!(
+        matches,
+        vec![first],
+        "a parse failure keeps the last good registry"
+    );
+    assert!(
+        launch
+            .overlay_error()
+            .is_some_and(|error| error.contains("config error")),
+        "the parse failure is surfaced: {:?}",
+        launch.overlay_error()
+    );
+
+    // Once the user's query edit clears it, the same failure must not come
+    // back on every bounded reconciliation.
+    launch.handle_key(key(KeyCode::Char('z')));
+    assert_eq!(launch.overlay_error(), None);
+    launch.on_tick_at(clock.idle());
+    launch.on_tick_at(clock.idle());
+    assert_eq!(
+        launch.overlay_error(),
+        None,
+        "a persistent config error must not spam the overlay"
+    );
+}
+
+#[test]
+fn launch_save_paths_refuse_to_overwrite_a_broken_config() {
+    const BROKEN: &str = "this is not toml [[[";
+
+    // `y` on the register question.
+    let (_dir, mut launch, config_path, _store_root) = launch_with_config_file();
+    fs::create_dir_all(config_path.parent().expect("config dir")).expect("config dir");
+    fs::write(&config_path, BROKEN).expect("corrupt config");
+    launch.handle_key(key(KeyCode::Char('y')));
+    assert!(!launch.ready(), "a broken registry is not overwritten");
+    assert_eq!(fs::read_to_string(&config_path).expect("read"), BROKEN);
+    let text = render_launch_lines(&launch, 90, 12).join("\n");
+    assert!(text.contains("config error"), "{text}");
+
+    // A typed path in the empty-registry prompt.
+    let (dir, mut launch, config_path, _store_root) = launch_with_config_file();
+    launch.handle_key(key(KeyCode::Char('p')));
+    let typed = dir.path().join("typed");
+    for character in typed.to_str().expect("path").chars() {
+        launch.handle_key(key(KeyCode::Char(character)));
+    }
+    fs::create_dir_all(config_path.parent().expect("config dir")).expect("config dir");
+    fs::write(&config_path, BROKEN).expect("corrupt config");
+    launch.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        launch.path_input(),
+        Some(typed.to_str().expect("path")),
+        "the typed path is preserved"
+    );
+    assert!(
+        launch
+            .overlay_error()
+            .is_some_and(|error| error.contains("config error")),
+        "the failure is surfaced: {:?}",
+        launch.overlay_error()
+    );
+    assert_eq!(fs::read_to_string(&config_path).expect("read"), BROKEN);
+
+    // `!` on the nested question.
+    let (_dir, mut launch, config_path) = nested_launch();
+    fs::write(&config_path, BROKEN).expect("corrupt config");
+    launch.handle_key(key(KeyCode::Char('!')));
+    assert!(!launch.ready(), "a broken registry is not overwritten");
+    assert_eq!(fs::read_to_string(&config_path).expect("read"), BROKEN);
+}
+
+#[test]
+fn a_failed_launch_save_answers_after_the_error_was_dismissed() {
+    let (dir, mut launch, config_path, _store_root) = launch_with_config_file();
+    launch.handle_key(key(KeyCode::Char('p')));
+    let typed = dir.path().join("typed");
+    for character in typed.to_str().expect("path").chars() {
+        launch.handle_key(key(KeyCode::Char(character)));
+    }
+    let broken = "this is not toml [[[";
+    fs::create_dir_all(config_path.parent().expect("config dir")).expect("config dir");
+    fs::write(&config_path, broken).expect("corrupt config");
+
+    // The rescan surfaces the failure, then a query edit clears the overlay.
+    let mut clock = Clock::start();
+    launch.on_tick_at(clock.idle());
+    assert!(
+        launch
+            .overlay_error()
+            .is_some_and(|error| error.contains("config error")),
+        "the rescan surfaced it: {:?}",
+        launch.overlay_error()
+    );
+    launch.handle_key(key(KeyCode::Char('x')));
+    assert_eq!(launch.overlay_error(), None, "the user dismissed it");
+
+    launch.handle_key(key(KeyCode::Enter));
+    assert!(
+        launch
+            .overlay_error()
+            .is_some_and(|error| error.contains("config error")),
+        "the failed save answers: {:?}",
+        launch.overlay_error()
+    );
+    assert_eq!(fs::read_to_string(&config_path).expect("read"), broken);
 }
 
 #[test]

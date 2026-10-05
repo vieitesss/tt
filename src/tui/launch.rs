@@ -9,6 +9,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::Context;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -16,6 +17,9 @@ use tt::resolve::Resolution;
 use tt::{registry, Config, Project};
 
 use super::app::expand_tilde;
+use super::live::{
+    registered_like, retarget_highlight, ReconcileClock, RegistryFile, RegistryRefresh,
+};
 use super::picker::{self, Picker, PickerKind};
 use super::text::pop_word;
 
@@ -71,6 +75,10 @@ pub(crate) struct Launch {
     quit: bool,
     /// Index of the highlighted button into [`Launch::buttons`].
     button: usize,
+    /// Wall-clock trigger for the bounded registry re-read.
+    reconcile: ReconcileClock,
+    /// The registry file this modal re-reads for CLI project changes.
+    registry_file: RegistryFile,
 }
 
 impl Launch {
@@ -90,6 +98,8 @@ impl Launch {
             error: None,
             quit: false,
             button: 0,
+            reconcile: ReconcileClock::new(Instant::now()),
+            registry_file: RegistryFile::default(),
         }
     }
 
@@ -104,6 +114,20 @@ impl Launch {
         let mut launch = Self::new(config, resolution, store_root);
         launch.enter_projects(None, current.as_ref());
         launch
+    }
+
+    /// Poll the registry on the bounded clock, so a project added or removed
+    /// by the CLI appears while the modal is open.
+    pub(crate) fn on_tick(&mut self) {
+        self.on_tick_at(Instant::now());
+    }
+
+    /// [`on_tick`](Self::on_tick) at an explicit instant; tests drive this
+    /// with a virtual clock so a burst of keys cannot accelerate the re-read.
+    pub(crate) fn on_tick_at(&mut self, now: Instant) {
+        if self.reconcile.due(now) {
+            self.reload_registry();
+        }
     }
 
     /// Human-readable lines for the modal (empty when already ready or when a
@@ -167,6 +191,77 @@ impl Launch {
             picker.highlight,
             picker::project_matches(query, &self.config.projects, self.path_display()),
         ))
+    }
+
+    /// Re-read the registry from the file it was loaded from, so a project
+    /// added or removed by the CLI reaches a picker that is open or opened
+    /// later. An in-memory config with no file path is left as it is.
+    ///
+    /// Returns whether the registry is current. On a read or parse failure the
+    /// last good registry stands and the overlay error is set once; a caller
+    /// about to open a store may continue on it, but a caller about to write
+    /// the registry must stop so the save cannot overwrite the file.
+    fn reload_registry(&mut self) -> bool {
+        let highlighted = self.highlighted_project();
+        let surfaced = self.registry_file.surfaced().map(str::to_owned);
+        match self.registry_file.refresh(&self.config) {
+            RegistryRefresh::InMemory => true,
+            RegistryRefresh::Fresh(config) => {
+                self.config = config;
+                // A readable file resolves the failure it replaced; action
+                // feedback is left alone.
+                if self.error.is_some() && self.error == surfaced {
+                    self.error = None;
+                }
+                self.retarget_pick(highlighted.as_ref());
+                true
+            }
+            RegistryRefresh::Failed(message) => {
+                if let Some(message) = message {
+                    self.error = Some(message);
+                }
+                false
+            }
+        }
+    }
+
+    /// [`reload_registry`](Self::reload_registry) before a save: a failure
+    /// always answers the user action, even when the periodic rescan already
+    /// surfaced (and the user dismissed) the same message.
+    fn reload_registry_for_save(&mut self) -> bool {
+        if self.reload_registry() {
+            return true;
+        }
+        self.error = self.registry_file.surfaced().map(str::to_owned);
+        false
+    }
+
+    /// The project highlighted in the open picker, if any. Captured before a
+    /// registry reload so the highlight can follow the same project by
+    /// identity instead of by index.
+    fn highlighted_project(&self) -> Option<Project> {
+        let LaunchState::Pick { query, picker, .. } = &self.state else {
+            return None;
+        };
+        let matches =
+            picker::project_matches(query, &self.config.projects, &self.config.path_display);
+        let highlight = picker.highlight.min(matches.len().checked_sub(1)?);
+        matches.get(highlight).cloned()
+    }
+
+    /// Keep the open picker's highlight on the same project after a registry
+    /// reload; a vanished project clamps the highlight to the shortened list.
+    fn retarget_pick(&mut self, previous: Option<&Project>) {
+        let LaunchState::Pick { query, picker, .. } = &self.state else {
+            return;
+        };
+        let matches =
+            picker::project_matches(query, &self.config.projects, &self.config.path_display);
+        let highlight = retarget_highlight(&matches, picker.highlight, previous);
+        let LaunchState::Pick { picker, .. } = &mut self.state else {
+            return;
+        };
+        picker.highlight = highlight;
     }
 
     /// Typed path in the empty-registry register prompt.
@@ -296,16 +391,26 @@ impl Launch {
     }
 
     /// Consume the modal, returning the config and the resolved project.
-    pub(crate) fn into_parts(self) -> (Config, Project) {
-        let LaunchState::Ready(project) = self.state else {
+    ///
+    /// The registry is re-read immediately before the store is opened, so a
+    /// project that was unregistered or re-registered under a new slug while
+    /// the modal waited resolves to its current entry.
+    pub(crate) fn into_parts(mut self) -> (Config, Project) {
+        self.reload_registry();
+        let LaunchState::Ready(project) = &self.state else {
             unreachable!("launch is only consumed once a project is ready");
         };
+        let project = registered_like(&self.config, project).unwrap_or_else(|| project.clone());
         (self.config, project)
     }
 
     /// Open the project picker, or the register-path prompt when none exist.
     fn enter_projects(&mut self, back: Option<PathBuf>, current: Option<&Project>) {
+        // A picker opened now must show the registry as it is now; the
+        // refresh comes after clearing stale action feedback so a config
+        // error it surfaces is not lost.
         self.error = None;
+        self.reload_registry();
         if self.config.projects.is_empty() {
             self.state = LaunchState::RegisterDir {
                 back,
@@ -378,18 +483,22 @@ impl Launch {
     }
 
     fn commit_pick(&mut self) {
-        let LaunchState::Pick { query, picker, .. } = &self.state else {
-            return;
-        };
-        let matches =
-            picker::project_matches(query, &self.config.projects, &self.config.path_display);
-        if matches.is_empty() {
+        let intended = self.highlighted_project();
+        // Resolve against the registry as it is now: a project removed
+        // meanwhile must not be opened, and a re-registered one resolves to
+        // its current entry (its slug may have changed).
+        self.reload_registry();
+        let Some(intended) = intended else {
             self.error = Some("no matching projects".to_owned());
             return;
+        };
+        match registered_like(&self.config, &intended) {
+            Some(project) => {
+                self.state = LaunchState::Ready(project);
+                self.error = None;
+            }
+            None => self.error = Some(format!("{} is no longer registered", intended.slug)),
         }
-        let project = matches[picker.highlight.min(matches.len() - 1)].clone();
-        self.state = LaunchState::Ready(project);
-        self.error = None;
     }
 
     fn commit_path(&mut self) {
@@ -406,6 +515,12 @@ impl Launch {
         }
         if let Err(error) = fs::create_dir_all(&path) {
             self.error = Some(format!("{error}"));
+            return;
+        }
+        // Re-read before saving so a registration made meanwhile is kept, and
+        // stop when the file cannot be read: saving the stale registry would
+        // overwrite whatever the file now holds. The typed path is kept.
+        if !self.reload_registry_for_save() {
             return;
         }
         match registry::register_and_save_in(&mut self.config, &path, &self.store_root) {
@@ -434,6 +549,12 @@ impl Launch {
 
     /// Register `path` and make it the resolved project.
     fn register(&mut self, path: PathBuf) {
+        // Re-read before saving so a registration made meanwhile is kept, and
+        // stop when the file cannot be read: saving the stale registry would
+        // overwrite whatever the file now holds. The question stays open.
+        if !self.reload_registry_for_save() {
+            return;
+        }
         let outcome = registry::register_and_save_in(&mut self.config, &path, &self.store_root);
         match outcome {
             Ok(project) => {
@@ -446,6 +567,12 @@ impl Launch {
 
     /// Persist the never-ask rule for `project` and keep using it.
     fn never_ask(&mut self, project: &Project) {
+        // Re-read before saving so a registration made meanwhile is kept, and
+        // stop when the file cannot be read: saving the stale registry would
+        // overwrite whatever the file now holds.
+        if !self.reload_registry_for_save() {
+            return;
+        }
         if let Err(error) =
             registry::set_never_ask(&mut self.config, project).context("saving the config")
         {

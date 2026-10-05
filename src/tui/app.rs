@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{Local, NaiveDate};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -23,6 +23,10 @@ use tt::{
 
 use super::keymap::{keymap_columns, keymap_content_lines, keymap_content_width, keymap_geometry};
 use super::list::TaskList;
+use super::live::{
+    registered_like, retarget_highlight, same_project, FailureLatch, ReconcileClock, RegistryFile,
+    RegistryRefresh,
+};
 use super::picker::{self, FilterChoice, FilterCriterion, MoveChoice, Picker, PickerKind};
 use super::text::pop_word;
 
@@ -334,7 +338,20 @@ pub(crate) struct App {
     pending_edit: Option<PathBuf>,
     /// Set by the first `g` of a `gg` chord.
     pending_g: bool,
-    watcher: Option<VaultWatcher>,
+    /// Watcher for the current store; `None` when watching failed. Tests
+    /// disable it to exercise the reconciliation path in isolation.
+    pub(crate) watcher: Option<VaultWatcher>,
+    /// Wall-clock trigger for the bounded store rescan.
+    reconcile: ReconcileClock,
+    /// A reconciliation came due while an edit buffer was open; apply it once
+    /// the buffer settles. Kept separate from `external_change_pending` so a
+    /// routine rescan never shows a change warning that was not observed.
+    reconcile_deferred: bool,
+    /// The registry file this session re-reads for CLI project changes.
+    registry_file: RegistryFile,
+    /// Last surfaced reload error, so a store that keeps failing does not
+    /// replace the toast on every reconciliation.
+    reload_error: FailureLatch,
     /// Set when a watched change arrived while an unsaved buffer was open;
     /// shown on the context row until the buffer settles and reloads.
     pub(crate) external_change_pending: bool,
@@ -348,7 +365,6 @@ impl App {
         project: Option<Project>,
         store_root: Option<PathBuf>,
     ) -> Self {
-        let watcher = vault.watch().ok();
         let mut app = Self {
             vault,
             selected: None,
@@ -376,11 +392,29 @@ impl App {
             move_destination: None,
             pending_edit: None,
             pending_g: false,
-            watcher,
+            watcher: None,
+            reconcile: ReconcileClock::new(Instant::now()),
+            reconcile_deferred: false,
+            registry_file: RegistryFile::default(),
+            reload_error: FailureLatch::default(),
             external_change_pending: false,
         };
         app.refresh();
+        app.start_watcher();
         app
+    }
+
+    /// Start watching the current store. A failure must not be silent: the
+    /// session still recovers through bounded reconciliation, but the user is
+    /// told live updates are unavailable.
+    fn start_watcher(&mut self) {
+        match self.vault.watch() {
+            Ok(watcher) => self.watcher = Some(watcher),
+            Err(error) => {
+                self.watcher = None;
+                self.set_toast(format!("instant updates unavailable: {error}"));
+            }
+        }
     }
 
     /// Whether the event loop should exit.
@@ -396,6 +430,14 @@ impl App {
     /// The open picker, if any.
     pub(crate) fn picker(&self) -> Option<&Picker> {
         match &self.mode {
+            InputMode::Pick(picker) => Some(picker),
+            _ => None,
+        }
+    }
+
+    /// The open picker, mutably, if any.
+    fn picker_mut(&mut self) -> Option<&mut Picker> {
+        match &mut self.mode {
             InputMode::Pick(picker) => Some(picker),
             _ => None,
         }
@@ -521,14 +563,21 @@ impl App {
         }
     }
 
-    /// Poll the watcher: reload while idle, warn and keep the buffer while
-    /// editing. Never writes to the vault.
+    /// Advance the session one event-loop iteration. This runs after every
+    /// key, resize, and idle poll, so nothing here may assume a fixed cadence.
     pub(crate) fn on_tick(&mut self) {
         // Keep "today" fresh: a session left open across midnight must still
         // render due and overdue correctly.
         self.today = Local::now().date_naive();
+        self.on_tick_at(Instant::now());
+    }
+
+    /// [`on_tick`](Self::on_tick) at an explicit instant. Tests drive this
+    /// with a virtual clock: bounded reconciliation is scheduled on elapsed
+    /// wall time, and only the clock knows how much of it passed.
+    pub(crate) fn on_tick_at(&mut self, now: Instant) {
         // Toasts expire on tick counts, independent of the watcher; this must
-        // run before the `!changed` early return.
+        // run before the watcher early return.
         if let Some(toast) = &mut self.toast {
             toast.ticks_left = toast.ticks_left.saturating_sub(1);
         }
@@ -540,13 +589,18 @@ impl App {
             self.toast = None;
         }
         let changed = self.watcher.as_ref().is_some_and(VaultWatcher::changed);
-        if !changed {
-            return;
-        }
+        let reconcile_due = self.reconcile.due(now);
         if self.has_unsaved_buffer() {
-            self.external_change_pending = true;
-        } else {
+            // The no-clobber contract: hold the buffer and remember what
+            // arrived. Only an observed signal shows the sticky warning; a
+            // routine rescan stays invisible until it is applied.
+            self.external_change_pending |= changed;
+            self.reconcile_deferred |= reconcile_due;
+        } else if changed || reconcile_due {
             self.reload_now();
+        }
+        if reconcile_due {
+            self.reload_registry();
         }
     }
 
@@ -898,6 +952,9 @@ impl App {
 
     /// Start the project picker (`p`), filtering over the registry.
     fn start_project_pick(&mut self) {
+        // A picker opened now must show what the registry holds now, not what
+        // it held when the session started.
+        self.reload_registry();
         if self.config.projects.is_empty() {
             self.set_toast("no registered projects");
             return;
@@ -916,17 +973,52 @@ impl App {
         )
     }
 
-    fn commit_project_pick(&mut self) {
-        let Some(highlight) = self.picker_highlight() else {
+    /// Candidate projects of the open project picker: `p` switch or the `m`
+    /// cross-project destination. `None` when another picker is open.
+    fn project_picker_matches(&self) -> Option<Vec<Project>> {
+        match self.picker_kind() {
+            Some(PickerKind::Project) => Some(self.project_matches()),
+            Some(PickerKind::MoveProject { .. }) => Some(self.move_project_matches()),
+            _ => None,
+        }
+    }
+
+    /// The project highlighted in an open project picker, if any. Captured
+    /// before a registry reload so the highlight can follow the same project
+    /// by identity instead of by index.
+    fn highlighted_project(&self) -> Option<Project> {
+        let matches = self.project_picker_matches()?;
+        let highlight = self.picker_highlight()?.min(matches.len().checked_sub(1)?);
+        matches.get(highlight).cloned()
+    }
+
+    /// Keep an open project picker's highlight on the same project after a
+    /// registry reload; when that project vanished, clamp the highlight to the
+    /// shortened list so it never points past the end.
+    fn retarget_project_picker(&mut self, previous: Option<&Project>) {
+        let Some(matches) = self.project_picker_matches() else {
             return;
         };
-        let matches = self.project_matches();
-        if matches.is_empty() {
+        let Some(picker) = self.picker_mut() else {
+            return;
+        };
+        picker.highlight = retarget_highlight(&matches, picker.highlight, previous);
+    }
+
+    fn commit_project_pick(&mut self) {
+        let intended = self.highlighted_project();
+        // The registry may have changed since the picker was drawn; re-read
+        // it so a project removed elsewhere can never be opened, and resolve
+        // the destination to its current entry (its slug may have changed).
+        self.reload_registry();
+        let Some(intended) = intended else {
             self.set_toast("no matching projects");
             return;
+        };
+        match registered_like(&self.config, &intended) {
+            Some(project) => self.switch_project(project),
+            None => self.set_toast(format!("{} is no longer registered", intended.slug)),
         }
-        let project = matches[highlight.min(matches.len() - 1)].clone();
-        self.switch_project(project);
     }
 
     /// Open another project's store and make it current, keeping the capture
@@ -941,7 +1033,6 @@ impl App {
         match registry::open_store(&root, &project) {
             Ok(vault) => {
                 self.vault = vault;
-                self.watcher = self.vault.watch().ok();
                 self.project = Some(project);
                 self.mode = InputMode::Navigate;
                 self.input.clear();
@@ -954,6 +1045,7 @@ impl App {
                     .as_ref()
                     .map_or_else(String::new, |project| project.slug.clone());
                 self.set_toast(format!("switched to {slug}"));
+                self.start_watcher();
             }
             Err(error) => {
                 self.mode = InputMode::Navigate;
@@ -994,6 +1086,12 @@ impl App {
         }
         if let Err(error) = fs::create_dir_all(&path) {
             self.set_toast(format!("error: {error}"));
+            return;
+        }
+        // Re-read before saving so a registration made meanwhile is kept, and
+        // stop when the file cannot be read: saving the stale registry would
+        // overwrite whatever the file now holds. The prompt keeps the path.
+        if !self.reload_registry_for_save() {
             return;
         }
         match registry::register_and_save_in(&mut self.config, &path, &root) {
@@ -1678,6 +1776,8 @@ impl App {
         if moving.is_empty() {
             return;
         }
+        // A destination offered now must come from the registry as it is now.
+        self.reload_registry();
         self.move_destination = None;
         self.mode = InputMode::Pick(Picker::new(PickerKind::Move { moving }));
         self.input.clear();
@@ -1714,9 +1814,7 @@ impl App {
             .iter()
             .filter(|destination| {
                 !self.project.as_ref().is_some_and(|current| {
-                    destination.slug == current.slug
-                        || registry::normalize(&destination.path)
-                            == registry::normalize(&current.path)
+                    destination.slug == current.slug || same_project(destination, current)
                 })
             })
             .cloned()
@@ -1790,18 +1888,22 @@ impl App {
     /// Choose a different registered Project and open its Store for the final
     /// parent/root choice.
     fn commit_move_project_pick(&mut self) {
-        let Some(highlight) = self.picker_highlight() else {
-            return;
-        };
         let Some(PickerKind::MoveProject { moving }) = self.picker_kind().cloned() else {
             return;
         };
-        let projects = self.move_project_matches();
-        if projects.is_empty() {
+        let intended = self.highlighted_project();
+        // The registry may have changed since the picker was drawn; re-read
+        // it so a project removed elsewhere cannot become a destination, and
+        // use its current entry (the slug may have changed).
+        self.reload_registry();
+        let Some(intended) = intended else {
             self.set_toast("no matching projects");
             return;
-        }
-        let project = projects[highlight.min(projects.len() - 1)].clone();
+        };
+        let Some(project) = registered_like(&self.config, &intended) else {
+            self.set_toast(format!("{} is no longer registered", intended.slug));
+            return;
+        };
         let Some(root) = self.store_root.clone() else {
             self.mode = InputMode::Navigate;
             self.input.clear();
@@ -1834,6 +1936,10 @@ impl App {
         let Some(PickerKind::MoveParent { moving, .. }) = self.picker_kind().cloned() else {
             return;
         };
+        // The destination vault was opened before this picker; re-read the
+        // registry and resolve it by directory, because it may have been
+        // unregistered or re-registered under a new slug meanwhile.
+        self.reload_registry();
         let matches = self.move_parent_matches();
         if matches.is_empty() {
             return;
@@ -1845,6 +1951,27 @@ impl App {
             self.set_toast("move destination is unavailable");
             return;
         };
+        // The destination may have been unregistered or re-registered under a
+        // new slug while its parent picker was open. Resolve it by directory:
+        // moving into the Store the old slug names would strand the tasks.
+        match registered_like(&self.config, &project) {
+            None => {
+                self.mode = InputMode::Navigate;
+                self.input.clear();
+                self.set_toast(format!("{} is no longer registered", project.slug));
+                return;
+            }
+            Some(current) if current.slug != project.slug => {
+                self.mode = InputMode::Navigate;
+                self.input.clear();
+                self.set_toast(format!(
+                    "{} was re-registered as {}; choose the move again",
+                    project.slug, current.slug
+                ));
+                return;
+            }
+            Some(_) => {}
+        }
         if let Err(error) = target.reload() {
             self.mode = InputMode::Navigate;
             self.input.clear();
@@ -1866,7 +1993,6 @@ impl App {
         let count = outcome.tasks.len();
         let slug = project.slug.clone();
         self.vault = target;
-        self.watcher = self.vault.watch().ok();
         self.project = Some(project);
         self.mode = InputMode::Navigate;
         self.input.clear();
@@ -1882,6 +2008,7 @@ impl App {
             "moved {count} {} to {slug}",
             if count == 1 { "task" } else { "tasks" }
         ));
+        self.start_watcher();
     }
 
     /// `d`: ask before deleting the active selection (or the cursor task
@@ -2135,10 +2262,51 @@ impl App {
         self.settle_pending_reload();
     }
 
+    /// Re-read the registry from the file it was loaded from, so a
+    /// `tt project add`/`remove` run in another process reaches the project
+    /// picker, whether it is already open or opened later. An in-memory config
+    /// with no file path is left as it is.
+    ///
+    /// Returns whether the registry is current. On a read or parse failure the
+    /// last good registry stands and the message is toasted once; a caller
+    /// about to open a store may continue on it, but a caller about to write
+    /// the registry must stop so the save cannot overwrite the file.
+    fn reload_registry(&mut self) -> bool {
+        let highlighted = self.highlighted_project();
+        match self.registry_file.refresh(&self.config) {
+            RegistryRefresh::InMemory => true,
+            RegistryRefresh::Fresh(config) => {
+                self.config = config;
+                self.retarget_project_picker(highlighted.as_ref());
+                true
+            }
+            RegistryRefresh::Failed(message) => {
+                if let Some(message) = message {
+                    self.set_toast(message);
+                }
+                false
+            }
+        }
+    }
+
+    /// [`reload_registry`](Self::reload_registry) before a save: a failure
+    /// always answers the user action, even when the periodic rescan already
+    /// surfaced (and the user dismissed) the same message.
+    fn reload_registry_for_save(&mut self) -> bool {
+        if self.reload_registry() {
+            return true;
+        }
+        if let Some(message) = self.registry_file.surfaced() {
+            self.set_toast(message.to_owned());
+        }
+        false
+    }
+
     /// After leaving an input mode, apply any change that arrived while the
-    /// buffer was held.
+    /// buffer was held, including a reconciliation that came due.
     fn settle_pending_reload(&mut self) {
-        if self.external_change_pending {
+        if self.external_change_pending || self.reconcile_deferred {
+            self.reconcile_deferred = false;
             self.reload_now();
         }
     }
@@ -2155,8 +2323,16 @@ impl App {
         let reload = self.vault.reload();
         self.external_change_pending = false;
         self.refresh();
-        if let Err(error) = reload {
-            self.set_toast(format!("error: {error}"));
+        match reload {
+            Ok(_) => self.reload_error.clear(),
+            Err(error) => {
+                let message = error.to_string();
+                // A store that keeps failing must not replace the toast with
+                // the same message on every bounded rescan.
+                if self.reload_error.first(&message) {
+                    self.set_toast(format!("error: {message}"));
+                }
+            }
         }
     }
 
