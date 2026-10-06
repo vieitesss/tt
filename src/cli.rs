@@ -10,9 +10,10 @@
 //! registry. `--projects` opens the TUI project picker without registering
 //! cwd and is only valid without a subcommand.
 
+use std::env;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{self, ExitCode};
 
 use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate};
@@ -29,6 +30,9 @@ use tt::{
 
 /// Contextual add target for quick capture.
 const STDIN_BODY: &str = "-";
+
+/// Repository `tt update` installs from.
+const REPO_URL: &str = "https://github.com/vieitesss/tt";
 
 /// Error for commands that need a registered project and do not get one.
 const UNREGISTERED: &str = "not a registered project; run tt add or tt project add";
@@ -54,6 +58,9 @@ pub(crate) enum Command {
     Move(MoveArgs),
     /// List, add, or remove registered projects.
     Project(ProjectArgs),
+    /// Install the latest `main` of tt into ~/.local/bin with cargo.
+    #[command(visible_alias = "upgrade")]
+    Update,
 }
 
 /// `tt add`
@@ -255,6 +262,11 @@ fn execute(cli: &Cli) -> Result<()> {
         bail!("--projects is only valid without a subcommand");
     }
 
+    // Updating must work even when the config or registry is broken.
+    if matches!(cli.command, Some(Command::Update)) {
+        return update();
+    }
+
     let mut config = Config::load().context("loading config")?;
     if config.deprecated_vault.is_some() {
         eprintln!(
@@ -295,8 +307,8 @@ fn execute(cli: &Cli) -> Result<()> {
         Some(Command::Reopen(args)) => set_state(&mut vault, args, TaskState::Open, json),
         Some(Command::Edit(args)) => edit(&mut vault, args, json),
         Some(Command::Move(args)) => move_tasks(&mut vault, &config, args, json),
-        Some(Command::Project(_)) | None => {
-            unreachable!("the TUI and project commands are handled before opening a vault")
+        Some(Command::Project(_) | Command::Update) | None => {
+            unreachable!("the TUI, project and update commands are handled before opening a vault")
         }
     }
 }
@@ -450,6 +462,31 @@ fn parse_nested_answer(raw: &str) -> NestedAnswer {
         "!" | "never" => NestedAnswer::NeverAsk,
         _ => NestedAnswer::Parent,
     }
+}
+
+/// `tt update|upgrade`: reinstall tt from the `main` branch with cargo,
+/// streaming cargo's output.
+fn update() -> Result<()> {
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    let mut cargo = update_command(&Path::new(&home).join(".local"));
+    let status = cargo
+        .status()
+        .context("running cargo; is the Rust toolchain installed?")?;
+    if !status.success() {
+        bail!("cargo install failed ({status})");
+    }
+    Ok(())
+}
+
+/// `cargo install` of the `main` branch into `<root>/bin`, replacing any
+/// existing binary.
+fn update_command(root: &Path) -> process::Command {
+    let mut cargo = process::Command::new("cargo");
+    cargo
+        .args(["install", "--git", REPO_URL, "--branch", "main"])
+        .args(["--locked", "--force", "--root"])
+        .arg(root);
+    cargo
 }
 
 /// `tt project list|add|remove`
@@ -1000,5 +1037,26 @@ mod tests {
         assert_eq!(parse_nested_answer("never"), NestedAnswer::NeverAsk);
         assert_eq!(parse_nested_answer("n"), NestedAnswer::Parent);
         assert_eq!(parse_nested_answer(""), NestedAnswer::Parent);
+    }
+
+    #[test]
+    fn update_installs_main_into_the_given_root() {
+        let cargo = update_command(Path::new("/home/me/.local"));
+        assert_eq!(cargo.get_program(), "cargo");
+        let args: Vec<_> = cargo.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "install",
+                "--git",
+                REPO_URL,
+                "--branch",
+                "main",
+                "--locked",
+                "--force",
+                "--root",
+                "/home/me/.local",
+            ]
+        );
     }
 }

@@ -54,6 +54,14 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_is_an_alias_of_update() {
+        for name in ["update", "upgrade"] {
+            let cli = Cli::try_parse_from(["tt", name]).expect("parse update");
+            assert!(matches!(cli.command, Some(super::cli::Command::Update)));
+        }
+    }
+
+    #[test]
     fn projects_flag_does_not_parse_after_a_subcommand() {
         assert!(Cli::try_parse_from(["tt", "list", "-p"]).is_err());
     }
