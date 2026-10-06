@@ -1,6 +1,6 @@
 ---
 name: tt
-description: Operate a tt (ToTask) project from the CLI. Use when the user asks about tasks: adding, listing, showing, completing, cancelling, reopening, or renaming; when registering projects with `tt project`; when scripting or bulk-editing a project with `tt --json`; or when reading and hand-editing the one-file-per-task markdown stored in a project store.
+description: "Operate a tt (ToTask) project from the CLI. Use when the user asks about tasks: adding, listing, showing, completing, cancelling, reopening, or renaming; when registering projects with `tt project`; when scripting or bulk-editing a project with `tt --json`; or when reading and hand-editing the one-file-per-task markdown stored in a project store."
 ---
 
 `tt` is a keyboard-driven terminal todo app organized into **projects**: a
