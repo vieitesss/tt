@@ -22,6 +22,7 @@ mod picker;
 #[cfg(test)]
 mod tests;
 mod text;
+mod theme;
 mod ui;
 
 use std::path::{Path, PathBuf};

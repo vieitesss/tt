@@ -7,7 +7,7 @@
 
 use chrono::NaiveDate;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -23,6 +23,7 @@ use super::list::ListRow;
 use super::markdown;
 use super::picker;
 use super::text::{text_width, truncate_title, truncate_to_width};
+use super::theme;
 
 /// Maximum matches shown in the search popup.
 const SEARCH_POPUP_MATCHES: usize = 5;
@@ -142,13 +143,13 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
             path_display::shorten(&project.path, &app.config.path_display),
             Style::default(),
         ),
-        None => Span::styled("tt", Style::default().fg(Color::DarkGray)),
+        None => Span::styled("tt", Style::default().fg(theme::DIM)),
     };
     frame.render_widget(Paragraph::new(label), left);
     if let Some((badge_area, text)) = right {
         frame.render_widget(
             Paragraph::new(text)
-                .style(Style::default().fg(Color::Yellow))
+                .style(Style::default().fg(theme::WARNING))
                 .alignment(Alignment::Right),
             badge_area,
         );
@@ -164,8 +165,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     if app.list.is_empty() {
         frame.render_widget(
-            Paragraph::new("(no tasks — press a to add)")
-                .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new("(no tasks — press a to add)").style(Style::default().fg(theme::DIM)),
             area,
         );
         return;
@@ -199,9 +199,9 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// State glyph and color, shared by list rows and the preview metadata.
 fn state_glyph(state: Option<TaskState>) -> (&'static str, Style) {
     match state {
-        Some(TaskState::Done) => ("●", Style::default().fg(Color::Green)),
-        Some(TaskState::Cancelled) | None => ("—", Style::default().fg(Color::DarkGray)),
-        Some(TaskState::Open) => ("○", Style::default().fg(Color::DarkGray)),
+        Some(TaskState::Done) => ("●", Style::default().fg(theme::DONE)),
+        Some(TaskState::Cancelled) | None => ("—", Style::default().fg(theme::DIM)),
+        Some(TaskState::Open) => ("○", Style::default().fg(theme::DIM)),
     }
 }
 
@@ -212,14 +212,14 @@ fn state_glyph(state: Option<TaskState>) -> (&'static str, Style) {
 /// reverse inherited from the selected row.
 fn priority_glyph(priority: Priority) -> (&'static str, Style) {
     let (text, bg) = match priority {
-        Priority::High => ("!", Color::Red),
-        Priority::Med => ("~", Color::Yellow),
-        Priority::Low => ("↓", Color::DarkGray),
+        Priority::High => ("!", theme::DANGER),
+        Priority::Med => ("~", theme::WARNING),
+        Priority::Low => ("↓", theme::DIM),
     };
     (
         text,
         Style::default()
-            .fg(Color::Rgb(255, 255, 255))
+            .fg(theme::ON_COLOR)
             .bg(bg)
             .remove_modifier(Modifier::all()),
     )
@@ -359,7 +359,7 @@ fn row_line(
         selection = selection.add_modifier(Modifier::REVERSED);
     }
     if marked {
-        selection = selection.bg(Color::Yellow);
+        selection = selection.bg(theme::WARNING);
     }
 
     let task = app.vault.get(&row.id);
@@ -444,13 +444,13 @@ fn row_meta(app: &App, id: &TaskId) -> RowMeta {
     let due = task.due.map(|due| {
         let today = app.today;
         let (text, style) = if due < today {
-            ("overdue".to_owned(), Style::default().fg(Color::Red))
+            ("overdue".to_owned(), Style::default().fg(theme::DANGER))
         } else if due == today {
-            ("today".to_owned(), Style::default().fg(Color::Red))
+            ("today".to_owned(), Style::default().fg(theme::DANGER))
         } else {
             (
                 format!("{}d", (due - today).num_days()),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::DIM),
             )
         };
         Span::styled(text, style)
@@ -463,12 +463,8 @@ fn row_meta(app: &App, id: &TaskId) -> RowMeta {
         None
     } else {
         let (done, total) = app.vault.rollup(id);
-        (total > 0).then(|| {
-            Span::styled(
-                format!("{done}/{total}"),
-                Style::default().fg(Color::DarkGray),
-            )
-        })
+        (total > 0)
+            .then(|| Span::styled(format!("{done}/{total}"), Style::default().fg(theme::DIM)))
     };
     RowMeta {
         due,
@@ -489,7 +485,7 @@ fn push_meta(spans: &mut Vec<Span<'static>>, span: Span<'static>) {
 /// turn red.
 fn title_style(task: Option<&Task>, today: NaiveDate) -> Style {
     let Some(task) = task else {
-        return Style::default().fg(Color::Red);
+        return Style::default().fg(theme::DANGER);
     };
     let mut style = Style::default();
     if task.state == TaskState::Cancelled {
@@ -498,7 +494,7 @@ fn title_style(task: Option<&Task>, today: NaiveDate) -> Style {
             .add_modifier(Modifier::DIM);
     }
     if task.due.is_some_and(|due| due < today) {
-        style = style.fg(Color::Red);
+        style = style.fg(theme::DANGER);
     }
     style
 }
@@ -538,7 +534,7 @@ fn render_picker_popup(frame: &mut Frame<'_>, area: Rect, popup_width: u16, popu
     frame.render_widget(Clear, popup_area);
     let block = Block::bordered()
         .title(popup.title)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme::ACCENT));
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
@@ -598,7 +594,7 @@ fn render_confirm_delete(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .title("delete")
-        .border_style(Style::default().fg(Color::Red));
+        .border_style(Style::default().fg(theme::DANGER));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -658,7 +654,7 @@ pub(crate) fn render_launch(frame: &mut Frame<'_>, launch: &Launch) {
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .title("tt")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme::ACCENT));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -742,7 +738,7 @@ fn render_launch_picker(
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .title("projects")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme::ACCENT));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -791,7 +787,7 @@ fn render_launch_path(frame: &mut Frame<'_>, input: &str, error: Option<&str>) {
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .title("new project")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme::ACCENT));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -848,14 +844,15 @@ fn wrapped_rows(line: &str, width: usize) -> usize {
 fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(id) = app.selected.as_ref() else {
         frame.render_widget(
-            Paragraph::new("no task selected").style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new("no task selected").style(Style::default().fg(theme::DIM)),
             area,
         );
         return;
     };
     let Some(task) = app.vault.get(id) else {
         frame.render_widget(
-            Paragraph::new(format!("task not found: {id}")).style(Style::default().fg(Color::Red)),
+            Paragraph::new(format!("task not found: {id}"))
+                .style(Style::default().fg(theme::DANGER)),
             area,
         );
         return;
@@ -871,7 +868,7 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
     lines.push(Line::from(Span::styled(
         task.title.clone(),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme::ACCENT)
             .add_modifier(Modifier::BOLD),
     )));
 
@@ -881,9 +878,7 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if task.body.trim().is_empty() {
         lines.push(Line::from(Span::styled(
             "[empty body]",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(theme::DIM).add_modifier(Modifier::DIM),
         )));
     } else {
         lines.push(Line::from(""));
@@ -917,7 +912,7 @@ fn preview_backlinks(app: &App, task: &Task) -> Vec<Line<'static>> {
             .map(|task| task.title.to_lowercase())
             .unwrap_or_default()
     });
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(theme::DIM);
     ids.into_iter()
         .map(|id| Line::from(Span::styled(format!("↩ {}", app.resolve_title(&id)), dim)))
         .collect()
@@ -929,12 +924,12 @@ fn preview_backlinks(app: &App, task: &Task) -> Vec<Line<'static>> {
 /// shows the state, so it is deliberately absent here too. Fields with no
 /// value are omitted, so a bare task renders no metadata line at all.
 fn preview_metadata(app: &App, task: &Task) -> Vec<Span<'static>> {
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(theme::DIM);
     let mut spans: Vec<Span<'static>> = Vec::new();
 
     if let Some(due) = task.due {
         let style = if due < app.today {
-            Style::default().fg(Color::Red)
+            Style::default().fg(theme::DANGER)
         } else {
             dim
         };
@@ -963,9 +958,9 @@ fn render_hint(frame: &mut Frame<'_>, area: Rect, app: &App) {
     match app.status_line() {
         FooterLine::Text(text) => {
             let style = if matches!(app.mode, InputMode::Navigate) {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme::DIM)
             } else {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(theme::ACCENT)
             };
             frame.render_widget(Paragraph::new(text).style(style), area);
         }
@@ -975,10 +970,10 @@ fn render_hint(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 if index > 0 {
                     spans.push(Span::raw("   "));
                 }
-                spans.push(Span::styled(*key, Style::default().fg(Color::Cyan)));
+                spans.push(Span::styled(*key, Style::default().fg(theme::ACCENT)));
                 spans.push(Span::styled(
                     format!(" {label}"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::DIM),
                 ));
             }
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1003,7 +998,7 @@ fn render_register_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .title("new project")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme::ACCENT));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -1027,7 +1022,7 @@ fn render_register_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// Third footer row: project context and the sticky external-change flag.
 fn render_context(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(
-        Paragraph::new(app.context_text()).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(app.context_text()).style(Style::default().fg(theme::DIM)),
         area,
     );
 }
@@ -1048,12 +1043,12 @@ fn render_toast(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let y = area.y + area.height.saturating_sub(height);
     let popup = Rect::new(x, y, width, height);
     frame.render_widget(Clear, popup);
-    let block = Block::bordered().border_style(Style::default().fg(Color::Cyan));
+    let block = Block::bordered().border_style(Style::default().fg(theme::ACCENT));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     frame.render_widget(
         Paragraph::new(truncate_title(&toast.text, inner.width as usize))
-            .style(Style::default().fg(Color::Cyan)),
+            .style(Style::default().fg(theme::ACCENT)),
         inner,
     );
 }
@@ -1157,7 +1152,7 @@ fn keymap_lines(columns: usize) -> Vec<Line<'static>> {
                     spans.push(Span::styled(
                         title,
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(theme::WARNING)
                             .add_modifier(Modifier::BOLD),
                     ));
                 }
@@ -1167,9 +1162,9 @@ fn keymap_lines(columns: usize) -> Vec<Line<'static>> {
                     key_width,
                 } => {
                     spans.push(Span::raw("  "));
-                    spans.push(Span::styled(key, Style::default().fg(Color::Cyan)));
+                    spans.push(Span::styled(key, Style::default().fg(theme::ACCENT)));
                     spans.push(Span::raw(" ".repeat(key_width - text_width(key) + 2)));
-                    spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+                    spans.push(Span::styled(label, Style::default().fg(theme::DIM)));
                 }
                 KeymapRow::Blank => {}
             }
@@ -1205,7 +1200,7 @@ fn render_keymap_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .title(" Keymap ")
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(theme::WARNING));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let body_height = geometry.body_height as u16;
@@ -1227,7 +1222,7 @@ fn render_keymap_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new("esc or ? to close")
             .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(Style::default().fg(theme::DIM)),
         footer,
     );
 }
@@ -1259,7 +1254,7 @@ fn render_issues_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let block = Block::bordered()
         .title(title)
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(theme::WARNING));
 
     // Render the block and its content separately so text can never paint over
     // the border at narrow widths. The path column is measured once across
@@ -1362,10 +1357,10 @@ fn issue_lines(
     };
     let kind_style = if selected {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(theme::WARNING)
             .add_modifier(Modifier::REVERSED)
     } else {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(theme::WARNING)
     };
     vec![
         Line::from(vec![

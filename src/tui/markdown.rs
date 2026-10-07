@@ -12,12 +12,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use tt::TaskId;
 
+use super::theme;
+
 /// Blockquote line prefix, repeated per nesting depth.
 const QUOTE_PREFIX: &str = "│ ";
 /// Horizontal rule rendered for a thematic break.
 const RULE_LINE: &str = "────────";
 /// Background shared by inline code and fenced code blocks.
-const CODE_BG: Color = Color::DarkGray;
+const CODE_BG: Color = theme::DIM;
 
 /// Parse `body` and render it as preview lines.
 ///
@@ -56,7 +58,7 @@ fn heading_style(level: HeadingLevel) -> Style {
 /// Style for markdown links and resolved wikilinks.
 fn link_style() -> Style {
     Style::default()
-        .fg(Color::Cyan)
+        .fg(theme::ACCENT)
         .add_modifier(Modifier::UNDERLINED)
 }
 
@@ -319,7 +321,7 @@ impl Renderer {
 
     /// Style for block furniture: bullets, rules, and quote bars.
     fn base_style(&self) -> Style {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme::DIM)
     }
 
     fn finish(mut self, resolve: &impl Fn(&str) -> Option<String>) -> Vec<Line<'static>> {
