@@ -9,7 +9,7 @@ use chrono::NaiveDate;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use tt::{path_display, Priority, Task, TaskId, TaskState, VaultIssue};
 
@@ -533,6 +533,7 @@ fn render_picker_popup(frame: &mut Frame<'_>, area: Rect, popup_width: u16, popu
     );
     frame.render_widget(Clear, popup_area);
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title(popup.title)
         .border_style(Style::default().fg(theme::ACCENT));
     let inner = block.inner(popup_area);
@@ -593,6 +594,7 @@ fn render_confirm_delete(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title("delete")
         .border_style(Style::default().fg(theme::DANGER));
     let inner = block.inner(popup);
@@ -653,6 +655,7 @@ pub(crate) fn render_launch(frame: &mut Frame<'_>, launch: &Launch) {
 
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title("tt")
         .border_style(Style::default().fg(theme::ACCENT));
     let inner = block.inner(popup);
@@ -737,6 +740,7 @@ fn render_launch_picker(
 
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title("projects")
         .border_style(Style::default().fg(theme::ACCENT));
     let inner = block.inner(popup);
@@ -786,6 +790,7 @@ fn render_launch_path(frame: &mut Frame<'_>, input: &str, error: Option<&str>) {
     let popup = Rect::new(x, y, width, height);
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title("new project")
         .border_style(Style::default().fg(theme::ACCENT));
     let inner = block.inner(popup);
@@ -997,6 +1002,7 @@ fn render_register_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let popup = Rect::new(x, y, width, height);
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title("new project")
         .border_style(Style::default().fg(theme::ACCENT));
     let inner = block.inner(popup);
@@ -1043,7 +1049,9 @@ fn render_toast(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let y = area.y + area.height.saturating_sub(height);
     let popup = Rect::new(x, y, width, height);
     frame.render_widget(Clear, popup);
-    let block = Block::bordered().border_style(Style::default().fg(theme::ACCENT));
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::ACCENT));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     frame.render_widget(
@@ -1199,6 +1207,7 @@ fn render_keymap_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title(" Keymap ")
         .border_style(Style::default().fg(theme::WARNING));
     let inner = block.inner(popup);
@@ -1253,6 +1262,7 @@ fn render_issues_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )
     };
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title(title)
         .border_style(Style::default().fg(theme::WARNING));
 

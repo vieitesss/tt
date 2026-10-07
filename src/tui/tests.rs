@@ -5247,11 +5247,11 @@ fn issue_overlay_content_stays_inside_its_border_at_narrow_widths() {
     let top_row = 1usize;
     let bottom_row = (height - 4) as usize;
     let top = &lines[top_row];
-    assert!(top.starts_with('┌'), "top border: {top:?}");
-    assert!(top.ends_with('┐'), "top border: {top:?}");
+    assert!(top.starts_with('╭'), "top border: {top:?}");
+    assert!(top.ends_with('╮'), "top border: {top:?}");
     let bottom = &lines[bottom_row];
-    assert!(bottom.starts_with('└'), "bottom border: {bottom:?}");
-    assert!(bottom.ends_with('┘'), "bottom border: {bottom:?}");
+    assert!(bottom.starts_with('╰'), "bottom border: {bottom:?}");
+    assert!(bottom.ends_with('╯'), "bottom border: {bottom:?}");
 
     for row in (top_row + 1)..bottom_row {
         let cells: Vec<char> = lines[row].chars().collect();
@@ -7173,4 +7173,75 @@ fn scroll_clamp_keeps_the_selection_inside_the_viewport() {
     assert_eq!(ensure_selection_visible(20, 5, 0, 0), 5);
     // An empty list cannot scroll.
     assert_eq!(ensure_selection_visible(0, 0, 0, 8), 0);
+}
+
+/// Assert a rendered popup draws rounded corners and no square ones.
+fn assert_rounded_corners(lines: &[String], popup: &str) {
+    let text = lines.join("\n");
+    for corner in ['╭', '╮', '╰', '╯'] {
+        assert!(text.contains(corner), "{popup} lacks {corner}: {text}");
+    }
+    for corner in ['┌', '┐', '└', '┘'] {
+        assert!(
+            !text.contains(corner),
+            "{popup} has square {corner}: {text}"
+        );
+    }
+}
+
+#[test]
+fn every_popup_draws_rounded_corners() {
+    let (dir, mut app) = setup();
+    app.store_root = Some(dir.path().join("data"));
+    add_task(&mut app, "Alpha", None);
+    add_task(&mut app, "Beta", None);
+    app.refresh();
+
+    app.handle_key(key(KeyCode::Char('m')));
+    assert!(app.picker_kind().is_some());
+    assert_rounded_corners(&render_lines(&mut app, 100, 20), "picker");
+    app.handle_key(key(KeyCode::Esc));
+
+    app.handle_key(key(KeyCode::Char('d')));
+    assert!(matches!(app.mode, InputMode::ConfirmDelete { .. }));
+    assert_rounded_corners(&render_lines(&mut app, 100, 20), "confirm delete");
+    app.handle_key(key(KeyCode::Esc));
+
+    app.handle_key(key(KeyCode::Char('P')));
+    assert!(matches!(app.mode, InputMode::RegisterPath));
+    assert_rounded_corners(&render_lines(&mut app, 100, 20), "register path");
+    app.handle_key(key(KeyCode::Esc));
+
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.keymap_open);
+    assert_rounded_corners(&render_lines(&mut app, 100, 40), "keymap");
+    app.handle_key(key(KeyCode::Esc));
+
+    app.handle_key(key(KeyCode::Char('x')));
+    assert_rounded_corners(&render_lines(&mut app, 100, 20), "toast");
+}
+
+#[test]
+fn issues_overlay_draws_rounded_corners() {
+    let (_dir, mut app) = setup_with_issues(&["CONTEXT.md"]);
+    app.handle_key(key(KeyCode::Char('g')));
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.issues_open);
+    assert_rounded_corners(&render_lines(&mut app, 100, 20), "issues");
+}
+
+#[test]
+fn launch_modals_draw_rounded_corners() {
+    let (_dir, launch) = register_launch();
+    assert_rounded_corners(&render_launch_lines(&launch, 90, 12), "launch question");
+
+    let (_dir, mut launch) = unregistered_launch_with_other();
+    launch.handle_key(key(KeyCode::Char('p')));
+    assert!(launch.project_pick().is_some());
+    assert_rounded_corners(&render_launch_lines(&launch, 90, 16), "launch picker");
+
+    let (_dir, mut launch) = launch_with_projects(vec![]);
+    launch.handle_key(key(KeyCode::Char('p')));
+    assert!(launch.path_input().is_some());
+    assert_rounded_corners(&render_launch_lines(&launch, 90, 12), "launch path");
 }
