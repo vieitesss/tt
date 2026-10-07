@@ -656,6 +656,16 @@ impl Vault {
         self.edit(id, |task| task.priority = priority)
     }
 
+    /// Set or clear the due date of an existing task and persist it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::NotFound`] for an unknown id or
+    /// [`VaultError::Io`] when the file cannot be written.
+    pub fn set_due(&mut self, id: &TaskId, due: Option<NaiveDate>) -> Result<Task, VaultError> {
+        self.edit(id, |task| task.due = due)
+    }
+
     /// Replace an existing task's tags, normalizing them before persistence.
     ///
     /// # Errors
@@ -1505,6 +1515,44 @@ mod tests {
         vault.set_priority(&task.id, None).expect("clear priority");
         let reopened = Vault::open(vault.root()).expect("reopen vault");
         assert_eq!(reopened.get(&task.id).expect("task").priority, None);
+    }
+
+    #[test]
+    fn set_due_persists_clears_and_preserves_other_fields() {
+        let (_dir, mut vault) = open_vault();
+        let task = vault
+            .add(NewTask {
+                body: "Keep this description\n".to_owned(),
+                tags: vec!["work".to_owned()],
+                priority: Some(Priority::High),
+                ..NewTask::new("Schedule me")
+            })
+            .expect("add");
+        let due = NaiveDate::from_ymd_opt(2026, 10, 31);
+        let updated = vault.set_due(&task.id, due).expect("set due");
+        assert_eq!(updated.due, due);
+        assert_eq!(updated.title, task.title);
+        assert_eq!(updated.body, task.body);
+        assert_eq!(updated.tags, task.tags);
+        assert_eq!(updated.priority, task.priority);
+        assert_eq!(updated.rank, task.rank);
+        let reopened = Vault::open(vault.root()).expect("reopen");
+        assert_eq!(reopened.get(&task.id).expect("task").due, due);
+        vault.set_due(&task.id, None).expect("clear due");
+        let reopened = Vault::open(vault.root()).expect("reopen");
+        assert_eq!(reopened.get(&task.id).expect("task").due, None);
+    }
+
+    #[test]
+    fn set_due_rejects_an_unknown_task_without_writing() {
+        let (_dir, mut vault) = open_vault();
+        let id = TaskId::parse("missing").expect("id");
+        assert!(matches!(
+            vault.set_due(&id, None),
+            Err(VaultError::NotFound(_))
+        ));
+        assert!(vault.is_empty());
+        assert_eq!(fs::read_dir(vault.root()).expect("read dir").count(), 0);
     }
 
     #[test]
