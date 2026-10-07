@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "menubar",
+  "description": "Menu bar popover: core defaults only, enough to invoke the app's own commands and to listen for the visibility and focus events the Rust shell emits. It has no window-mutating permission of its own; it hides itself through the hide_menubar command. No filesystem, shell, dialog, or opener plugin permission is granted.",
+  "windows": ["menubar"],
+  "permissions": ["core:default"]
+}

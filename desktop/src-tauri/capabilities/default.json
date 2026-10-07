@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Main window: core defaults only. Every close request is intercepted by the installed onCloseRequested wrapper, which either confirms a dirty draft in-app or calls the Rust close_main_window command; that command now hides the window instead of destroying it, so no window-destroy permission is needed. No filesystem or shell plugin is installed.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

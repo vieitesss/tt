@@ -1,0 +1,17 @@
+/* One 16 px icon grid for the whole app. The fold chevron rotates in place
+   when its row opens; reduced motion swaps it instantly. */
+.icon-svg {
+  display: inline-block;
+  vertical-align: middle;
+  flex: none;
+}
+
+.icon-svg.rotated {
+  transform: rotate(90deg);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .icon-svg {
+    transition: transform var(--dur-press) var(--ease-in-out);
+  }
+}

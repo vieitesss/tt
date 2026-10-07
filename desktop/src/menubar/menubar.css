@@ -1,0 +1,734 @@
+/* Menu bar popover styling.
+ *
+ * The window itself is transparent and carries the native popover material, so
+ * the page paints no background: only text, rows, and separators sit over it.
+ * Motion is CSS-only. Fades run for everyone; movement (slide, scale, rotate)
+ * is added inside `prefers-reduced-motion: no-preference` (see ../motion.css).
+ */
+
+:root {
+  color-scheme: light dark;
+  --mb-text: #1c2128;
+  --mb-muted: #667085;
+  --mb-border: rgba(60, 70, 90, 0.16);
+  --mb-row: rgba(255, 255, 255, 0.28);
+  --mb-row-hover: rgba(255, 255, 255, 0.5);
+  --mb-panel: rgba(255, 255, 255, 0.6);
+  --mb-accent: #2456a6;
+  --mb-on-accent: #ffffff;
+  --mb-danger: #b42318;
+  --mb-overdue: #b42318;
+  --mb-today: #b54708;
+  --mb-flash: rgba(36, 86, 166, 0.14);
+  --mb-shadow: 0 1px 0 rgba(255, 255, 255, 0.35) inset;
+  --mb-exit: 2000ms;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --mb-text: #e7ebf0;
+    --mb-muted: #98a2b3;
+    --mb-border: rgba(255, 255, 255, 0.14);
+    --mb-row: rgba(255, 255, 255, 0.04);
+    --mb-row-hover: rgba(255, 255, 255, 0.1);
+    --mb-panel: rgba(20, 24, 30, 0.55);
+    --mb-accent: #7fb0ff;
+    --mb-on-accent: #10151d;
+    --mb-danger: #ff8d80;
+    --mb-overdue: #ff8d80;
+    --mb-today: #ffc46b;
+    --mb-flash: rgba(127, 176, 255, 0.18);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  background: transparent;
+  margin: 0;
+  height: 100%;
+}
+
+/* The popover does not bounce when a scroll runs out of content. */
+html {
+  overscroll-behavior: none;
+}
+
+body {
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  color: var(--mb-text);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+.menubar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 6px 6px 8px;
+  gap: 6px;
+  animation: fade-in var(--dur-press) var(--ease-out);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .menubar {
+    animation: fade-in var(--dur-press) var(--ease-out), pop var(--dur-press) var(--ease-out);
+  }
+}
+
+.menubar[data-shown="false"] {
+  animation: none;
+}
+
+@keyframes pop {
+  from {
+    scale: 0.97;
+    translate: 0 -4px;
+  }
+}
+
+.spacer {
+  flex: 1;
+}
+
+.muted {
+  color: var(--mb-muted);
+}
+
+/* Header ------------------------------------------------------------------ */
+
+.mb-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+}
+
+.mb-switcher {
+  position: relative;
+}
+
+.mb-project {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 220px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  padding: 3px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.mb-project:hover {
+  background: var(--mb-row-hover);
+}
+
+.mb-project-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mb-projects {
+  /* Concentric corners: the outer radius is the item radius plus the gap
+     between them (padding and the 1px border). */
+  --item-radius: 6px;
+  --item-gap: 4px;
+  position: absolute;
+  z-index: 5;
+  top: 26px;
+  left: 0;
+  min-width: 220px;
+  max-height: 260px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  margin: 0;
+  padding: var(--item-gap);
+  list-style: none;
+  border-radius: calc(var(--item-radius) + var(--item-gap) + 1px);
+  border: 1px solid var(--mb-border);
+  background: var(--mb-panel);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 8px 24px rgba(16, 24, 40, 0.18);
+}
+
+.mb-projects button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  padding: 5px 7px;
+  border-radius: var(--item-radius);
+  cursor: pointer;
+}
+
+.mb-projects button:hover,
+.mb-projects button[aria-selected="true"] {
+  background: var(--mb-row-hover);
+}
+
+.mb-projects kbd {
+  font: 11px/1 -apple-system, system-ui, sans-serif;
+  color: var(--mb-muted);
+}
+
+.mb-icon {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.mb-icon:hover {
+  background: var(--mb-row-hover);
+}
+
+/* Quick add --------------------------------------------------------------- */
+
+.mb-add input {
+  width: 100%;
+  border: 1px solid var(--mb-border);
+  background: var(--mb-row);
+  color: inherit;
+  font: inherit;
+  padding: 5px 8px;
+  border-radius: 7px;
+}
+
+.mb-add input:focus {
+  outline: 2px solid var(--mb-accent);
+  outline-offset: -1px;
+}
+
+.mb-subtask-hint {
+  margin: -2px 2px 0;
+  font-size: 11px;
+  color: var(--mb-muted);
+}
+
+.mb-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 2px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  background: var(--mb-flash);
+  color: var(--mb-danger);
+  font-size: 12px;
+}
+
+/* Rows -------------------------------------------------------------------- */
+
+.mb-rows {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mb-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding-right: 8px;
+  border-radius: 6px;
+  animation: fade-in var(--dur-pop) var(--ease-out);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .mb-row {
+    animation: fade-in var(--dur-pop) var(--ease-out), rise-in var(--dur-pop) var(--ease-out);
+  }
+}
+
+.mb-row:hover {
+  background: var(--mb-row-hover);
+}
+
+.mb-row.active,
+.mb-row.current {
+  background: var(--mb-row-hover);
+}
+
+.mb-row.changed {
+  animation: flash 1200ms var(--ease-out);
+}
+
+/* A completed row lingers for the Undo window, then fades out. The fade is
+   the cue and stays under reduced motion; the slide and collapse are motion. */
+.mb-row.leaving {
+  animation: row-fade-out var(--mb-exit) var(--ease-in-out) forwards;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .mb-row.leaving {
+    animation-name: row-out;
+  }
+}
+
+.mb-row.state-done .mb-title,
+.mb-row.state-cancelled .mb-title {
+  text-decoration: line-through;
+  color: var(--mb-muted);
+}
+
+@keyframes row-fade-out {
+  0%,
+  60% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes row-out {
+  0%,
+  60% {
+    opacity: 1;
+    translate: none;
+  }
+  100% {
+    opacity: 0;
+    translate: 0 -4px;
+    max-height: 0;
+    min-height: 0;
+  }
+}
+
+@keyframes flash {
+  from {
+    background: var(--mb-flash);
+  }
+  to {
+    background: transparent;
+  }
+}
+
+.mb-fold {
+  flex: none;
+  width: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: var(--mb-muted);
+  cursor: pointer;
+  font-size: 10px;
+  padding: 0;
+  border-radius: 4px;
+}
+
+.mb-check {
+  flex: none;
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  border: 1.5px solid var(--mb-muted);
+  border-radius: 4px;
+  background: transparent;
+  display: inline-grid;
+  place-content: center;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-press) var(--ease-out),
+    border-color var(--dur-press) var(--ease-out);
+}
+
+.mb-check::after {
+  content: "";
+  width: 7px;
+  height: 3.5px;
+  border-left: 2px solid var(--mb-on-accent);
+  border-bottom: 2px solid var(--mb-on-accent);
+  transform: rotate(-45deg);
+  opacity: 0;
+  transition: opacity var(--dur-press) var(--ease-out);
+}
+
+.mb-check:checked {
+  background: var(--mb-accent);
+  border-color: var(--mb-accent);
+}
+
+.mb-check:checked::after {
+  opacity: 1;
+}
+
+/* The tick draws in, the box pops and gives under the press: all movement. */
+@media (prefers-reduced-motion: no-preference) {
+  .mb-check {
+    transition:
+      background-color var(--dur-press) var(--ease-out),
+      border-color var(--dur-press) var(--ease-out),
+      transform var(--dur-press) var(--ease-out);
+  }
+
+  .mb-check::after {
+    transform: rotate(-45deg) scale(0);
+    transition:
+      opacity var(--dur-press) var(--ease-out),
+      transform var(--dur-press) var(--ease-out);
+  }
+
+  .mb-check:checked {
+    transform: scale(1.06);
+  }
+
+  .mb-check:checked::after {
+    transform: rotate(-45deg) scale(1);
+  }
+
+  .mb-check:active {
+    transform: scale(0.95);
+  }
+}
+
+/* Press feedback on the popover's buttons; the title button is a whole row of
+   text and the fold chevron is a bare glyph, so neither shrinks. */
+@media (prefers-reduced-motion: no-preference) {
+  .mb-project,
+  .mb-icon,
+  .mb-actions button,
+  .mb-guard-actions button,
+  .mb-undo button,
+  .mb-projects button {
+    transition: transform var(--dur-press) var(--ease-out);
+  }
+
+  .mb-project:active,
+  .mb-icon:active,
+  .mb-actions button:active,
+  .mb-guard-actions button:active,
+  .mb-undo button:active,
+  .mb-foot-action:active,
+  .mb-projects button:active {
+    transform: scale(0.97);
+  }
+}
+
+.mb-title {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  padding: 2px 0;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mb-meta {
+  flex: none;
+  display: inline-flex;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--mb-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.mb-meta .due.overdue {
+  color: var(--mb-overdue);
+}
+
+.mb-meta .due.today,
+.mb-facts .due.today {
+  color: var(--mb-today);
+}
+
+.mb-facts .due.overdue {
+  color: var(--mb-overdue);
+}
+
+.prio.high {
+  color: var(--mb-danger);
+}
+
+.mb-empty {
+  margin: 8px 10px;
+}
+
+/* Expanded detail --------------------------------------------------------- */
+
+.mb-detail {
+  margin: 2px 6px 8px;
+  padding: 8px;
+  border: 1px solid var(--mb-border);
+  border-radius: 8px;
+  background: var(--mb-row);
+  /* Inline expansion: fades in; with motion allowed it also slides in while
+     the panel grows. */
+  overflow: hidden;
+  animation: fade-in var(--dur-pop) var(--ease-out);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .mb-detail {
+    animation: fade-in var(--dur-pop) var(--ease-out), expand-in var(--dur-pop) var(--ease-out);
+  }
+}
+
+@keyframes expand-in {
+  from {
+    translate: 0 -4px;
+    max-height: 0;
+  }
+  to {
+    max-height: 640px;
+  }
+}
+
+.mb-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: 0 0 6px;
+  font-size: 11px;
+  color: var(--mb-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.mb-facts div {
+  display: flex;
+  gap: 4px;
+}
+
+.mb-facts dt {
+  font-weight: 600;
+}
+
+.mb-facts dd {
+  margin: 0;
+}
+
+.mb-detail .markdown {
+  max-height: 220px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  font-size: 12px;
+}
+
+.mb-detail .markdown p {
+  margin: 0 0 6px;
+}
+
+.mb-detail .markdown pre {
+  overflow: auto;
+  padding: 6px;
+  border-radius: 6px;
+  background: var(--mb-panel);
+}
+
+.mb-detail .markdown button.wikilink {
+  border: 0;
+  background: transparent;
+  color: var(--mb-accent);
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+}
+
+.mb-edit {
+  display: grid;
+  gap: 6px;
+}
+
+.mb-edit label {
+  display: grid;
+  gap: 2px;
+  font-size: 11px;
+  color: var(--mb-muted);
+}
+
+.mb-edit input,
+.mb-edit textarea {
+  width: 100%;
+  border: 1px solid var(--mb-border);
+  background: var(--mb-panel);
+  color: var(--mb-text);
+  font: inherit;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+
+.mb-edit textarea {
+  /* Grows with the text; past the cap it scrolls. */
+  field-sizing: content;
+  min-height: 96px;
+  max-height: 240px;
+  resize: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.mb-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+  font-size: 11px;
+}
+
+.mb-actions button,
+.mb-guard-actions button,
+.mb-undo button {
+  border: 1px solid var(--mb-border);
+  background: var(--mb-panel);
+  color: inherit;
+  font: inherit;
+  padding: 3px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.mb-actions button.primary {
+  background: var(--mb-accent);
+  border-color: var(--mb-accent);
+  color: var(--mb-on-accent);
+}
+
+.mb-actions button.danger,
+.mb-guard-actions button.danger {
+  color: var(--mb-danger);
+}
+
+.mb-conflict {
+  margin-top: 8px;
+  padding: 6px;
+  border-radius: 6px;
+  background: var(--mb-flash);
+}
+
+.mb-conflict p {
+  margin: 0;
+  font-size: 11px;
+}
+
+.mb-orphan {
+  margin: 0 0 6px;
+}
+
+.mb-orphan textarea {
+  width: 100%;
+  min-height: 72px;
+  margin-top: 6px;
+  border: 1px solid var(--mb-border);
+  background: var(--mb-panel);
+  color: var(--mb-text);
+  padding: 4px 6px;
+  border-radius: 6px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Footer ------------------------------------------------------------------ */
+
+.mb-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px 0;
+  border-top: 1px solid var(--mb-border);
+  font-size: 11px;
+  color: var(--mb-muted);
+}
+
+.mb-showdone {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.mb-foot-action {
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  padding: 2px 6px;
+  border-radius: 5px;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-press) var(--ease-out),
+    color var(--dur-press) var(--ease-out);
+}
+
+.mb-foot-action:hover,
+.mb-foot-action:focus-visible {
+  background: var(--mb-panel);
+  color: var(--mb-text);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .mb-foot-action {
+    transition:
+      background-color var(--dur-press) var(--ease-out),
+      color var(--dur-press) var(--ease-out),
+      transform var(--dur-press) var(--ease-out);
+  }
+}
+
+.mb-undo {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--mb-text);
+}
+
+/* Discard guard ----------------------------------------------------------- */
+
+.mb-guard {
+  position: absolute;
+  inset: auto 10px 34px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid var(--mb-border);
+  background: var(--mb-panel);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 10px 28px rgba(16, 24, 40, 0.24);
+  animation: fade-in var(--dur-press) var(--ease-out);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .mb-guard {
+    animation: fade-in var(--dur-press) var(--ease-out), expand-in var(--dur-press) var(--ease-out);
+  }
+}
+
+.mb-guard p {
+  margin: 0 0 8px;
+}
+
+.mb-guard-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}

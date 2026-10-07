@@ -1,0 +1,44 @@
+[package]
+name = "tt-desktop"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+description = "TT Desktop — a macOS companion for tt"
+license = "MIT"
+publish = false
+
+[lib]
+name = "tt_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+tt = { path = "../.." }
+tauri = { version = "=2.11.5", features = ["tray-icon", "macos-private-api"] }
+tauri-plugin-dialog = "=2.7.3"
+tauri-plugin-global-shortcut = "=2.3.2"
+tauri-plugin-clipboard-manager = "=2.3.3"
+tauri-plugin-opener = "=2.5.5"
+chrono = { version = "0.4.45", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Activation for the menu bar popover while the app is Accessory. Both crates
+# were already in the lock file as transitive dependencies of tauri; pinning
+# them here only makes the safe `NSApplication::activate` binding available.
+# No `unsafe` is used (see menubar::activate).
+objc2 = { version = "=0.6.5", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"

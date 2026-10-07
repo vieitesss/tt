@@ -3,3 +3,10 @@ prototypes/footer/target/
 *.rs.bk
 .pi-subagent-runs/
 app.log
+
+# TT Desktop (standalone package under desktop/)
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+desktop/coverage/

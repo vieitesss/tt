@@ -1,0 +1,77 @@
+/* Motion shared by the main window and the menu bar popover.
+ *
+ * The rule: a fade of opacity or colour is not motion and runs for everyone;
+ * anything that moves, scales, slides or rotates sits inside
+ * `prefers-reduced-motion: no-preference`, so the default is none. Nothing
+ * strips motion afterwards with a blanket `animation: none`.
+ *
+ * Curves follow good-css "Motion tokens": ease-out for anything entering or
+ * leaving, ease-in-out for something already on screen that moves. Never
+ * `ease-in`, never `transition: all`.
+ */
+
+:root {
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  /* Press feedback and small state changes: 100-160ms. */
+  --dur-press: 140ms;
+  /* Dropdowns, panels, rows and toasts: 150-250ms. */
+  --dur-pop: 180ms;
+  /* A modal: 200-500ms. */
+  --dur-modal: 240ms;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+/* The movement half of an entrance: always paired with `fade-in`. */
+@keyframes rise-in {
+  from {
+    translate: 0 -4px;
+  }
+}
+
+/* Dropdowns and disclosure panels unroll from their trigger instead of
+ * popping (good-css "Reveal with clip-path"). A panel mounts with `.reveal`
+ * and is given `.leaving` for the length of its exit, so `@starting-style`
+ * drives the entrance and the class drives the exit. The negative inset is
+ * wider than the largest shadow's blur plus offset, and the top stays at 0 so
+ * no shadow shows where the panel meets its trigger.
+ *
+ * Reduced motion keeps the opacity fade and drops the unroll. */
+.reveal {
+  transition: opacity var(--dur-pop) var(--ease-out);
+}
+
+.reveal.leaving {
+  opacity: 0;
+  pointer-events: none;
+}
+
+@starting-style {
+  .reveal {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .reveal {
+    clip-path: inset(0 -3rem -3rem);
+    transition:
+      opacity var(--dur-pop) var(--ease-out),
+      clip-path var(--dur-pop) var(--ease-out);
+  }
+
+  .reveal.leaving {
+    clip-path: inset(0 -3rem 100%);
+  }
+
+  @starting-style {
+    .reveal {
+      clip-path: inset(0 -3rem 100%);
+    }
+  }
+}

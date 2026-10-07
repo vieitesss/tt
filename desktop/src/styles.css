@@ -1,0 +1,1049 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --panel-alt: #eef1f5;
+  --border: #d4d9e0;
+  --text: #1c2128;
+  --muted: #667085;
+  --accent: #2456a6;
+  --accent-soft: #dce6f6;
+  --danger: #b42318;
+  --warn: #b54708;
+  --ok: #0f7b4f;
+  --selected: #e6ecf5;
+  --match: #fff4cc;
+  --shadow: 0 6px 24px rgba(16, 24, 40, 0.12);
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c;
+    --panel: #1b1f26;
+    --panel-alt: #232832;
+    --border: #313846;
+    --text: #e7ebf0;
+    --muted: #98a2b3;
+    --accent: #7fb0ff;
+    --accent-soft: #21324d;
+    --danger: #ff8d80;
+    --warn: #ffc46b;
+    --ok: #61d29a;
+    --selected: #223044;
+    --match: #4a3d12;
+    --shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+/* A desktop window does not bounce: a trackpad scroll that runs out of
+   content stops instead of dragging the whole page. */
+html {
+  overscroll-behavior: none;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: var(--panel-alt);
+}
+
+/* Press feedback: the button gives a little under the pointer. Inline links
+   written as buttons and the row-wide fold chevron are left out. */
+@media (prefers-reduced-motion: no-preference) {
+  button:not(.wikilink, .ref-link) {
+    transition: transform var(--dur-press) var(--ease-out);
+  }
+
+  button:not(.wikilink, .ref-link):active:not(:disabled) {
+    transform: scale(0.97);
+  }
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+button.danger,
+button.icon.danger {
+  color: var(--danger);
+}
+
+button.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 6px;
+  line-height: 1.2;
+}
+
+button.block {
+  width: 100%;
+}
+
+/* Quiet, link-like action for secondary affordances (Clear, Edit description). */
+button.quiet {
+  background: transparent;
+  border-color: transparent;
+  color: var(--accent);
+  padding: 2px 4px;
+}
+
+button.quiet:hover:not(:disabled) {
+  background: var(--panel-alt);
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+.tree:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+
+.brand {
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+}
+
+.spacer {
+  flex: 1;
+}
+
+.flag {
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+.flag.external {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+.columns {
+  display: grid;
+  grid-template-columns: minmax(300px, 340px) minmax(0, 1fr);
+  min-height: 0;
+  flex: 1;
+}
+
+/* Collapsing the sidebar hands its width back to the task details. */
+.columns.sidebar-collapsed {
+  grid-template-columns: 40px minmax(0, 1fr);
+}
+
+.rail {
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 8px;
+}
+
+.sidebar {
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 8px;
+  gap: 8px;
+}
+
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.sidebar-head h2 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0;
+}
+
+.project-row {
+  align-items: center;
+  font-weight: 600;
+}
+
+.project-row > .disclosure {
+  flex: none;
+}
+
+/* The options trigger is revealed on row hover or keyboard focus, and stays
+   visible for the open project and while its own panel is open. Only the
+   trigger is dimmed: the panel itself must never inherit the opacity. */
+.project-row .disclosure > .disclosure-trigger {
+  opacity: 0;
+}
+
+.project-row:hover .disclosure > .disclosure-trigger,
+.project-row:focus-within .disclosure > .disclosure-trigger,
+.project-row.selected .disclosure > .disclosure-trigger,
+.project-row .disclosure > .disclosure-trigger[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.project-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The open Project's search, filters and New task, scoped by its name. */
+.sidebar-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tools-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-options {
+  width: 220px;
+}
+
+.filter-panel {
+  width: 240px;
+}
+
+.project-path {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tree-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.search-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.tree-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  min-width: 0;
+}
+
+.filter-summary {
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.composer input {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+
+.composer select {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+
+input,
+select,
+textarea {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px;
+}
+
+label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+}
+
+label.inline {
+  white-space: nowrap;
+}
+
+.filter-form {
+  display: grid;
+  gap: 8px;
+}
+
+.filter-form label {
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.filter-form label select,
+.filter-form label input {
+  flex: 1;
+  min-width: 0;
+}
+
+.filter-form label.inline {
+  justify-content: flex-start;
+}
+
+.tree {
+  /* The selection bar is positioned against the tree and follows the selected
+     row's box (below). The scope keeps the anchor name local to this tree. */
+  position: relative;
+  anchor-scope: --nav-selected;
+  overflow: auto;
+  overscroll-behavior: contain;
+  flex: 1;
+  padding: 4px 0 12px;
+}
+
+.tree-row {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 3px 8px;
+  cursor: default;
+  border-left: 3px solid transparent;
+}
+
+.tree-row:hover {
+  background: var(--panel-alt);
+}
+
+.tree-row.selected {
+  background: var(--selected);
+}
+
+/* Pressing a row previews the selection it is about to make. A press on a
+   button inside the row (fold, options) is that button's, not the row's. */
+.tree-row:active:not(:has(button:active)) {
+  background: var(--selected);
+}
+
+/* One accent bar for the tree's one selection. It sits on the selected row's
+   left edge and slides to the next selected row instead of jumping. With no
+   selected row there is no anchor and the bar is hidden. */
+.tree-row[aria-selected="true"] {
+  anchor-name: --nav-selected;
+}
+
+.tree::after {
+  content: "";
+  position: absolute;
+  position-anchor: --nav-selected;
+  top: anchor(top);
+  left: anchor(left);
+  width: 3px;
+  height: anchor-size(height);
+  background: var(--accent);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--dur-press) var(--ease-out);
+}
+
+.tree:has([aria-selected="true"])::after {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .tree::after {
+    transition:
+      opacity var(--dur-press) var(--ease-out),
+      top var(--dur-pop) var(--ease-out),
+      height var(--dur-pop) var(--ease-out);
+  }
+}
+
+.tree-row.match .row-title {
+  background: var(--match);
+}
+
+/* The tree's keyboard cursor. It is only drawn while the tree owns focus, so
+   arrowing onto a Project row is visible without looking like a selection. */
+.tree:focus-within .tree-row.cursor {
+  box-shadow: inset 0 0 0 1px var(--accent);
+  border-radius: 4px;
+}
+
+/* A newly revealed row (a Project opening, a Task unfolding) settles in.
+   Folding away is instant, so nothing waits on an animation to be usable. */
+.tree-row:not(.project-row) {
+  animation: fade-in var(--dur-press) var(--ease-out);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .tree-row:not(.project-row) {
+    animation: fade-in var(--dur-press) var(--ease-out), rise-in var(--dur-press) var(--ease-out);
+  }
+}
+
+.tree-row .fold {
+  border: none;
+  background: transparent;
+  padding: 0;
+  width: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+}
+
+/* A leaf keeps the fold column's width without growing: the global `.spacer`
+   (flex: 1) is for pushing toolbar items apart, not for tree rows. */
+.fold.spacer {
+  display: inline-block;
+  width: 16px;
+  flex: 0 0 16px;
+}
+
+.row-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row-meta {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.glyph {
+  font-size: 12px;
+}
+
+.state-open {
+  color: var(--muted);
+}
+
+.state-done {
+  color: var(--ok);
+}
+
+.state-cancelled {
+  color: var(--danger);
+}
+
+.prio-high {
+  color: var(--danger);
+}
+
+.prio-med {
+  color: var(--warn);
+}
+
+.due.tone-overdue,
+.due.tone-today {
+  color: var(--danger);
+}
+
+.tag {
+  color: var(--accent);
+}
+
+.tree-empty,
+.muted {
+  color: var(--muted);
+}
+
+/* Quiet line under the open Project's row when it has no Tasks. */
+.nav-empty {
+  padding: 3px 8px 3px 24px;
+  font-size: 12px;
+}
+
+/* Secondary disclosure: trigger plus a floating panel, no menu semantics. */
+.disclosure {
+  position: relative;
+  display: inline-flex;
+}
+
+.disclosure-trigger {
+  background: transparent;
+  border-color: var(--border);
+}
+
+.disclosure-trigger[aria-expanded="true"] {
+  background: var(--panel-alt);
+  border-color: var(--accent);
+}
+
+.disclosure-panel {
+  overscroll-behavior: contain;
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 15;
+  width: max-content;
+  min-width: 220px;
+  max-width: min(340px, calc(100vw - 32px));
+  max-height: min(70vh, 520px);
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.disclosure-panel.align-end {
+  left: auto;
+  right: 0;
+}
+
+.properties-panel,
+.actions-panel {
+  width: 300px;
+}
+
+.property {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.property-label {
+  flex: none;
+  width: 60px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.property input,
+.property select {
+  flex: 1;
+  min-width: 0;
+}
+
+.action-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.action-group h3 {
+  margin: 0;
+  flex-basis: 100%;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.action-group label {
+  flex: 1 1 100%;
+  gap: 8px;
+}
+
+.action-group label select {
+  flex: 1;
+  min-width: 0;
+}
+
+.file-group {
+  display: grid;
+  gap: 2px;
+}
+
+.file-path,
+.file-id {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.details {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--panel);
+  padding: 16px 20px;
+  gap: 12px;
+}
+
+.detail-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.detail-title-row {
+  display: flex;
+  flex: 1 1 200px;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.state-toggle {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  margin-top: 1px;
+  padding: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  line-height: 1;
+}
+
+.detail-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.detail-actions {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.detail-meta-quiet {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.meta-sep {
+  color: var(--border);
+}
+
+.empty {
+  margin: auto;
+  text-align: center;
+  color: var(--muted);
+  padding: 32px;
+}
+
+.body-preview {
+  max-width: 68ch;
+  overflow-wrap: anywhere;
+}
+
+.editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.body-editor {
+  /* Grows with the text; past the cap it scrolls. */
+  field-sizing: content;
+  width: 100%;
+  min-height: 260px;
+  max-height: 70vh;
+  font-family: var(--mono);
+  resize: none;
+}
+
+.description-bar {
+  display: flex;
+}
+
+.conflict {
+  border: 1px solid var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: grid;
+  gap: 6px;
+}
+
+.conflict .row,
+.editor .row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.markdown {
+  line-height: 1.6;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3 {
+  margin: 0.6em 0 0.3em;
+}
+
+.markdown p,
+.markdown ul,
+.markdown ol,
+.markdown blockquote {
+  margin: 0.4em 0;
+}
+
+.markdown code {
+  font-family: var(--mono);
+  background: var(--panel-alt);
+  border-radius: 4px;
+  padding: 0 3px;
+}
+
+.markdown pre {
+  background: var(--panel-alt);
+  padding: 8px;
+  border-radius: 6px;
+  overflow: auto;
+}
+
+.markdown blockquote {
+  border-left: 3px solid var(--border);
+  padding-left: 10px;
+  color: var(--muted);
+}
+
+.markdown a {
+  color: var(--accent);
+}
+
+button.wikilink {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  text-decoration: underline;
+  padding: 0;
+}
+
+button.wikilink.dangling {
+  color: var(--warn);
+  text-decoration: underline dotted;
+}
+
+.md-inert {
+  text-decoration: line-through;
+  color: var(--muted);
+}
+
+.md-image {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.detail-refs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ref-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.ref-panel {
+  width: 240px;
+}
+
+button.ref-link {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  padding: 0;
+  text-align: left;
+}
+
+button.ref-link.dangling {
+  color: var(--warn);
+}
+
+.issues {
+  position: relative;
+}
+
+.issues .disclosure-trigger {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+.issue-panel {
+  top: calc(100% + 6px);
+  width: min(560px, 80vw);
+  max-width: min(560px, calc(100vw - 32px));
+  padding: 8px;
+  gap: 6px;
+}
+
+.issue-region {
+  display: grid;
+  gap: 6px;
+}
+
+.issue {
+  display: grid;
+  gap: 1px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 4px;
+}
+
+.issue-kind {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.issue-path,
+.issue-detail {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: grid;
+  place-items: center;
+  z-index: 30;
+  transition: opacity var(--dur-modal) var(--ease-out);
+}
+
+/* The dialog stays mounted while `.leaving` plays (ConfirmDialog.tsx), so both
+   directions are plain transitions. Reduced motion keeps the fade and drops
+   the scale. */
+.modal-backdrop.leaving {
+  opacity: 0;
+  pointer-events: none;
+}
+
+@starting-style {
+  .modal-backdrop {
+    opacity: 0;
+  }
+}
+
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  padding: 16px;
+  width: min(420px, 90vw);
+  display: grid;
+  gap: 10px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .modal {
+    transition: scale var(--dur-modal) var(--ease-out);
+  }
+
+  .modal-backdrop.leaving .modal {
+    scale: 0.96;
+  }
+
+  @starting-style {
+    .modal {
+      scale: 0.96;
+    }
+  }
+}
+
+.modal h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.modal p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+button.danger-solid {
+  background: #b42318;
+  border-color: #b42318;
+  color: #fff;
+}
+
+button.danger-solid:hover:not(:disabled) {
+  background: #98221a;
+}
+
+.toast {
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 8px 12px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  z-index: 20;
+  max-width: 70vw;
+}
+
+/* Same pattern as the dialog: fade always, rise only with motion allowed. */
+.toast {
+  transition: opacity var(--dur-pop) var(--ease-out);
+}
+
+.toast.leaving {
+  opacity: 0;
+  pointer-events: none;
+}
+
+@starting-style {
+  .toast {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .toast {
+    transition:
+      opacity var(--dur-pop) var(--ease-out),
+      translate var(--dur-pop) var(--ease-out);
+  }
+
+  .toast.leaving {
+    translate: 0 8px;
+  }
+
+  @starting-style {
+    .toast {
+      translate: 0 8px;
+    }
+  }
+}
+
+.toast.error {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.loading {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  color: var(--muted);
+}
