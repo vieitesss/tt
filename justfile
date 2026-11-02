@@ -6,42 +6,36 @@ default:
 
 # Check formatting without modifying files.
 fmt:
-    cargo fmt --check
+    test -z "$(gofmt -l .)"
+    stylua --check lua plugin tests/nvim
 
-# Apply rustfmt to the sources.
+# Apply gofmt and StyLua to the sources.
 fmt-fix:
-    cargo fmt
+    gofmt -w .
+    stylua lua plugin tests/nvim
 
-# Lint all targets with Clippy, warnings as errors.
-clippy:
-    cargo clippy --all-targets -- -D warnings
+# Run go vet.
+vet:
+    go vet ./...
 
-# Run the test suite.
-test:
-    cargo test
+# Run the Go test suite.
+test: build
+    go test ./...
 
-# Run every quality gate: fmt, clippy, test.
-check: fmt clippy test
+# Run the headless Neovim tests against bin/tt.
+test-nvim: build
+    nvim --headless -u NONE -l tests/nvim/run.lua
 
-# Build the debug binary.
+# Run every quality gate: fmt, vet, test, test-nvim.
+check: fmt vet test test-nvim
+
+# Build the binary the plugin uses.
 build:
-    cargo build
+    go build -o bin/tt ./cmd/tt
 
-# Build the release binary.
-build-release:
-    cargo build --release
-
-# Run the TUI, optionally against a vault: just run /tmp/vault
-run vault="":
-    cargo run -- {{ if vault == "" { "" } else { "--vault " + quote(vault) } }}
-
-install: build-release
-    rm ~/.local/bin/tt | true
-    ln -sf "$(pwd)/target/release/tt" ~/.local/bin/tt
-
-# Run the throwaway footer-design prototypes.
-proto:
-    cargo run --manifest-path prototypes/footer/Cargo.toml
+# Install the CLI into ~/.local/bin.
+install:
+    GOBIN="$HOME/.local/bin" go install ./cmd/tt
 
 install_skill:
     rm -rf ~/.agents/skills/tt | true
