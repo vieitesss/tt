@@ -1,110 +1,116 @@
 ---
 name: tt
-description: "Operate a tt (ToTask) project from the CLI. Use when the user asks about tasks: adding, listing, showing, completing, cancelling, reopening, or renaming; when registering projects with `tt project`; when scripting or bulk-editing a project with `tt --json`; or when reading and hand-editing the one-file-per-task markdown stored in a project store."
+description: "Operate a tt (ToTask) project from the CLI. Use when the user asks about tasks: adding, listing, showing, completing, cancelling, reopening, or renaming; when registering projects with `tt project`; when scripting or bulk-editing a project with `tt --json`, including `tt apply`; or when reading and hand-editing the one-file-per-task markdown stored in a project store."
 ---
 
-`tt` is a keyboard-driven terminal todo app organized into **projects**: a
-project is a directory registered with `tt`, and its tasks live in an invisible
-central **store** of plain markdown files, one file per task. The CLI covers
-the full task lifecycle; the TUI (what `tt` opens with no subcommand) and the
-CLI are clients of the same library and write identical files. Design rationale
-lives in `CONTEXT.md` and `docs/adr/`.
+`tt` keeps a task list for each **project**: a directory registered with `tt`.
+Its tasks live in an invisible **store** of plain markdown files, one file per
+task. The `tt` CLI is the interface for agents and scripts. The Neovim plugin
+is a human client of the same commands. Design rationale lives in `CONTEXT.md`
+and `docs/adr/`.
 
 ## Invocation
 
 ```
-tt [--path PATH] [--json] [-p|--projects] <command>
+tt [--path PATH] [--json] <command>
 ```
 
-Project resolution, first match wins:
+- `--json` prints JSON on stdout. Parse it: the shapes below are stable. Human
+  output is not.
+- `--path PATH` sets the starting directory for project resolution.
+- `-V`, `--version` prints the version. Bare `tt` prints help.
+- `--vault PATH` (hidden) opens a store folder directly and skips the registry.
+  `$TT_VAULT` does the same.
+- `--projects` and `-p` do not exist; `tt` rejects them as unknown flags (exit 2).
 
-1. `--vault PATH` / `$TT_VAULT` — hidden escape hatch: open that folder
-   directly and skip the registry.
-2. `--path PATH`, else `$TT_PATH`, else the current working directory.
+## Project resolution
 
-From the starting directory, `tt` walks ancestors nearest-first; the first
-registered project wins. Consequences:
+The starting directory is `--path`, else `$TT_PATH`, else the current
+directory. Then:
+
+1. Walk up from the starting directory, nearest first. The first registered
+   project wins.
+2. In a linked git worktree, a registration inside the worktree wins. Otherwise
+   the same relative path in the **main checkout** is walked up.
+3. If nothing is registered, the path to register is the main checkout root
+   (or the starting directory outside git).
+
+All worktrees of one repository therefore use one project and one store. New
+tasks record no worktree information.
+
+Consequences:
 
 - A directory inside a registered project resolves to that project.
-- An unregistered directory: `tt add` registers it silently when
-  non-interactive (`--json`, piped, or not a TTY) and prompts otherwise; read
-  commands fail with `not a registered project; run tt add or tt project add`.
-  Bare `tt` can bind to a different registered project instead (`Projects` in
-  the launch modal, or `tt --projects`); `--projects` is only valid without a
-  subcommand.
-- A directory nested inside a project must be registered explicitly
-  (`tt project add`) to become its own project.
+- An unregistered directory: `tt add` registers it silently when non-interactive
+  (`--json`, piped, or no TTY) and prompts otherwise. Other commands, including
+  `apply`, fail with `not a registered project; run tt add or tt project add`.
+- A nested directory must be registered explicitly (`tt project add DIR`) to be
+  its own project.
+- `tt project add DIR` in a worktree maps `DIR` to the same path in the main
+  checkout. It fails if that directory does not exist there. `project remove`
+  maps paths the same way.
 
-Paths:
+## Paths and config
 
-- Config/registry: `$TT_CONFIG`, else `$XDG_DATA_HOME/tt/config.toml`
-  or `~/.local/share/tt/config.toml`. On first use, an existing legacy config at
-  `$XDG_CONFIG_HOME/tt/config.toml` (or `~/.config/tt/config.toml`) is migrated
-  if the shared registry is missing. `TT_CONFIG` disables implicit migration.
+- Config (the registry): `$TT_CONFIG`, else `$XDG_DATA_HOME/tt/config.toml`,
+  else `~/.local/share/tt/config.toml`. If that file is missing, an existing
+  legacy `$XDG_CONFIG_HOME/tt/config.toml` (default `~/.config/tt/config.toml`)
+  is migrated to it on first use. `TT_CONFIG` disables the migration.
 - Store: `$XDG_DATA_HOME/tt/<slug>/`, else `~/.local/share/tt/<slug>/`.
 
 ```toml
 capture_target = "abc1234567" # default parent for `tt add` without --parent
 
-[path_display]
-style = "short"               # "home" | "short" | "tail"
-tail = 1
-
 [[project]]
-path = "~/work/app"
+path = "~/work/app"           # paths under HOME are written with ~/
 slug = "app"
 never_ask_nested = false
 ```
 
-A legacy `vault = "..."` key is deprecated: `tt` warns on stderr, ignores it,
-and preserves it when the config is rewritten.
+A `vault = "..."` key is deprecated: `tt` warns on stderr, ignores it, and keeps
+it when the config is rewritten. Unknown keys are kept.
 
 ## Output contract
 
-- Pass `--json` and parse stdout; the shapes below are stable. Human output is not.
-- Success: exit `0` with the JSON object on stdout.
-- Runtime failure: exit `1`. With `--json` the error is
-  `{"error":"<message>"}` on stdout; human mode prints `error: <message>` to stderr.
-- Usage errors (unknown flag, bad enum value): exit `2` with usage on stderr, never JSON.
-- Store problems print `warning: <file> (<kind>): <detail>` on stderr and never
+- Success: exit `0`, the JSON object on stdout.
+- Runtime failure: exit `1`. With `--json`: `{"error":"<message>"}` on stdout.
+  Human mode: `error: <message>` on stderr.
+- Usage error (unknown flag, bad value, wrong argument count): exit `2`, usage
+  on stderr, never JSON.
+- Store problems: `warning: <path> (<kind>): <detail>` on stderr. They never
   fail the command.
 
 ### Task object
 
-Every task-producing command returns this shape:
+Task-producing commands return:
 
 ```json
 {"id":"bzfca8bm5j","title":"Write the plan","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":null}
 ```
 
-- `id` — the task's identity: the stem of its store file (10 characters from
-  `[0-9a-z]` when `tt` creates it). Use it in `[[id]]` links; the frontmatter
-  `id` must equal it. A mismatch is warned about as `id mismatch` and the task
-  still keys by the filename, so `tt` never renames or rewrites a file to
-  "fix" a user edit.
-- `state` — `open` | `done` | `cancelled`.
-- `parent` — parent task id or `null` (strict tree, one parent max).
-- `tags` — without a leading `#`; a `work` filter also matches `work/admin`.
-- `due` — `YYYY-MM-DD`, date only. `priority` — `high` | `med` | `low`.
-- `rank` — the task's optional manual place among its siblings (same parent,
-  or roots together), lower first; `null` when unranked. It is sibling-only
-  and independent of `priority`.
+- `id`: the stem of the store file, 10 characters from `[0-9a-z]` when `tt`
+  creates it. Other ids may use `[0-9a-z_-]`, up to 64 characters. Use it in
+  `[[id]]` links.
+- `state`: `open` | `done` | `cancelled`.
+- `parent`: parent id or `null`. One parent maximum.
+- `tags`: without a leading `#`. A `work` filter also matches `work/admin`.
+- `due`: `YYYY-MM-DD`. `priority`: `high` | `med` | `low`.
+- `rank`: optional place among siblings, lower first; `null` when unranked.
+- `add` and `show` also return `path`: the absolute store file path. Other
+  commands do not.
 
 ## Commands
-
-Examples run in a fresh project; ids and the project path are illustrative.
 
 ### `tt add`
 
 ```
-tt add TITLE | --title TITLE [--parent ID] [--tag TAG]... [--due YYYY-MM-DD]
+tt add [TITLE] [--title TITLE] [--parent ID] [--tag TAG]... [--due YYYY-MM-DD]
        [--priority high|med|low] [--body TEXT|-]
 ```
 
-Creates a task and returns it. Pass the title positionally or via `--title`, not
-both. `--body -` reads the body from stdin; bodies may contain `[[id]]` links.
-Without `--parent`, a configured `capture_target` is used, else the project root.
-On an unregistered directory a non-interactive `tt add` registers it first.
+Pass the title positionally or with `--title`, not both. `--body -` reads the
+body from stdin. Without `--parent`, `capture_target` is used if set, else the
+project root. The new task is appended after its siblings.
 
 ```console
 $ mkdir -p /tmp/tt-demo/project && cd /tmp/tt-demo/project
@@ -112,11 +118,9 @@ $ export TT_CONFIG=/tmp/tt-demo/config.toml XDG_DATA_HOME=/tmp/tt-demo/data
 $ tt --json project add
 {"path":"/tmp/tt-demo/project","slug":"project"}
 $ tt --json add --title "Write the plan"
-{"id":"8d7jfebh28","title":"Write the plan","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":0}
-$ tt --json add "Ship it" --parent 8d7jfebh28 --tag work/admin --due 2026-09-17 --priority high --body "See [[8d7jfebh28]]."
-{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0}
+{"id":"8d7jfebh28","title":"Write the plan","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":0,"path":"/tmp/tt-demo/data/tt/project/8d7jfebh28.md"}
 $ printf 'body from stdin\n' | tt --json add "Stdin task" --body -
-{"id":"yubpl8hb0y","title":"Stdin task","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":1}
+{"id":"yubpl8hb0y","title":"Stdin task","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":1,"path":"/tmp/tt-demo/data/tt/project/yubpl8hb0y.md"}
 ```
 
 ### `tt list`
@@ -125,103 +129,161 @@ $ printf 'body from stdin\n' | tt --json add "Stdin task" --body -
 tt list [--flat] [--tag TAG] [--state open|done|cancelled] [--due-today]
 ```
 
-Tree by default: `{"tasks":[{...task,"children":[...]}]}`. A matching task whose
-parent does not match is promoted to a root; ancestors of matches are excluded.
-Siblings display in `rank` order — ranked first ascending, then unranked by
-lowercased title, then id. `--flat` returns `{"tasks":[{...task}]}` sorted by
-id, without `children`.
-`--due-today` includes overdue tasks; filters combine with AND.
+Tree by default: `{"tasks":[{...task,"children":[...]}],"revision":"..."}`.
+`--flat` returns `{"tasks":[{...task}],"revision":"..."}` sorted by id, with no
+`children`. A task that matches while its parent does not is promoted to a root.
+Siblings are ordered by `rank` (ranked first, ascending), then by lowercased
+title, then by id. `--due-today` includes overdue tasks. Filters combine with AND.
+
+`revision` is needed by `tt apply`. Read it from the same `list` call you plan
+from.
 
 ```console
 $ tt --json list --flat --tag work
-{"tasks":[{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0}]}
-$ tt --json list
-{"tasks":[{"id":"8d7jfebh28","title":"Write the plan","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":0,"children":[{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0,"children":[]}]},{"id":"yubpl8hb0y","title":"Stdin task","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":1,"children":[]}]}
+{"tasks":[{"id":"2mucpsinmb","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0}],"revision":"1af83cbb529cdbca59bdb4b9283dd2ed051eece66d5c5228e76ace6926ae4861"}
 ```
 
-### `tt show <ID>`
+### `tt show ID`
 
-Task object plus `body`, `links`, `backlinks`, and `children` (arrays of ids).
-Dangling link targets are allowed and reported as-is.
+The task object plus `body`, `links`, `backlinks`, `children` (ids), and `path`.
 
 ```console
-$ tt --json show 3wcss7oxg4
-{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0,"body":"See [[8d7jfebh28]].","links":["8d7jfebh28"],"backlinks":[],"children":[]}
 $ tt --json show 8d7jfebh28
-{"id":"8d7jfebh28","title":"Write the plan","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":0,"body":"","links":[],"backlinks":["3wcss7oxg4"],"children":["3wcss7oxg4"]}
+{"id":"8d7jfebh28","title":"Write the plan","state":"open","parent":null,"tags":[],"due":null,"priority":null,"rank":0,"body":"","links":[],"backlinks":["2mucpsinmb"],"children":["2mucpsinmb"],"path":"/tmp/tt-demo/data/tt/project/8d7jfebh28.md"}
 ```
 
-### `tt done <ID>` / `tt cancel <ID>` / `tt reopen <ID>`
+### `tt done ID` / `tt cancel ID` / `tt reopen ID`
 
-Set the state (`reopen` sets `open`) and return the task object.
+Set the state (`reopen` sets `open`) and return the task object without `path`.
 
 ```console
-$ tt --json done 3wcss7oxg4
-{"id":"3wcss7oxg4","title":"Ship it","state":"done","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0}
-$ tt --json reopen 3wcss7oxg4
-{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0}
+$ tt --json done 2mucpsinmb
+{"id":"2mucpsinmb","title":"Ship it","state":"done","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0}
 ```
 
-### `tt edit <ID> [--title TITLE]`
+### `tt edit ID [--title TITLE]`
 
-With `--title`, renames the task; the id and file never change. Without
-`--title`, opens the task file in `$EDITOR` (fallback `vi`) and returns the
-task object after the editor exits. Use `--title` in scripts; the interactive
-form is for humans.
+With `--title`, renames the task and returns it. The id and file name never
+change. Mirror aliases in this store are rewritten (see Title sync). Without
+`--title`, opens the task file in `$EDITOR` (fallback `vi`), then reloads and
+returns the task. Scripts use `--title`; the editor form is for people.
 
 ```console
-$ tt --json edit 3wcss7oxg4 --title "Ship it v2"
-{"id":"3wcss7oxg4","title":"Ship it v2","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0}
+$ tt --json edit 2mucpsinmb --title "Ship it v2"
+{"id":"2mucpsinmb","title":"Ship it v2","state":"open","parent":"8d7jfebh28","tags":["work/admin"],"due":"2026-09-17","priority":"high","rank":0}
 ```
 
-### `tt move <ID> [--to-project DIR|SLUG] [--parent ID | --root]`
+### `tt move ID`
 
-Reparent a task within the current Project, or move it and its entire subtree
-to another registered Project. Without `--to-project`, exactly one of
-`--parent` or `--root` is required: `--parent` makes the task a child of that
-Task in the current Store, and `--root` makes it a root. `--parent` and
-`--root` conflict. In-project moves use the same rules as the TUI: the task
-cannot be its own parent or move under a descendant, an unknown task or parent
-is an error, the task is appended among its new siblings, and its old sibling
-rank gap is closed.
+```
+tt move ID [--parent ID | --root] [--to-project DIR|SLUG]
+```
 
-With `--to-project`, resolve the destination by its registered directory path
-or slug; an unregistered path is an error and is never registered implicitly.
-Without `--parent`, the moved root becomes a root in the destination Store;
-`--root` is equivalent to omitting `--parent`. If the destination resolves to
-the current Store, the command reparents within the current Project instead of
-performing a cross-Store move. Descendant parent pointers and ranks are kept;
-each moved root's rank is cleared. Identities, bodies, and `[[id]]` link text
-are unchanged. Links from tasks left in the source may now be dangling, which
-is legitimate; Title sync remains Store-local.
+- Without `--to-project`: reparents within the current project. Exactly one of
+  `--parent ID` or `--root` is required. The task becomes the last sibling in
+  its new group. A task cannot move under itself or a descendant.
+- With `--to-project DIR|SLUG`: moves the task and its whole subtree to a
+  registered project. An unregistered destination is an error; it is never
+  registered implicitly. Without `--parent`, or with `--root`, the moved root
+  becomes unranked at the destination's root. If the destination is the current
+  project, the command reparents in place.
+- Ids, bodies, and `[[id]]` text are unchanged. Links left in the source may
+  dangle, which is legitimate.
+- A cross-project move checks for id collisions first, then writes all target
+  files before removing any source file. A failure mid-way returns
+  `partial move (target_written=N, source_removed=N)`; duplicate copies may
+  remain.
 
-A cross-Project move writes every task to the target Store atomically without
-replacement before removing anything from the source. An id collision is an
-error. If a filesystem failure occurs after the move begins, the error reports
-the partial progress; duplicate copies may remain, but a task is never removed
-before its target copy is safe.
-
-With `--json`, either kind of move returns all moved Task objects in id order
-and a `target_project` reference with `path` and `slug`:
+Both kinds of move return every moved task (the root and all descendants) in id
+order, plus the destination:
 
 ```json
-{"tasks":[{"id":"3wcss7oxg4","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":[],"due":null,"priority":null,"rank":0},{"id":"8d7jfebh28","title":"Write the plan","state":"open","parent":"abc1234567","tags":[],"due":null,"priority":null,"rank":null}],"target_project":{"path":"/work/other","slug":"other"}}
+{"tasks":[{"id":"2mucpsinmb","title":"Ship it","state":"open","parent":"8d7jfebh28","tags":[],"due":null,"priority":null,"rank":0}],"target_project":{"path":"/work/other","slug":"other"}}
 ```
 
-The `tasks` array contains the moved root and every descendant, not just the
-requested ID, for both in-project and cross-Project moves. Runtime errors
-follow the normal exit-1 / `{"error":"…"}` contract.
+### `tt apply`
 
-### `tt project list` / `tt project add [DIR]` / `tt project remove DIR|SLUG`
+```
+tt apply [--dry-run]
+```
 
-Register, list, and unregister directories. `add` defaults to the resolved
-starting directory and creates the project's store folder. `remove` only
-unregisters; store files are kept.
+Makes the project match a complete desired tree. Send one JSON object on stdin:
+
+```json
+{"revision":"<revision from tt --json list>","tasks":[
+  {"id":"8d7jfebh28","title":"Write the plan","state":"done","tags":[],"due":null,"priority":null,"children":[
+    {"id":"2mucpsinmb","title":"Ship it","tags":["work/admin"],"due":"2026-09-17","priority":"high","children":[]}
+  ]},
+  {"title":"New task","children":[]}
+]}
+```
+
+Rules:
+
+- `revision` and `tasks` are required. Input must be exactly one JSON object.
+- `tasks` is the **whole** tree. Every task you want to keep must appear. Any
+  existing task missing from the tree is **deleted**, with its body.
+- Node fields: `id` (omit for a new task; ids are generated), `title` (required,
+  not blank), `state` (default `open`), `tags` (default empty), `due`
+  (`YYYY-MM-DD` or `null`), `priority` (`high`|`med`|`low` or `null`),
+  `children`.
+- An omitted `tags`, `due`, or `priority` **clears** the field. Send the full
+  value on every apply.
+- Order among siblings sets their `rank`.
+- The whole tree is validated before any write. Errors include
+  `invalid task id`, `duplicate task id`, `task not found`, `invalid state`,
+  `invalid priority`, and `task title must not be empty`.
+- A `revision` that no longer matches the store fails with
+  `task list changed on disk; reload`, and nothing is written. Run `tt list`
+  again and re-plan.
+- Writes happen in this order: new tasks, updates and moves, mirror-alias
+  rewrites, then deletions. Bodies and unknown frontmatter keys of kept tasks
+  are preserved.
+
+Output (stdout, `--json`):
+
+```json
+{"revision":"0b9773b3...","dry_run":false,"adds":[{"id":"pdgyhn41zi","title":"New task","parent":null}],"updates":[{"id":"8d7jfebh28","fields":["state"]}],"moves":[],"reorders":0,"deletes":[]}
+```
+
+- `adds`: `{id,title,parent}`. `updates`: `{id,fields}`. `moves`: `{id,from,to}`.
+  `reorders`: a count. `deletes`: `{id,title,has_body}`.
+- `dry_run: true` plans without writing. Its ids for new tasks are provisional,
+  and its `revision` is the current one.
+- A successful apply returns the new `revision`. Use it for the next apply.
+- An I/O failure during writes exits `1` with
+  `{"error":"...","applied":{...same shape...}}`. `applied` lists what was
+  committed. There is no rollback.
+- Human mode prints `applied: N adds, N updates, N moves, N reorders, N deletes`
+  (or `planned:` for `--dry-run`).
+
+```console
+$ R=$(tt --json list | sed 's/.*"revision":"\([^"]*\)".*/\1/')
+$ printf '%s' "{\"revision\":\"$R\",\"tasks\":[{\"title\":\"New task\",\"children\":[]}]}" | tt --json apply --dry-run
+```
+
+`apply` does not register an unregistered directory.
+
+### `tt project list` / `tt project add [DIR]` / `tt project remove DIR|SLUG` / `tt project current`
+
+- `list`: `{"projects":[{"path":"...","slug":"...","never_ask_nested":false}]}`.
+- `add [DIR]`: registers `DIR`, or the starting directory when omitted. `DIR`
+  must exist (`project directory does not exist`). It creates the store folder.
+  Returns `{"path":"...","slug":"..."}`. Registering an existing project
+  returns it.
+- `remove DIR|SLUG`: unregisters only. Store files are kept. Returns
+  `{"removed":{...}}`. Fails with `not a registered project: ...` if absent.
+- `current`: resolves the starting directory without registering anything.
+  Returns `{"registered":true|false,"path":"...","slug":"...|null","nested":"...|null"}`.
+  `path` is the registered path, or the path to register when `registered` is
+  false.
 
 ```console
 $ tt --json project list
 {"projects":[{"path":"/tmp/tt-demo/project","slug":"project","never_ask_nested":false}]}
-$ tt --json project add /tmp/tt-demo/other
+$ tt --json project current
+{"registered":true,"path":"/tmp/tt-demo/project","slug":"project","nested":null}
+$ mkdir -p /tmp/tt-demo/other && tt --json project add /tmp/tt-demo/other
 {"path":"/tmp/tt-demo/other","slug":"other"}
 $ tt --json project remove other
 {"removed":{"path":"/tmp/tt-demo/other","slug":"other","never_ask_nested":false}}
@@ -237,120 +299,15 @@ $ echo $?
 1
 ```
 
-## TUI
+### `tt update` (alias `upgrade`)
 
-Bare `tt` opens the list for the resolved project: by default, one indented
-row per task in pre-order, with tree guides, a fold marker on parents, a state
-glyph, and quiet right-aligned metadata only when present (relative due,
-priority, and the `done/total` rollup). A session-only filter replaces that
-view with matching tasks as depth-zero rows. The header shows the project path
-(never the invisible store) and the issue badge. The footer is three rows: a
-blank spacer, one hint row with styled key/label pairs for the current mode (or
-the live input prompt), and a context row with the project slug and task count
-plus the active filter, if any. Short-lived confirmations and errors
-appear as a toast popup above the footer that dismisses itself after about
-three seconds and never takes focus.
-The list is the smaller pane; the larger right-hand preview follows the
-selection: a dim metadata line (due, priority, tags — the list glyph already
-shows the state), the title in bold accent, then the parsed markdown body
-(headings, lists, code, quotes, rules, and `[text](url)` links plus `[[...]]`
-wikilinks in every accepted form, shown as the target's live title when it is
-in this store; a dangling target shows its id, and an alias is never
-displayed). An empty body shows a dim `[empty body]` placeholder. Tasks that
-link to the selection are listed after the body as dim `↩ Title` lines,
-alphabetical by live title; a list taller than the pane clips at its edge,
-because the pane does not scroll.
-Link and backlink navigation stays on `o`.
-
-| Key | Action |
-| --- | --- |
-| `j`/`k`, `↓`/`↑` | Move the selection through the flat list |
-| `J`/`K` | Move the cursor task later/earlier among its siblings (marks are ignored; clear a filter first) |
-| `ctrl-d`/`ctrl-u` | Move the selection 10 rows down/up |
-| `gg`/`G` | Jump to the first/last row |
-| `h`/`←` | Collapse the selected parent; if already collapsed or childless, jump to its parent |
-| `l`/`→` | Expand the selected collapsed parent (no-op otherwise) |
-| `a`/`A` | Add a child under the selection / a new root task at the top of the list |
-| `N` | Quick capture to the configured `capture_target`, else the project root |
-| `x` | Cycle the selection (or every marked task) open ↔ done; cancelled tasks are left unchanged |
-| `!` | Set or clear priority on the selection (or every marked task) |
-| `t` | Toggle an existing tag, or add a typed tag, on the selection (or every marked task) |
-| `f` | Filter by one state, priority, or tag; matching tasks form a flat session-only list, and `clear filter` restores the tree |
-| `Tab` | Toggle the current row in the multi-selection; `Esc` clears the selection first |
-| `m` | Move the selection (or every marked subtree) within this Project or into another registered Project |
-| `d` | Delete the selection (or every marked task) and its descendants after confirming |
-| `L` | Append a `[[{id}.md|{Title}]]` link from the selected task to another task |
-| `r` | Rename the selected task from a prompt prefilled with its current title; committing rewrites the title and immediately cascades mirror aliases in other tasks |
-| `e`/`Enter` | Open the selected task in `$EDITOR` |
-| `/` | Search titles; `Enter` selects, `Esc` restores the previous selection |
-| `p` | Switch to another registered project |
-| `P` | Register a new project by path (expands `~`, creates the directory, and switches to it) |
-| `o` | Jump through the selection's links and backlinks; unresolvable outlinks are marked `(missing)` and `Enter` toasts `not found` instead of jumping |
-| `?` | Open the Keymap overlay |
-| `g?` | Open the store-issues overlay |
-| `q` | Quit |
-
-`Tab` builds a multi-selection; marked rows show a `▪` marker in the reserved
-left gutter over a yellow background, and the footer switches to selection
-hints. While anything is marked, `m`, `d`, `x`, `!`, and `t` act on every marked task;
-with nothing marked they act on the selection alone.
-`A` inserts a new root task at the top of the list, regardless of the
-selection, while `a`, `N`, and CLI `tt add` append to the destination
-sibling group; those writes
-materialize consecutive ranks `0..n-1` for the group. An in-Project `m` move
-appends each moved root among its destination siblings; a cross-Project move
-clears each moved root's Rank. `J`/`K` move the cursor task one place
-later/earlier among its siblings, ignoring marks; with a
-filter active, no siblings, or already at that end, they toast and write
-nothing.
-`m` opens a `move under…` picker offering `⌂ root` plus every task outside the
-moving set and its descendants, followed by `⇄ another project…` when another
-registered Project is available. Choosing a Project opens a parent picker in
-that Store (`⌂ root` plus its tasks); committing moves the whole subtree,
-switches the List to that Project, and selects the moved root. In-Project moves
-keep descendants attached; marked tasks whose ancestor is also marked are
-deduplicated. `d` opens a confirmation: one task asks
-`Delete "<title>"?` and several ask `Delete N tasks?`, adding
-`and its K descendants` or `and their K descendants` when the subtrees hold
-more than the requested tasks. `[ Delete ] [ Cancel ]` are highlighted with
-Cancel default, so a bare `Enter` never deletes; `y` (or `d`) confirms and
-`Esc` (or `n`) cancels. Deleting removes a task and all its descendants —
-nothing is reparented, so move children up first with `m` if you want to keep
-them — and `[[id]]` links to deleted tasks are left dangling. `L` appends a
-`[[{id}.md|{Title}]]` link from the selected task through a `link to…` picker,
-ignoring the multi-selection; a title containing `|` or `]` cannot carry an
-alias, so the bare `[[{id}.md]]` form is written instead. `r` opens a prompt
-prefilled with the cursor task's title (marking is ignored, and marks survive);
-`Enter` rewrites the title and immediately cascades mirror aliases in the same
-action, because the TUI already knows the old and new title, while `Esc`
-cancels with no writes. Renaming a task by any route while the TUI is running
-cascades to mirror aliases (see Title sync); there is no unlink command yet.
-
-Folds are in-memory only: they are never persisted, and a new session starts
-fully expanded. Rollups keep counting folded children, and search, link jumps,
-and any other programmatic selection unfold the target's ancestors, so a folded
-task can never become unreachable.
-
-While the issues overlay is open: `j`/`k` move between issues, `e`/`Enter`
-opens the highlighted file in `$EDITOR` (the vault reloads on return, and once
-the issues are fixed the overlay closes and confirms with a toast), `Esc`
-closes it, and `q` quits. If an editor round-trip raises the issue count, the
-TUI immediately toasts `⚠ N issues — press g?` so a content edit that broke a
-file cannot go unnoticed.
-
-On launch, an unregistered directory offers registration and a nested
-directory offers to become its own project. Both questions show highlighted
-buttons: `←`/`→` (or `h`/`l`/Tab) move the highlight, `Enter` confirms, and
-`Esc` (or the Cancel button) quits without opening anything. The `y`/`n` keys
-still answer directly, and `!` on the nested question keeps the parent and
-stops asking there. The register question defaults to Yes; the nested question
-defaults to Register parent, so `n` (or Register parent) still opens the parent
-project.
+Runs `go install github.com/vieitesss/tt/cmd/tt@main` with
+`GOBIN=$HOME/.local/bin`. It needs `go` on `PATH` and replaces any `tt` binary
+in `~/.local/bin`.
 
 ## On-disk format
 
-One file per task at `<store>/<id>.md`, where `<store>` is
-`$XDG_DATA_HOME/tt/<slug>/` (else `~/.local/share/tt/<slug>/`):
+One file per task at `<store>/<id>.md`:
 
 ```markdown
 ---
@@ -367,62 +324,49 @@ rank: 0
 See [[8d7jfebh28]].
 ```
 
-- The filename stem is the task's identity. The frontmatter `id` must match
-  it; a mismatch is reported as `id mismatch` and preserved verbatim on
-  rewrite. Files are never renamed automatically, and `tt` never rewrites a
-  file to repair a mismatch.
-- A `parent` id that is missing (or forms a cycle) makes the task render as a
-  root and is reported as `dangling parent` or `cycle`; if the missing parent
-  later appears, the task reattaches on the next scan because nothing rewrote
-  the file. `[[id]]` links may dangle (for example cross-project); they are
-  not warnings.
-- `rank` is an optional integer sibling position; `tt` omits the key when the
-  task is unranked.
-- Rewrites preserve unknown frontmatter keys and are atomic (temp file + rename).
-- `[[...]]` links are extracted from the body; backlinks are computed, never
-  stored. Link by id (the filename stem), not by title or alias.
-- A `.md` file is a task only if its frontmatter parses and declares an `id`.
-  Files without a frontmatter block, or with frontmatter but no `id` (notes,
-  skills, editor documents), are ignored silently. A file that claims an `id`
-  but fails to parse is skipped and warned about; it is never rewritten.
-- Users never browse the store; prefer `tt --json` for changes so the index
-  stays consistent.
+- The file stem is the identity. A frontmatter `id` that differs from the stem
+  is reported as `id mismatch`; the task loads under the stem. Files are never
+  renamed, and `tt` never rewrites a file to fix a mismatch.
+- A `.md` file without task frontmatter (no frontmatter, or another tool's) is
+  ignored silently. A file with task frontmatter that is malformed (bad YAML,
+  invalid UTF-8, or a file name that is not a valid id) is skipped and warned
+  about as `malformed`; it is never rewritten.
+- A parent that is missing makes the task a root (`dangling parent`). If the
+  parent appears later, the task reattaches. A parent cycle removes the closing
+  edge and makes that task a root (`cycle`).
+- `rank` is an optional integer; the key is omitted when unranked.
+- Rewrites keep unknown frontmatter keys and are atomic (temp file, then rename).
+- Backlinks are computed from bodies, never stored. Link by id, not by title.
+- Prefer `tt --json` over hand edits, so the index stays consistent.
 
 ### Links
 
-A link is written `[[{id}.md|{Title}]]`: the target's real store filename (the
-store is flat, so `gf`-style navigation works in any editor) plus a display
-alias. The parser accepts the older and shorter forms too — `[[id]]`,
-`[[id|alias]]`, `[[id.md]]`, `[[id.md|alias]]`, and `.md`-suffixed paths — and
-normalizes them all to the target's filename stem, which is and remains the
-identity. Aliases and paths never affect resolution, and `--json`
-`links`/`backlinks` stay id arrays. `L` writes the full form; when the title
-contains `|` or `]` it falls back to the bare `[[{id}.md]]`.
+Write a link as `[[{id}.md|{Title}]]`: the real file name, so it is navigable
+in any editor, plus a display alias. The parser also accepts `[[id]]`,
+`[[id|alias]]`, `[[id.md]]`, and `[[id.md|alias]]`, and normalizes them to the
+id. Aliases never affect identity. In `--json`, `links` and `backlinks` are id
+arrays.
 
 ### Title sync
 
-While the TUI is running, a reload that observes a title change rewrites every
-alias that equaled the target's old title (a *mirror*) to the new one, through
-the same atomic write path as any other edit. Sync is one-way (editing an alias
-never renames a task), mirror-only (aliases that deliberately differ are never
-touched), in-store only (dangling and cross-project targets have no old title
-and are exempt), and idempotent (it writes only on a real mismatch, so a
-cascade's next reload is silent). A cold scan — any CLI command, or a fresh TUI
-start — has no previous index and never writes, so a rename made while no TUI
-was running leaves aliases stale until they are edited by hand.
+When a title changes through `tt edit --title`, `tt edit` (editor form), or an
+apply that renames a task, every alias in this store that equaled the old title
+(a *mirror*) is rewritten to the new title. Sync is one-way and mirror-only:
+aliases that differ on purpose are never touched, and no other store is
+changed. A title changed outside tt (for example, in an editor on the file) is
+not synced by later commands: they start cold and never write. Edit such
+aliases by hand.
 
 ## Troubleshooting
 
-- Wrong project? Resolution is `--path` > `$TT_PATH` > cwd, nearest registered
-  ancestor first; run `tt project list` to see the registry, or pass `--path`
-  explicitly in scripts.
-- Task missing from `tt list`? Its file must be named `<id>.md` and its
-  frontmatter must declare the matching `id`, `title`, and `state`; notes and
-  broken files are ignored or warned about instead.
-- `warning:` lines on stderr name skipped or repairable files (malformed,
-  id mismatch, dangling parent, cycle); the command still exits `0`.
-- Hand-editing or an editor round-trip looks wrong? `g?` in the TUI opens the
-  store-issue overlay: `j`/`k` move between issues, `e`/`Enter` opens the
-  highlighted file, and the `⚠ N issues` header badge counts the same warnings.
-  An edit from inside the TUI that raises the issue count toasts
-  `⚠ N issues — press g?` right away.
+- Wrong project? Resolution order: `--path`, `$TT_PATH`, then cwd, nearest
+  registered ancestor first. Run `tt --json project current` to see what
+  resolves, and `tt project list` to see the registry.
+- Task missing from `tt list`? Its file must be `<id>.md` with a frontmatter
+  `id`, `title`, and `state`. Notes and malformed files are ignored or warned
+  about.
+- `warning:` on stderr names a skipped or repairable file (`unreadable`,
+  `malformed`, `id mismatch`, `dangling parent`, `cycle`). The command still
+  exits `0`.
+- `task list changed on disk; reload` from `apply`: run `tt --json list`, take
+  the new `revision`, and apply again from the fresh tree.

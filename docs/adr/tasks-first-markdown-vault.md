@@ -1,5 +1,7 @@
 # Tasks-first data model stored as a plain markdown vault
 
+> Note: The TUI and file watching were removed. Tasks are read by CLI commands and the Neovim buffer. See [go-neovim](go-neovim.md).
+
 The app is tasks-first: every node is a Task, tasks nest recursively (strict tree, one parent max), tasks connect via untyped `[[id]]` links shown bidirectionally, and nested tags (`#work/admin`) are pure labels. "Projects"/"groups" are not separate types — a group is just a Task with sub-tasks. All data lives in a user-owned folder of markdown files (one file per Task, YAML frontmatter for id/state/parent/tags, free markdown body holding links). The vault is the single source of truth; any index is a disposable cache.
 
 ## Considered Options

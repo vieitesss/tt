@@ -1,5 +1,7 @@
 # Move task subtrees between registered Projects without changing Identity
 
+> Note: The TUI `m` flow was removed. `tt move --to-project` is the cross-Project path. See [go-neovim](go-neovim.md).
+
 A Task may be reparented within a Project or moved between registered
 Projects, but Identity is the stable link and parent reference contract. A move
 carries the whole selected subtree with the same ids and bodies; descendants

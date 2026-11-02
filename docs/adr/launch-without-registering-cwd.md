@@ -1,5 +1,7 @@
 # Bind a TUI session without registering cwd
 
+> Note: The TUI and `--projects` were removed; `:TT projects` is the picker. See [go-neovim](go-neovim.md).
+
 Bare `tt` in an unregistered directory still asks whether to register cwd, but
 the TUI can bind to a different already-registered Project instead of quitting.
 A session always has one current Project — there is no homeless TUI. `--projects`

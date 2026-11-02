@@ -1,5 +1,7 @@
 # Rust + ratatui for the TUI
 
+Status: Superseded by [go-neovim](go-neovim.md). The Rust CLI and TUI were removed.
+
 Built in Rust with ratatui. v2 dropped the hand-drawn map canvas for a
 list-first view, but total control of the terminal still matters (tree guides,
 right-aligned metadata, the persistent preview, and the launch modals), a

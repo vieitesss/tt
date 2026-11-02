@@ -1,5 +1,7 @@
 # Project-centric central store and list-first TUI
 
+> Note: The list-first TUI was removed; the Neovim buffer shows the project tree. See [go-neovim](go-neovim.md).
+
 `tt` v2 pivots from "one vault you point at" to **projects**: a project is a
 directory the user already works in, registered in the shared config (default
 `$XDG_DATA_HOME/tt/config.toml`, else `~/.local/share/tt/config.toml`; overridden

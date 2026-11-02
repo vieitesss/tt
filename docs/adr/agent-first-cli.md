@@ -1,5 +1,7 @@
 # Agent-first CLI as a stable interface
 
+> Note: The TUI was removed; the Neovim plugin is now the interactive client. See [go-neovim](go-neovim.md).
+
 The app ships a headless CLI covering the full task lifecycle (add, list/query, done/cancel/reopen, link, tag, edit, re-parent) with stable, machine-readable output (`--json`), plus a `SKILL.md` so AI agents can operate the vault without the TUI. The CLI is a *public contract*, not a debug tool: both the TUI and agents are clients of the same vault library.
 
 ## Consequences

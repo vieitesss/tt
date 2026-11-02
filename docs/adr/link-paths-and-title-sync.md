@@ -1,5 +1,7 @@
 # Links carry the target's path plus a display alias, and mirror aliases sync with titles
 
+> Note: The TUI and its file watcher were removed. Title sync now runs only on `tt edit --title`, `tt edit`, and `tt apply`. See [go-neovim](go-neovim.md).
+
 Links were stored as bare `[[id]]`: unreadable in `$EDITOR` (the id says nothing)
 and unnavigable without editor-specific setup. We decided the *file format* must
 carry both readability and navigability, with zero editor-specific machinery. A
