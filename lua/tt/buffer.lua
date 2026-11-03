@@ -19,14 +19,6 @@ local function decorate(buf)
     virt_lines = { { { header, "Title" } }, {} },
     virt_lines_above = true,
   })
-  local last = vim.api.nvim_buf_line_count(buf) - 1
-  vim.api.nvim_buf_set_extmark(buf, namespace, last, 0, {
-    virt_lines = {
-      {},
-      { { "Edit like text (dd, o, >>).", "Comment" } },
-      { { ":w shows a summary, then applies.", "Comment" } },
-    },
-  })
 end
 
 local function reload(buf)
