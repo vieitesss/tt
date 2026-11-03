@@ -40,4 +40,4 @@ install:
 install_skill:
     rm -rf ~/.agents/skills/tt | true
     mkdir -p ~/.agents/skills/tt
-    ln -sf ~/personal/tt/SKILL.md ~/.agents/skills/tt/SKILL.md
+    ln -sf ~/personal/tt/skills/tt/SKILL.md ~/.agents/skills/tt/SKILL.md
